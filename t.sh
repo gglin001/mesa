@@ -56,12 +56,24 @@ popd
 
 ################################################################################
 
-# no wayland
-meson . build -Dplatforms=x11 -Dprefix=$PWD/build/install
+meson setup --reconfigure build \
+  -Dprefix=$PWD/build/install \
+  -Dplatforms=x11 \
+  -Dgallium-drivers=swrast \
+  -Dgallium-opencl=standalone \
+  -Dopencl-spirv=true \
+  -Dvulkan-drivers=swrast \
+  -Dopengl=false \
+  -Dllvm=enabled \
+  2>&1 | tee demos/meson.setup.log
 
+# TODO: enable `gallium-rusticl`
+
+meson configure --clearcache build
 meson compile -C build
 meson install -C build
 
 ################################################################################
 
+# debug
 meson --help
