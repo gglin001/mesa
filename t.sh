@@ -25,8 +25,8 @@ apt install -y libelf-dev
 
 apt install -y libclc-dev
 apt install -y libdrm-dev
+# apt install -y libvulkan-dev
 apt install -y \
-  libvulkan-dev \
   libx11-dev \
   libx11-xcb-dev \
   libxcb-dri2-0-dev \
@@ -63,13 +63,16 @@ meson setup --reconfigure build \
   -Dgallium-opencl=standalone \
   -Dopencl-spirv=true \
   -Dvulkan-drivers=swrast \
+  -Dgles1=false \
+  -Dgles2=false \
   -Dopengl=false \
   -Dllvm=enabled \
+  -Dbuild-tests=true \
   2>&1 | tee demos/meson.setup.log
 
 # TODO: enable `gallium-rusticl`
 
-meson configure --clearcache build
+# meson configure --clearcache build
 meson compile -C build
 meson install -C build
 
