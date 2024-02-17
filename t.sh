@@ -19,8 +19,10 @@ micromamba install -y bison
 # meson cannot find spirv-tools from conda
 apt install -y spirv-tools
 
-apt install -y lua5.4
+apt install -y lua5.4 liblua5.4-dev
 apt install -y libarchive-dev
+apt install -y libelf-dev
+
 apt install -y libclc-dev
 apt install -y libdrm-dev
 apt install -y \
@@ -47,7 +49,8 @@ mkdir -p demos
 git clone https://github.com/KhronosGroup/SPIRV-LLVM-Translator.git demos
 pushd demos/SPIRV-LLVM-Translator
 git checkout -b v17.0.0 v17.0.0
-cmake -DCMAKE_INSTALL_PREFIX=$PWD/build/install -G Ninja -S$PWD -B$PWD/build
+cmake -G Ninja -S$PWD -B$PWD/build
+# default prefix is `/usr/local/`, pkgconfig will find it, if you install it to other folder, need setup env `PKG_CONFIG_PATH`
 cmake --build $PWD/build --target install
 popd
 
