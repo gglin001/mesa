@@ -17,11 +17,12 @@ micromamba install -y clangdev
 micromamba install -y bison
 
 # meson cannot find spirv-tools from conda
-apt install spirv-tools
-apt install libclc-dev
-apt install libdrm-dev
-apt install libx11-dev libx11-xcb-dev
-apt install libxfixes-dev
+apt install -y spirv-tools
+
+apt install -y lua5.4
+apt install -y libarchive-dev
+apt install -y libclc-dev
+apt install -y libdrm-dev
 apt install -y \
   libvulkan-dev \
   libx11-dev \

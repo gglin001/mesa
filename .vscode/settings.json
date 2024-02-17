@@ -1,0 +1,11 @@
+{
+    "terminal.integrated.env.linux": {
+        "EXT_PATH": "${workspaceFolder}/demos/SPIRV-LLVM-Translator/build/install/bin",
+        "PKG_CONFIG_PATH": "${workspaceFolder}/demos/SPIRV-LLVM-Translator/build/install/lib/pkgconfig",
+    },
+    // meson LSP not works on linux
+    "mesonbuild.configureOnOpen": false,
+    "mesonbuild.buildFolder": "build",
+    "mesonbuild.downloadLanguageServer": "ask",
+    "mesonbuild.languageServer": null,
+}
