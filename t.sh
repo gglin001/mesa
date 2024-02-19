@@ -56,18 +56,21 @@ popd
 
 ################################################################################
 
-meson setup --reconfigure build \
+CC=clang CXX=clang++ \
+  meson setup --reconfigure build \
+  --buildtype=debug \
   -Dprefix=$PWD/build/install \
   -Dplatforms=x11 \
-  -Dgallium-drivers=swrast \
+  -Dgallium-drivers="swrast" \
+  -Ddraw-use-llvm=true \
   -Dgallium-opencl=standalone \
   -Dopencl-spirv=true \
-  -Dvulkan-drivers=swrast \
+  -Dvulkan-drivers="swrast" \
   -Dgles1=false \
   -Dgles2=false \
   -Dopengl=false \
   -Dllvm=enabled \
-  -Dbuild-tests=true \
+  -Dbuild-tests=false \
   2>&1 | tee demos/meson.setup.log
 
 # TODO: enable `gallium-rusticl`
@@ -80,3 +83,4 @@ meson install -C build
 
 # debug
 meson --help
+

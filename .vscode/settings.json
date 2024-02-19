@@ -1,10 +1,12 @@
 {
     "terminal.integrated.env.linux": {
         "EXT_PATH": "${workspaceFolder}/build/install/bin",
+        // "OCL_ICD_VENDORS": "/root/micromamba/envs/pyenv/etc/OpenCL/vendors",
+        "OCL_ICD_FILENAMES": "${workspaceFolder}/build/install/lib/aarch64-linux-gnu/libOpenCL.so",
     },
     // meson LSP not works on linux
     "mesonbuild.configureOnOpen": false,
     "mesonbuild.buildFolder": "build",
-    "mesonbuild.downloadLanguageServer": "ask",
+    "mesonbuild.downloadLanguageServer": false,
     "mesonbuild.languageServer": null,
 }
