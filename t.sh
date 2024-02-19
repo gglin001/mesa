@@ -56,7 +56,7 @@ popd
 
 ################################################################################
 
-CC=clang CXX=clang++ \
+CC=/usr/bin/clang CXX=/usr/bin/clang++ \
   meson setup --reconfigure build \
   --buildtype=debug \
   -Dprefix=$PWD/build/install \
@@ -83,4 +83,3 @@ meson install -C build
 
 # debug
 meson --help
-
