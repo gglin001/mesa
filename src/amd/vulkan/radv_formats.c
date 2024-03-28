@@ -23,20 +23,20 @@
  */
 
 #include "radv_debug.h"
+#include "radv_formats.h"
 #include "radv_private.h"
 
 #include "sid.h"
-#include "vk_format.h"
 
 #include "vk_android.h"
+#include "vk_enum_defines.h"
+#include "vk_format.h"
 #include "vk_util.h"
 
 #include "util/format_r11g11b10f.h"
 #include "util/format_rgb9e5.h"
 #include "util/format_srgb.h"
 #include "util/half_float.h"
-#include "vulkan/util/vk_enum_defines.h"
-#include "vulkan/util/vk_format.h"
 #include "ac_drm_fourcc.h"
 
 uint32_t
@@ -636,7 +636,6 @@ radv_is_filter_minmax_format_supported(const struct radv_physical_device *pdevic
    case VK_FORMAT_R32G32B32_SFLOAT:
    case VK_FORMAT_R32G32B32A32_SFLOAT:
    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
-   case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
    case VK_FORMAT_D16_UNORM:
    case VK_FORMAT_X8_D24_UNORM_PACK32:
    case VK_FORMAT_D32_SFLOAT:
@@ -672,6 +671,8 @@ radv_is_filter_minmax_format_supported(const struct radv_physical_device *pdevic
    case VK_FORMAT_R32G32B32A32_SINT:
    case VK_FORMAT_S8_UINT:
       return gfx_level >= GFX9;
+   case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
+      return gfx_level >= GFX7;
    default:
       return false;
    }

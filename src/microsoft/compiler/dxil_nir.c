@@ -609,6 +609,55 @@ dxil_nir_lower_var_bit_size(nir_shader *shader, nir_variable_mode modes,
 }
 
 static bool
+remove_oob_array_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   uint32_t num_derefs = 1;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_copy_deref:
+      num_derefs = 2;
+      FALLTHROUGH;
+   case nir_intrinsic_load_deref:
+   case nir_intrinsic_store_deref:
+   case nir_intrinsic_deref_atomic:
+   case nir_intrinsic_deref_atomic_swap:
+      break;
+   default:
+      return false;
+   }
+
+   for (uint32_t i = 0; i < num_derefs; ++i) {
+      if (nir_deref_instr_is_known_out_of_bounds(nir_src_as_deref(intr->src[i]))) {
+         switch (intr->intrinsic) {
+         case nir_intrinsic_load_deref:
+         case nir_intrinsic_deref_atomic:
+         case nir_intrinsic_deref_atomic_swap:
+            b->cursor = nir_before_instr(&intr->instr);
+            nir_def *undef = nir_undef(b, intr->def.num_components, intr->def.bit_size);
+            nir_def_rewrite_uses(&intr->def, undef);
+            break;
+         default:
+            break;
+         }
+         nir_instr_remove(&intr->instr);
+         return true;
+      }
+   }
+
+   return false;
+}
+
+bool
+dxil_nir_remove_oob_array_accesses(nir_shader *shader)
+{
+   return nir_shader_intrinsics_pass(shader, remove_oob_array_access,
+                                     nir_metadata_block_index |
+                                        nir_metadata_dominance |
+                                        nir_metadata_loop_analysis,
+                                     NULL);
+}
+
+static bool
 lower_shared_atomic(nir_builder *b, nir_intrinsic_instr *intr, nir_variable *var)
 {
    b->cursor = nir_before_instr(&intr->instr);
@@ -1786,36 +1835,6 @@ dxil_nir_fix_io_uint_type(nir_shader *s, uint64_t in_mask, uint64_t out_mask)
    return progress;
 }
 
-struct remove_after_discard_state {
-   struct nir_block *active_block;
-};
-
-static bool
-remove_after_discard(struct nir_builder *builder, nir_instr *instr,
-                      void *cb_data)
-{
-   struct remove_after_discard_state *state = cb_data;
-   if (instr->block == state->active_block) {
-      nir_instr_remove_v(instr);
-      return true;
-   }
-
-   if (instr->type != nir_instr_type_intrinsic)
-      return false;
-
-   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-
-   if (intr->intrinsic != nir_intrinsic_discard &&
-       intr->intrinsic != nir_intrinsic_terminate &&
-       intr->intrinsic != nir_intrinsic_discard_if &&
-       intr->intrinsic != nir_intrinsic_terminate_if)
-      return false;
-
-   state->active_block = instr->block;
-
-   return false;
-}
-
 static bool
 lower_kill(struct nir_builder *builder, nir_intrinsic_instr *intr,
            void *_cb_data)
@@ -1827,14 +1846,22 @@ lower_kill(struct nir_builder *builder, nir_intrinsic_instr *intr,
       return false;
 
    builder->cursor = nir_instr_remove(&intr->instr);
+   nir_def *condition;
+
    if (intr->intrinsic == nir_intrinsic_discard ||
        intr->intrinsic == nir_intrinsic_terminate) {
       nir_demote(builder);
+      condition = nir_imm_true(builder);
    } else {
       nir_demote_if(builder, intr->src[0].ssa);
+      condition = intr->src[0].ssa;
    }
 
+   /* Create a new block by branching on the discard condition so that this return
+    * is definitely the last instruction in its own block */
+   nir_if *nif = nir_push_if(builder, condition);
    nir_jump(builder, nir_jump_return);
+   nir_pop_if(builder, nif);
 
    return true;
 }
@@ -1847,12 +1874,7 @@ dxil_nir_lower_discard_and_terminate(nir_shader *s)
 
    // This pass only works if all functions have been inlined
    assert(exec_list_length(&s->functions) == 1);
-   struct remove_after_discard_state state;
-   state.active_block = NULL;
-   nir_shader_instructions_pass(s, remove_after_discard, nir_metadata_none,
-                                &state);
-   return nir_shader_intrinsics_pass(s, lower_kill, nir_metadata_none,
-                                       NULL);
+   return nir_shader_intrinsics_pass(s, lower_kill, nir_metadata_none, NULL);
 }
 
 static bool

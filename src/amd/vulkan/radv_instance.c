@@ -53,7 +53,6 @@ static const struct debug_control radv_debug_options[] = {{"nofastclears", RADV_
                                                           {"nobinning", RADV_DEBUG_NOBINNING},
                                                           {"nongg", RADV_DEBUG_NO_NGG},
                                                           {"metashaders", RADV_DEBUG_DUMP_META_SHADERS},
-                                                          {"nomemorycache", RADV_DEBUG_NO_MEMORY_CACHE},
                                                           {"discardtodemote", RADV_DEBUG_DISCARD_TO_DEMOTE},
                                                           {"llvm", RADV_DEBUG_LLVM},
                                                           {"forcecompress", RADV_DEBUG_FORCE_COMPRESS},
@@ -162,12 +161,12 @@ static const driOptionDescription radv_dri_options[] = {
       DRI_CONF_RADV_FLUSH_BEFORE_TIMESTAMP_WRITE(false)
       DRI_CONF_RADV_RT_WAVE64(false)
       DRI_CONF_RADV_LEGACY_SPARSE_BINDING(false)
+      DRI_CONF_RADV_FORCE_PSTATE_PEAK_GFX11_DGPU(false)
       DRI_CONF_DUAL_COLOR_BLEND_BY_LOCATION(false)
       DRI_CONF_RADV_OVERRIDE_GRAPHICS_SHADER_VERSION(0)
       DRI_CONF_RADV_OVERRIDE_COMPUTE_SHADER_VERSION(0)
       DRI_CONF_RADV_OVERRIDE_RAY_TRACING_SHADER_VERSION(0)
       DRI_CONF_RADV_SSBO_NON_UNIFORM(false)
-      DRI_CONF_RADV_FORCE_ACTIVE_ACCEL_STRUCT_LEAVES(false)
       DRI_CONF_RADV_APP_LAYER()
    DRI_CONF_SECTION_END
 };
@@ -241,6 +240,9 @@ radv_init_dri_options(struct radv_instance *instance)
 
    instance->drirc.legacy_sparse_binding = driQueryOptionb(&instance->drirc.options, "radv_legacy_sparse_binding");
 
+   instance->drirc.force_pstate_peak_gfx11_dgpu =
+      driQueryOptionb(&instance->drirc.options, "radv_force_pstate_peak_gfx11_dgpu");
+
    instance->drirc.override_graphics_shader_version =
       driQueryOptioni(&instance->drirc.options, "radv_override_graphics_shader_version");
    instance->drirc.override_compute_shader_version =
@@ -262,9 +264,6 @@ radv_init_dri_options(struct radv_instance *instance)
 
    instance->drirc.vk_require_etc2 = driQueryOptionb(&instance->drirc.options, "vk_require_etc2");
    instance->drirc.vk_require_astc = driQueryOptionb(&instance->drirc.options, "vk_require_astc");
-
-   instance->drirc.force_active_accel_struct_leaves =
-      driQueryOptionb(&instance->drirc.options, "radv_force_active_accel_struct_leaves");
 }
 
 static const struct vk_instance_extension_table radv_instance_extensions_supported = {

@@ -1096,7 +1096,7 @@ static void
 check_memory_bindings(const struct anv_device *device,
                      const struct anv_image *image)
 {
-#ifdef DEBUG
+#if MESA_DEBUG
    /* As we inspect each part of the image, we merge the part's memory range
     * into these accumulation ranges.
     */
@@ -1331,11 +1331,6 @@ add_all_surfaces_implicit_layout(
                                    isl_tiling_flags, isl_usage);
       if (result != VK_SUCCESS)
          return result;
-
-      /* Disable aux if image supports export without modifiers. */
-      if (image->vk.external_handle_types != 0 &&
-          image->vk.tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
-         continue;
 
       result = add_aux_surface_if_supported(device, image, plane, plane_format,
                                             format_list_info,
@@ -1693,6 +1688,11 @@ anv_image_init(struct anv_device *device, struct anv_image *image,
       isl_extra_usage_flags |= ISL_SURF_USAGE_DISABLE_AUX_BIT;
    }
 
+   /* Disable aux if image supports export without modifiers. */
+   if (image->vk.external_handle_types != 0 &&
+       image->vk.tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
+      isl_extra_usage_flags |= ISL_SURF_USAGE_DISABLE_AUX_BIT;
+
    const isl_tiling_flags_t isl_tiling_flags =
       choose_isl_tiling_flags(device->info, create_info, isl_mod_info,
                               image->vk.wsi_legacy_scanout);
@@ -1874,7 +1874,7 @@ VkResult anv_CreateImage(
 {
    ANV_FROM_HANDLE(anv_device, device, _device);
 
-   if (!device->physical->has_sparse &&
+   if ((device->physical->sparse_type == ANV_SPARSE_TYPE_NOT_SUPPORTED) &&
        INTEL_DEBUG(DEBUG_SPARSE) &&
        pCreateInfo->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
                              VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
@@ -1986,18 +1986,10 @@ anv_image_get_memory_requirements(struct anv_device *device,
     *    only if the memory type `i` in the VkPhysicalDeviceMemoryProperties
     *    structure for the physical device is supported.
     */
-   uint32_t memory_types = 0;
-   for (uint32_t i = 0; i < device->physical->memory.type_count; i++) {
-      /* Have the protected image bit match only the memory types with the
-       * equivalent bit.
-       */
-      if (!!(image->vk.create_flags & VK_IMAGE_CREATE_PROTECTED_BIT) !=
-          !!(device->physical->memory.types[i].propertyFlags &
-             VK_MEMORY_PROPERTY_PROTECTED_BIT))
-         continue;
-
-      memory_types |= 1ull << i;
-   }
+   uint32_t memory_types =
+      (image->vk.create_flags & VK_IMAGE_CREATE_PROTECTED_BIT) ?
+      device->physical->memory.protected_mem_types :
+      device->physical->memory.default_buffer_mem_types;
 
    vk_foreach_struct(ext, pMemoryRequirements->pNext) {
       switch (ext->sType) {
@@ -2092,7 +2084,7 @@ void anv_GetDeviceImageMemoryRequirements(
    ANV_FROM_HANDLE(anv_device, device, _device);
    struct anv_image image = { 0 };
 
-   if (!device->physical->has_sparse &&
+   if ((device->physical->sparse_type == ANV_SPARSE_TYPE_NOT_SUPPORTED) &&
        INTEL_DEBUG(DEBUG_SPARSE) &&
        pInfo->pCreateInfo->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
                                     VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
@@ -2202,7 +2194,8 @@ void anv_GetImageSparseMemoryRequirements2(
    ANV_FROM_HANDLE(anv_image, image, pInfo->image);
 
    if (!anv_sparse_residency_is_enabled(device)) {
-      if (!device->physical->has_sparse && INTEL_DEBUG(DEBUG_SPARSE))
+      if ((device->physical->sparse_type == ANV_SPARSE_TYPE_NOT_SUPPORTED) &&
+          INTEL_DEBUG(DEBUG_SPARSE))
          fprintf(stderr, "=== [%s:%d] [%s]\n", __FILE__, __LINE__, __func__);
 
       *pSparseMemoryRequirementCount = 0;
@@ -2224,7 +2217,8 @@ void anv_GetDeviceImageSparseMemoryRequirements(
    struct anv_image image = { 0 };
 
    if (!anv_sparse_residency_is_enabled(device)) {
-      if (!device->physical->has_sparse && INTEL_DEBUG(DEBUG_SPARSE))
+      if ((device->physical->sparse_type == ANV_SPARSE_TYPE_NOT_SUPPORTED) &&
+          INTEL_DEBUG(DEBUG_SPARSE))
          fprintf(stderr, "=== [%s:%d] [%s]\n", __FILE__, __LINE__, __func__);
 
       *pSparseMemoryRequirementCount = 0;
@@ -3681,8 +3675,7 @@ anv_fill_buffer_view_surface_state(struct anv_device *device,
 {
    anv_fill_buffer_surface_state(device,
                                  state->state_data.data,
-                                 format, swizzle,
-                                 ISL_SURF_USAGE_TEXTURE_BIT,
+                                 format, swizzle, usage,
                                  address, range, stride);
 
    if (state->state.map)

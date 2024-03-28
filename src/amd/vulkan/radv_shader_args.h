@@ -47,6 +47,7 @@ struct radv_shader_args {
 
    /* NGG */
    struct ac_arg ngg_provoking_vtx;
+   struct ac_arg ngg_lds_layout;
 
    /* NGG GS */
    struct ac_arg ngg_culling_settings;
@@ -54,7 +55,6 @@ struct radv_shader_args {
    struct ac_arg ngg_viewport_translate[2];
 
    /* Fragment shaders */
-   struct ac_arg ps_epilog_pc;
    struct ac_arg ps_state;
 
    struct ac_arg prolog_inputs;
@@ -72,13 +72,13 @@ struct radv_shader_args {
     * # [12:19] = the LS-HS vertex stride in DWORDS
     */
    struct ac_arg tcs_offchip_layout;
-   struct ac_arg tcs_epilog_pc;
 
    /* TCS epilogs */
    struct ac_arg patch_base;
-   struct ac_arg tcs_out_current_patch_data_offset;
    struct ac_arg invocation_id;
    struct ac_arg rel_patch_id;
+   struct ac_arg tess_lvl_out[4];
+   struct ac_arg tess_lvl_in[2];
 
    /* TES */
    /* # [0:7] = the number of tessellation patches
@@ -94,6 +94,9 @@ struct radv_shader_args {
 
    /* For non-monolithic VS or TES on GFX9+. */
    struct ac_arg next_stage_pc;
+
+   /* PS/TCS epilogs PC. */
+   struct ac_arg epilog_pc;
 
    struct radv_userdata_locations user_sgprs_locs;
    unsigned num_user_sgprs;

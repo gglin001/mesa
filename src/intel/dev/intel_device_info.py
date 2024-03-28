@@ -65,13 +65,16 @@ class Enum:
 
 class Member:
     """Stores details needed to declare and serialize the member of a struct."""
-    def __init__(self, member_type, name, array=None, compiler_field=False, comment=None):
+    def __init__(self, member_type, name, array=None,
+                 compiler_field=False, ray_tracing_field=False,
+                 comment=None):
         self.member_type = member_type
         self.name = name
         self.array = array
         # indicates whether this field is used by the compiler, and whether it
         # should be included in the shader compiler cache hash function.
         self.compiler_field = compiler_field
+        self.ray_tracing_field = ray_tracing_field
         self.comment=comment
 
 class Struct:
@@ -237,9 +240,8 @@ Struct("intel_device_info",
                comment="Driver internal numbers used to differentiate platforms."),
 
         Member("int", "verx10", compiler_field=True),
-        Member("int", "display_ver"),
 
-        Member("int", "revision", compiler_field=True,
+        Member("int", "revision",
                comment=dedent("""\
                This revision is from ioctl (I915_PARAM_REVISION) unlike
                pci_revision_id from drm device. Its value is not always
@@ -363,6 +365,7 @@ Struct("intel_device_info",
         Member("uint8_t", "subslice_masks",
                array="INTEL_DEVICE_MAX_SLICES * DIV_ROUND_UP(INTEL_DEVICE_MAX_SUBSLICES, 8)",
                compiler_field=True,
+               ray_tracing_field=True,
                comment=dedent("""\
                An array of bit mask of the subslices available, use subslice_slice_stride
                to access this array.""")),

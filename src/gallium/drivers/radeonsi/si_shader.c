@@ -1707,6 +1707,11 @@ static bool kill_ps_outputs_cb(struct nir_builder *b, nir_instr *instr, void *_k
    assert(nir_intrinsic_component(intr) == 0);
    unsigned cb_shader_mask = ac_get_cb_shader_mask(key->ps.part.epilog.spi_shader_col_format);
 
+   /* Preserve alpha if ALPHA_TESTING is enabled. */
+   if (key->ps.part.epilog.alpha_func != PIPE_FUNC_ALWAYS ||
+       key->ps.part.epilog.alpha_to_coverage_via_mrtz)
+      cb_shader_mask |= 1 << 3;
+
    /* If COLOR is broadcasted to multiple color buffers, combine their masks. */
    if (location == FRAG_RESULT_COLOR) {
       for (unsigned i = 1; i <= key->ps.part.epilog.last_cbuf; i++)
@@ -1828,8 +1833,10 @@ static bool si_lower_io_to_mem(struct si_shader *shader, nir_shader *nir,
                  key->ge.opt.same_patch_vertices &&
                  !(sel->info.base.inputs_read & ~sel->info.tcs_vgpr_only_inputs),
                  sel->info.tessfactors_are_def_in_all_invocs,
-                 /* Emit epilog only when monolithic shader. */
-                 shader->is_monolithic);
+                 /* Emit tess factor writes in monolithic shaders that don't need an epilog. */
+                 shader->is_monolithic,
+                 /* Only pass tess factors to epilog in registers when they are defined in all invocations. */
+                 !shader->is_monolithic && sel->info.tessfactors_are_def_in_all_invocs);
       return true;
    } else if (nir->info.stage == MESA_SHADER_TESS_EVAL) {
       NIR_PASS_V(nir, ac_nir_lower_tes_inputs_to_mem, si_map_io_driver_location);

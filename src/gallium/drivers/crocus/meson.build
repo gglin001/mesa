@@ -64,7 +64,7 @@ foreach v : ['40', '45', '50', '60', '70', '75', '80']
       '-DGFX_VERx10=@0@'.format(v),
     ],
     gnu_symbol_visibility : 'hidden',
-    dependencies : [dep_libdrm, dep_valgrind, idep_genxml, idep_nir_headers, idep_intel_dev, idep_intel_blorp],
+    dependencies : [dep_libdrm, dep_valgrind, idep_genxml, idep_nir_headers, idep_intel_dev, idep_intel_blorp_elk],
   )
 endforeach
 
@@ -83,10 +83,11 @@ libcrocus = static_library(
   dependencies : [
     dep_libdrm, dep_valgrind, idep_genxml,
     idep_libintel_common, idep_nir_headers,
-    idep_intel_dev, idep_intel_blorp, idep_intel_decoder,
+    idep_intel_dev, idep_intel_blorp_elk, idep_intel_decoder_elk,
+    idep_intel_compiler_elk,
   ],
   link_with : [
-    crocus_per_hw_ver_libs, libintel_compiler, libisl,
+    crocus_per_hw_ver_libs, libisl,
     libintel_perf
   ],
 )

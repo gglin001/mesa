@@ -172,6 +172,12 @@ struct fd_dev_info {
 
       bool broken_ds_ubwc_quirk;
 
+      /* Whether UBWC is supported on all IBOs. Prior to this, only readonly
+       * or writeonly IBOs could use UBWC and mixing reads and writes was not
+       * permitted.
+       */
+      bool supports_ibo_ubwc;
+
       struct {
          uint32_t PC_POWER_CNTL;
          uint32_t TPL1_DBG_ECO_CNTL;
@@ -197,6 +203,9 @@ struct fd_dev_info {
 
       /* maximum number of descriptor sets */
       uint32_t max_sets;
+
+      float line_width_min;
+      float line_width_max;
    } a6xx;
 
    struct {
@@ -220,6 +229,13 @@ struct fd_dev_info {
       /* Size of buffer in gmem for VPC attributes */
       uint32_t sysmem_vpc_attr_buf_size;
       uint32_t gmem_vpc_attr_buf_size;
+
+      /* Whether the UBWC fast-clear values for snorn, unorm, and int formats
+       * are the same. This is the case from a740 onwards. These formats were
+       * already otherwise UBWC-compatible, so this means that they are now
+       * fully compatible.
+       */
+      bool ubwc_unorm_snorm_int_compatible;
    } a7xx;
 };
 

@@ -402,6 +402,13 @@ intrinsic("is_sparse_texels_resident", dest_comp=1, src_comp=[1], bit_sizes=[1,3
 intrinsic("sparse_residency_code_and", dest_comp=1, src_comp=[1, 1], bit_sizes=[32],
           flags=[CAN_ELIMINATE, CAN_REORDER])
 
+# Unlike is_sparse_texels_resident, this intrinsic is required to consume
+# the destination of the nir_tex_instr or sparse_load intrinsic directly.
+# As such it is allowed to ignore the .e component where we usually store
+# sparse information.
+intrinsic("is_sparse_resident_zink", dest_comp=1, src_comp=[0], bit_sizes=[1],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+
 # a barrier is an intrinsic with no inputs/outputs but which can't be moved
 # around/optimized in general
 def barrier(name):
@@ -516,7 +523,7 @@ intrinsic("quad_vote_all", src_comp=[1], dest_comp=1, flags=[CAN_ELIMINATE])
 
 # Rotate operation from SPIR-V: SpvOpGroupNonUniformRotateKHR.
 intrinsic("rotate", src_comp=[0, 1], dest_comp=0, bit_sizes=src0,
-          indices=[EXECUTION_SCOPE, CLUSTER_SIZE], flags=[CAN_ELIMINATE]);
+          indices=[CLUSTER_SIZE], flags=[CAN_ELIMINATE]);
 
 intrinsic("reduce", src_comp=[0], dest_comp=0, bit_sizes=src0,
           indices=[REDUCTION_OP, CLUSTER_SIZE], flags=[CAN_ELIMINATE])
@@ -895,11 +902,27 @@ system_value("layer_id", 1)
 system_value("view_index", 1)
 system_value("subgroup_size", 1)
 system_value("subgroup_invocation", 1)
+
+# These intrinsics provide a bitmask for all invocations, with one bit per
+# invocation starting with the least significant bit, according to the
+# following table,
+#
+#    variable           equation for bit values
+#    ----------------   --------------------------------
+#    subgroup_eq_mask   bit index == subgroup_invocation
+#    subgroup_ge_mask   bit index >= subgroup_invocation
+#    subgroup_gt_mask   bit index >  subgroup_invocation
+#    subgroup_le_mask   bit index <= subgroup_invocation
+#    subgroup_lt_mask   bit index <  subgroup_invocation
+#
+# These correspond to gl_SubGroupEqMaskARB, etc. from GL_ARB_shader_ballot,
+# and the above documentation is "borrowed" from that extension spec.
 system_value("subgroup_eq_mask", 0, bit_sizes=[32, 64])
 system_value("subgroup_ge_mask", 0, bit_sizes=[32, 64])
 system_value("subgroup_gt_mask", 0, bit_sizes=[32, 64])
 system_value("subgroup_le_mask", 0, bit_sizes=[32, 64])
 system_value("subgroup_lt_mask", 0, bit_sizes=[32, 64])
+
 system_value("num_subgroups", 1)
 system_value("subgroup_id", 1)
 system_value("workgroup_size", 3)
@@ -1582,9 +1605,6 @@ system_value("rt_arg_scratch_offset_amd", 1)
 # Whether to call the anyhit shader for an intersection in an intersection shader.
 system_value("intersection_opaque_amd", 1, bit_sizes=[1])
 
-# Used for indirect ray tracing.
-system_value("ray_launch_size_addr_amd", 1, bit_sizes=[64])
-
 # pointer to the next resume shader
 system_value("resume_shader_address_amd", 1, bit_sizes=[64], indices=[CALL_IDX])
 
@@ -1658,15 +1678,17 @@ intrinsic("load_streamout_buffer_amd", dest_comp=4, indices=[BASE], bit_sizes=[3
 # An ID for each workgroup ordered by primitve sequence
 system_value("ordered_id_amd", 1)
 
-# Add src1 to global streamout buffer offsets in the specified order
+# Add src1 to global streamout buffer offsets in the specified order.
+# Only 1 lane must be active.
 # src[] = { ordered_id, counter }
 # WRITE_MASK = mask for counter channel to update
-intrinsic("ordered_xfb_counter_add_amd", dest_comp=0, src_comp=[1, 0], indices=[WRITE_MASK], bit_sizes=[32])
+intrinsic("ordered_xfb_counter_add_gfx11_amd", dest_comp=0, src_comp=[1, 0], indices=[WRITE_MASK], bit_sizes=[32])
+
 # Subtract from global streamout buffer offsets. Used to fix up the offsets
 # when we overflow streamout buffers.
 # src[] = { offsets }
 # WRITE_MASK = mask of offsets to subtract
-intrinsic("xfb_counter_sub_amd", src_comp=[0], indices=[WRITE_MASK], bit_sizes=[32])
+intrinsic("xfb_counter_sub_gfx11_amd", src_comp=[0], indices=[WRITE_MASK], bit_sizes=[32])
 
 # Provoking vertex index in a primitive
 system_value("provoking_vtx_in_prim_amd", 1)
@@ -1715,6 +1737,9 @@ intrinsic("strict_wqm_coord_amd", src_comp=[0], dest_comp=0, bit_sizes=[32], ind
 intrinsic("cmat_muladd_amd", src_comp=[16, 16, 0], dest_comp=0, bit_sizes=src2,
           indices=[SATURATE, CMAT_SIGNED_MASK], flags=[CAN_ELIMINATE])
 
+# Get the debug log buffer descriptor.
+intrinsic("load_debug_log_desc_amd", bit_sizes=[32], dest_comp=4, flags=[CAN_ELIMINATE, CAN_REORDER])
+
 # V3D-specific instrinc for tile buffer color reads.
 #
 # The hardware requires that we read the samples and components of a pixel
@@ -1736,6 +1761,9 @@ store("tlb_sample_color_v3d", [1], [BASE, COMPONENT, SRC_TYPE], [])
 # V3D-specific intrinsic to load the number of layers attached to
 # the target framebuffer
 intrinsic("load_fb_layers_v3d", dest_comp=1, flags=[CAN_ELIMINATE, CAN_REORDER])
+
+# V3D-specific intrinsic to load W coordinate from the fragment shader payload
+intrinsic("load_fep_w_v3d", dest_comp=1, flags=[CAN_ELIMINATE, CAN_REORDER])
 
 # Active invocation index within the subgroup.
 # Equivalent to popcount(ballot(true) & ((1 << subgroup_invocation) - 1))
@@ -1984,9 +2012,9 @@ intrinsic("load_reloc_const_intel", dest_comp=1, bit_sizes=[32],
 # With this intrinsic, we can just check the surface_index src with
 # nir_src_is_const() and ignore set_offset.
 #
-# src[] = { set_offset, surface_index, array_index }
+# src[] = { set_offset, surface_index, array_index, bindless_base_offset }
 intrinsic("resource_intel", dest_comp=1, bit_sizes=[32],
-          src_comp=[1, 1, 1],
+          src_comp=[1, 1, 1, 1],
           indices=[DESC_SET, BINDING, RESOURCE_ACCESS_INTEL, RESOURCE_BLOCK_INTEL],
           flags=[CAN_ELIMINATE, CAN_REORDER])
 
@@ -2123,8 +2151,12 @@ intrinsic("end_primitive_nv", dest_comp=1, src_comp=[1], indices=[STREAM_ID])
 # Contains the final primitive handle and indicate the end of emission.
 intrinsic("final_primitive_nv", src_comp=[1])
 
+# src[] = { data }.
+intrinsic("fs_out_nv", src_comp=[1], indices=[BASE], flags=[])
+barrier("copy_fs_outputs_nv")
+
 intrinsic("bar_set_nv", dest_comp=1, bit_sizes=[32], flags=[CAN_ELIMINATE])
-intrinsic("bar_break_nv", dest_comp=1, bit_sizes=[32], src_comp=[1])
+intrinsic("bar_break_nv", dest_comp=1, bit_sizes=[32], src_comp=[1, 1])
 # src[] = { bar, bar_set }
 intrinsic("bar_sync_nv", src_comp=[1, 1])
 

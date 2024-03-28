@@ -38,6 +38,7 @@
 #include "ir3_parser.h"
 #include "ir3_shader.h"
 
+#include "freedreno/isa/ir3-isa.h"
 #include "isa/isa.h"
 
 #include "disasm.h"
@@ -523,6 +524,11 @@ ir3_setup_used_key(struct ir3_shader *shader)
                                 SYSTEM_VALUE_BARYCENTRIC_PERSP_CENTROID) ||
                     BITSET_TEST(info->system_values_read,
                                 SYSTEM_VALUE_BARYCENTRIC_LINEAR_CENTROID)));
+
+      /* Only enable this shader key bit if "dual_color_blend_by_location" is
+       * enabled:
+       */
+      key->force_dual_color_blend = shader->compiler->options.dual_color_blend_by_location;
    } else if (info->stage == MESA_SHADER_COMPUTE) {
       key->fastc_srgb = ~0;
       key->fsamples = ~0;
@@ -835,13 +841,13 @@ ir3_shader_disasm(struct ir3_shader_variant *so, uint32_t *bin, FILE *out)
               const_state->immediates[i * 4 + 3]);
    }
 
-   isa_disasm(bin, so->info.sizedwords * 4, out,
-              &(struct isa_decode_options){
-                 .gpu_id = ir->compiler->gen * 100,
-                 .show_errors = true,
-                 .branch_labels = true,
-                 .no_match_cb = print_raw,
-              });
+   ir3_isa_disasm(bin, so->info.sizedwords * 4, out,
+                  &(struct isa_decode_options){
+                     .gpu_id = ir->compiler->gen * 100,
+                     .show_errors = true,
+                     .branch_labels = true,
+                     .no_match_cb = print_raw,
+                  });
 
    fprintf(out, "; %s: outputs:", type);
    for (i = 0; i < so->outputs_count; i++) {

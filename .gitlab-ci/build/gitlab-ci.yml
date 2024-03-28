@@ -17,7 +17,6 @@
     paths:
       - _build/meson-logs/*.txt
       - _build/meson-logs/strace
-      - shader-db
       - artifacts
 
 # Just Linux
@@ -74,10 +73,11 @@ debian-testing:
       -D platforms=x11,wayland
     GALLIUM_ST: >
       -D dri3=enabled
+      -D gallium-nine=true
       -D gallium-va=enabled
       -D gallium-rusticl=true
-    GALLIUM_DRIVERS: "swrast,virgl,radeonsi,zink,crocus,iris,i915,r300"
-    VULKAN_DRIVERS: "swrast,amd,intel,intel_hasvk,virtio,nouveau-experimental"
+    GALLIUM_DRIVERS: "swrast,virgl,radeonsi,zink,crocus,iris,i915,r300,svga"
+    VULKAN_DRIVERS: "swrast,amd,intel,intel_hasvk,virtio,nouveau"
     BUILDTYPE: "debugoptimized"
     EXTRA_OPTION: >
       -D spirv-to-dxil=true
@@ -180,6 +180,7 @@ debian-build-testing:
       -D tools=drm-shim,etnaviv,freedreno,glsl,intel,intel-ui,nir,nouveau,lima,panfrost,asahi
       -D b_lto=true
     LLVM_VERSION: 15
+    S3_ARTIFACT_NAME: debian-build-testing
   script: |
     section_start lava-pytest "lava-pytest"
     .gitlab-ci/lava/lava-pytest.sh
@@ -189,9 +190,27 @@ debian-build-testing:
     .gitlab-ci/run-yamllint.sh
     section_switch meson "meson"
     .gitlab-ci/meson/build.sh
+    .gitlab-ci/prepare-artifacts.sh
+  timeout: 15m
+
+shader-db:
+  stage: code-validation
+  extends:
+    - .use-debian/x86_64_build
+    - .container+build-rules
+  needs:
+    - debian-build-testing
+  variables:
+    S3_ARTIFACT_NAME: debian-build-testing
+  before_script:
+    - !reference [.download_s3, before_script]
+  script: |
     section_switch shader-db "shader-db"
     .gitlab-ci/run-shader-db.sh
-  timeout: 30m
+  artifacts:
+    paths:
+      - shader-db
+  timeout: 15m
 
 # Test a release build with -Werror so new warnings don't sneak in.
 debian-release:
@@ -539,7 +558,7 @@ debian-clang:
       -D opencl-spirv=true
       -D shared-glapi=enabled
     GALLIUM_DRIVERS: "iris,nouveau,kmsro,r300,r600,freedreno,swrast,svga,v3d,vc4,virgl,etnaviv,panfrost,lima,zink,radeonsi,tegra,d3d12,crocus,i915,asahi"
-    VULKAN_DRIVERS: intel,amd,freedreno,broadcom,virtio,swrast,panfrost,imagination-experimental,microsoft-experimental,nouveau-experimental
+    VULKAN_DRIVERS: intel,amd,freedreno,broadcom,virtio,swrast,panfrost,imagination-experimental,microsoft-experimental,nouveau
     EXTRA_OPTION:
       -D spirv-to-dxil=true
       -D osmesa=true
@@ -617,7 +636,7 @@ debian-vulkan:
       -D c_args=-fno-sanitize-recover=all
       -D cpp_args=-fno-sanitize-recover=all
     UBSAN_OPTIONS: "print_stacktrace=1"
-    VULKAN_DRIVERS: amd,broadcom,freedreno,intel,intel_hasvk,panfrost,virtio,imagination-experimental,microsoft-experimental,nouveau-experimental
+    VULKAN_DRIVERS: amd,broadcom,freedreno,intel,intel_hasvk,panfrost,virtio,imagination-experimental,microsoft-experimental,nouveau
     EXTRA_OPTION: >
       -D vulkan-layers=device-select,overlay
       -D build-aco-tests=true

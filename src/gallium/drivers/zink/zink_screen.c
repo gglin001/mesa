@@ -80,10 +80,14 @@ bool zink_tracing = false;
 #endif
 #endif
 
-#if defined(__APPLE__)
+#ifdef __APPLE__
+#include "MoltenVK/mvk_vulkan.h"
 // Source of MVK_VERSION
-#include "MoltenVK/vk_mvk_moltenvk.h"
-#endif
+#include "MoltenVK/mvk_config.h"
+#define VK_NO_PROTOTYPES
+#include "MoltenVK/mvk_deprecated_api.h"
+#include "MoltenVK/mvk_private_api.h"
+#endif /* __APPLE__ */
 
 #ifdef HAVE_LIBDRM
 #include "drm-uapi/dma-buf.h"
@@ -562,6 +566,8 @@ zink_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
    }
    case PIPE_CAP_SUPPORTED_PRIM_MODES: {
       uint32_t modes = BITFIELD_MASK(MESA_PRIM_COUNT);
+      if (!screen->have_triangle_fans)
+        modes &= ~BITFIELD_BIT(MESA_PRIM_QUADS);
       modes &= ~BITFIELD_BIT(MESA_PRIM_QUAD_STRIP);
       modes &= ~BITFIELD_BIT(MESA_PRIM_POLYGON);
       modes &= ~BITFIELD_BIT(MESA_PRIM_LINE_LOOP);
@@ -837,6 +843,9 @@ zink_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
       return 1;
 
    case PIPE_CAP_BINDLESS_TEXTURE:
+      if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB &&
+          (screen->info.db_props.maxDescriptorBufferBindings < 2 || screen->info.db_props.maxSamplerDescriptorBufferBindings < 2))
+         return 0;
       return screen->info.have_EXT_descriptor_indexing;
 
    case PIPE_CAP_TEXTURE_BUFFER_OFFSET_ALIGNMENT:
@@ -1004,7 +1013,7 @@ zink_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
       return 0;
 
    case PIPE_CAP_MAX_SHADER_PATCH_VARYINGS:
-      return screen->info.props.limits.maxTessellationControlPerVertexOutputComponents / 4;
+      return screen->info.props.limits.maxTessellationControlPerPatchOutputComponents / 4;
    case PIPE_CAP_MAX_VARYINGS:
       /* need to reserve up to 60 of our varying components and 16 slots for streamout */
       return MIN2(screen->info.props.limits.maxVertexOutputComponents / 4 / 2, 16);
@@ -1399,6 +1408,77 @@ zink_is_format_supported(struct pipe_screen *pscreen,
           if (!(screen->info.props.limits.storageImageSampleCounts & sample_mask))
              return false;
       }
+      VkResult ret;
+      VkImageFormatProperties image_props;
+      VkImageFormatProperties2 props2;
+      props2.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+      props2.pNext = NULL;
+      VkPhysicalDeviceImageFormatInfo2 info;
+      info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
+      info.pNext = NULL;
+      info.format = vkformat;
+      info.flags = 0;
+      info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+      info.tiling = VK_IMAGE_TILING_OPTIMAL;
+      switch (target) {
+      case PIPE_TEXTURE_1D:
+      case PIPE_TEXTURE_1D_ARRAY: {
+         bool need_2D = false;
+         if (util_format_is_depth_or_stencil(format))
+            need_2D |= screen->need_2D_zs;
+         info.type = need_2D ? VK_IMAGE_TYPE_2D : VK_IMAGE_TYPE_1D;
+         break;
+      }
+
+      case PIPE_TEXTURE_CUBE:
+      case PIPE_TEXTURE_CUBE_ARRAY:
+         info.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+         FALLTHROUGH;
+      case PIPE_TEXTURE_2D:
+      case PIPE_TEXTURE_2D_ARRAY:
+      case PIPE_TEXTURE_RECT:
+         info.type = VK_IMAGE_TYPE_2D;
+         break;
+
+      case PIPE_TEXTURE_3D:
+         info.type = VK_IMAGE_TYPE_3D;
+         if (bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL))
+            info.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+         if (screen->info.have_EXT_image_2d_view_of_3d)
+            info.flags |= VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
+         break;
+
+      default:
+         unreachable("unknown texture target");
+      }
+      u_foreach_bit(b, bind) {
+         switch (1<<b) {
+         case PIPE_BIND_RENDER_TARGET:
+            info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            break;
+         case PIPE_BIND_DEPTH_STENCIL:
+            info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+            break;
+         case PIPE_BIND_SAMPLER_VIEW:
+            info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+            break;
+         }
+      }
+
+      if (VKSCR(GetPhysicalDeviceImageFormatProperties2)) {
+         ret = VKSCR(GetPhysicalDeviceImageFormatProperties2)(screen->pdev, &info, &props2);
+         /* this is using VK_IMAGE_CREATE_EXTENDED_USAGE_BIT and can't be validated */
+         if (vk_format_aspects(vkformat) & VK_IMAGE_ASPECT_PLANE_1_BIT)
+            ret = VK_SUCCESS;
+         image_props = props2.imageFormatProperties;
+      } else {
+         ret = VKSCR(GetPhysicalDeviceImageFormatProperties)(screen->pdev, vkformat, info.type,
+                                                             info.tiling, info.usage, info.flags, &image_props);
+      }
+      if (ret != VK_SUCCESS)
+         return false;
+      if (!(sample_count & image_props.sampleCounts))
+         return false;
    }
 
    struct zink_format_props props = screen->format_props[format];
@@ -1460,15 +1540,25 @@ zink_is_format_supported(struct pipe_screen *pscreen,
 }
 
 static void
+zink_set_damage_region(struct pipe_screen *pscreen, struct pipe_resource *pres, unsigned int nrects, const struct pipe_box *rects)
+{
+   struct zink_resource *res = zink_resource(pres);
+
+   for (unsigned i = 0; i < nrects; i++) {
+      int y = pres->height0 - rects[i].y - rects[i].height;
+      res->damage.extent.width = MAX2(res->damage.extent.width, rects[i].x + rects[i].width);
+      res->damage.extent.height = MAX2(res->damage.extent.height, y + rects[i].height);
+      res->damage.offset.x = MIN2(res->damage.offset.x, rects[i].x);
+      res->damage.offset.y = MIN2(res->damage.offset.y, y);
+   }
+
+   res->use_damage = nrects > 0;
+}
+
+static void
 zink_destroy_screen(struct pipe_screen *pscreen)
 {
    struct zink_screen *screen = zink_screen(pscreen);
-   struct zink_batch_state *bs = screen->free_batch_states;
-   while (bs) {
-      struct zink_batch_state *bs_next = bs->next;
-      zink_batch_state_destroy(screen, bs);
-      bs = bs_next;
-   }
 
 #ifdef HAVE_RENDERDOC_APP_H
    if (screen->renderdoc_capture_all && p_atomic_dec_zero(&num_screens))
@@ -1480,6 +1570,13 @@ zink_destroy_screen(struct pipe_screen *pscreen)
 
    if (screen->copy_context)
       screen->copy_context->base.destroy(&screen->copy_context->base);
+
+   struct zink_batch_state *bs = screen->free_batch_states;
+   while (bs) {
+      struct zink_batch_state *bs_next = bs->next;
+      zink_batch_state_destroy(screen, bs);
+      bs = bs_next;
+   }
 
    if (VK_NULL_HANDLE != screen->debugUtilsCallbackHandle) {
       VKSCR(DestroyDebugUtilsMessengerEXT)(screen->instance, screen->debugUtilsCallbackHandle, NULL);
@@ -1545,6 +1642,7 @@ zink_destroy_screen(struct pipe_screen *pscreen)
       close(screen->drm_fd);
 
    slab_destroy_parent(&screen->transfer_pool);
+   slab_destroy(&screen->present_mempool);
    ralloc_free(screen);
    glsl_type_singleton_decref();
 }
@@ -1718,6 +1816,7 @@ zink_flush_frontbuffer(struct pipe_screen *pscreen,
                        struct pipe_resource *pres,
                        unsigned level, unsigned layer,
                        void *winsys_drawable_handle,
+                       unsigned nboxes,
                        struct pipe_box *sub_box)
 {
    struct zink_screen *screen = zink_screen(pscreen);
@@ -1749,10 +1848,11 @@ zink_flush_frontbuffer(struct pipe_screen *pscreen,
          util_queue_fence_wait(&bs->flush_completed);
       }
    }
+   res->use_damage = false;
 
    /* always verify that this was acquired */
    assert(zink_kopper_acquired(res->obj->dt, res->obj->dt_idx));
-   zink_kopper_present_queue(screen, res);
+   zink_kopper_present_queue(screen, res, nboxes, sub_box);
 }
 
 bool
@@ -2131,15 +2231,28 @@ retry:
             props.pNext = &mod_props;
          }
          VkFormatProperties3 props3 = {0};
-         props3.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3;
-         props3.pNext = props.pNext;
-         props.pNext = &props3;
+         if (screen->info.have_KHR_format_feature_flags2 || screen->info.have_vulkan13) {
+           props3.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3;
+           props3.pNext = props.pNext;
+           props.pNext = &props3;
+         }
+
          VKSCR(GetPhysicalDeviceFormatProperties2)(screen->pdev, format, &props);
-         screen->format_props[i].linearTilingFeatures = props3.linearTilingFeatures;
-         screen->format_props[i].optimalTilingFeatures = props3.optimalTilingFeatures;
-         screen->format_props[i].bufferFeatures = props3.bufferFeatures;
-         if (props3.linearTilingFeatures & VK_FORMAT_FEATURE_2_LINEAR_COLOR_ATTACHMENT_BIT_NV)
-            screen->format_props[i].linearTilingFeatures |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+
+         if (screen->info.have_KHR_format_feature_flags2 || screen->info.have_vulkan13) {
+            screen->format_props[i].linearTilingFeatures = props3.linearTilingFeatures;
+            screen->format_props[i].optimalTilingFeatures = props3.optimalTilingFeatures;
+            screen->format_props[i].bufferFeatures = props3.bufferFeatures;
+
+            if (props3.linearTilingFeatures & VK_FORMAT_FEATURE_2_LINEAR_COLOR_ATTACHMENT_BIT_NV)
+               screen->format_props[i].linearTilingFeatures |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+         } else {
+           // MoltenVk is 1.2 API
+           screen->format_props[i].linearTilingFeatures = props.formatProperties.linearTilingFeatures;
+           screen->format_props[i].optimalTilingFeatures = props.formatProperties.optimalTilingFeatures;
+           screen->format_props[i].bufferFeatures = props.formatProperties.bufferFeatures;
+         }
+
          if (screen->info.have_EXT_image_drm_format_modifier && mod_props.drmFormatModifierCount) {
             screen->modifier_props[i].drmFormatModifierCount = mod_props.drmFormatModifierCount;
             screen->modifier_props[i].pDrmFormatModifierProperties = ralloc_array(screen, VkDrmFormatModifierPropertiesEXT, mod_props.drmFormatModifierCount);
@@ -2274,7 +2387,7 @@ zink_screen_export_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
       .fd = -1,
    };
 
-   int fd;
+   int fd = -1;
    if (res->obj->is_aux) {
       fd = os_dupfd_cloexec(res->obj->handle);
    } else {
@@ -2283,6 +2396,11 @@ zink_screen_export_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
       fd_info.memory = zink_bo_get_mem(res->obj->bo);
       fd_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
       VKSCR(GetMemoryFdKHR)(screen->dev, &fd_info, &fd);
+   }
+
+   if (unlikely(fd < 0)) {
+      mesa_loge("MESA: Unable to get a valid memory fd");
+      return VK_NULL_HANDLE;
    }
 
    int ret = drmIoctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export);
@@ -2543,9 +2661,11 @@ zink_get_sparse_texture_virtual_page_size(struct pipe_screen *pscreen,
    default:
       return 0;
    }
-   VkImageUsageFlags flags = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-   flags |= is_zs ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+   VkImageUsageFlags use_flags = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                 VK_IMAGE_USAGE_STORAGE_BIT;
+   use_flags |= is_zs ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   VkImageUsageFlags flags = screen->format_props[pformat].optimalTilingFeatures & use_flags;
    VkSparseImageFormatProperties props[4]; //planar?
    unsigned prop_count = ARRAY_SIZE(props);
    VKSCR(GetPhysicalDeviceSparseImageFormatProperties)(screen->pdev, format, type,
@@ -2554,11 +2674,16 @@ zink_get_sparse_texture_virtual_page_size(struct pipe_screen *pscreen,
                                                        VK_IMAGE_TILING_OPTIMAL,
                                                        &prop_count, props);
    if (!prop_count) {
-      if (pformat == PIPE_FORMAT_R9G9B9E5_FLOAT) {
-         screen->faked_e5sparse = true;
-         goto hack_it_up;
-      }
-      return 0;
+      /* format may not support storage; try without */
+      flags &= ~VK_IMAGE_USAGE_STORAGE_BIT;
+      prop_count = ARRAY_SIZE(props);
+      VKSCR(GetPhysicalDeviceSparseImageFormatProperties)(screen->pdev, format, type,
+                                                         multi_sample ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_1_BIT,
+                                                         flags,
+                                                         VK_IMAGE_TILING_OPTIMAL,
+                                                         &prop_count, props);
+      if (!prop_count)
+         return 0;
    }
 
    if (size) {
@@ -3179,7 +3304,6 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       driParseConfigFiles(config->options, config->options_info, 0, "zink",
                           NULL, NULL, NULL, 0, NULL, 0);
       screen->driconf.dual_color_blend_by_location = driQueryOptionb(config->options, "dual_color_blend_by_location");
-      screen->driconf.glsl_correct_derivatives_after_discard = driQueryOptionb(config->options, "glsl_correct_derivatives_after_discard");
       //screen->driconf.inline_uniforms = driQueryOptionb(config->options, "radeonsi_inline_uniforms");
       screen->driconf.emulate_point_smooth = driQueryOptionb(config->options, "zink_emulate_point_smooth");
       screen->driconf.zink_shader_object_enable = driQueryOptionb(config->options, "zink_shader_object_enable");
@@ -3196,12 +3320,12 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       }
    }
 
-   vk_instance_dispatch_table_load(&screen->vk.instance,
-                                   screen->vk_GetInstanceProcAddr,
-                                   screen->instance);
-   vk_physical_device_dispatch_table_load(&screen->vk.physical_device,
-                                          screen->vk_GetInstanceProcAddr,
-                                          screen->instance);
+   vk_instance_uncompacted_dispatch_table_load(&screen->vk.instance,
+                                                screen->vk_GetInstanceProcAddr,
+                                                screen->instance);
+   vk_physical_device_uncompacted_dispatch_table_load(&screen->vk.physical_device,
+                                                      screen->vk_GetInstanceProcAddr,
+                                                      screen->instance);
 
    zink_verify_instance_extensions(screen);
 
@@ -3298,9 +3422,9 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    if (!screen->dev)
       goto fail;
 
-   vk_device_dispatch_table_load(&screen->vk.device,
-                                 screen->vk_GetDeviceProcAddr,
-                                 screen->dev);
+   vk_device_uncompacted_dispatch_table_load(&screen->vk.device,
+                                             screen->vk_GetDeviceProcAddr,
+                                             screen->dev);
 
    init_queue(screen);
 
@@ -3382,6 +3506,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    screen->base.get_sparse_texture_virtual_page_size = zink_get_sparse_texture_virtual_page_size;
    screen->base.get_driver_query_group_info = zink_get_driver_query_group_info;
    screen->base.get_driver_query_info = zink_get_driver_query_info;
+   screen->base.set_damage_region = zink_set_damage_region;
 
    if (screen->info.have_EXT_sample_locations) {
       VkMultisamplePropertiesEXT prop;
@@ -3414,6 +3539,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    populate_format_props(screen);
 
    slab_create_parent(&screen->transfer_pool, sizeof(struct zink_transfer), 16);
+   slab_create(&screen->present_mempool, sizeof(struct zink_kopper_present_info), 16);
 
    screen->driconf.inline_uniforms = debug_get_bool_option("ZINK_INLINE_UNIFORMS", screen->is_cpu) && !(zink_debug & ZINK_DEBUG_DGC);
 
@@ -3467,20 +3593,11 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
          mesa_logw("zink: bug detected: inputAttachmentDescriptorSize(%u) > %u", (unsigned)screen->info.db_props.inputAttachmentDescriptorSize, ZINK_FBFETCH_DESCRIPTOR_SIZE);
          can_db = false;
       }
-      if (screen->compact_descriptors) {
-         if (screen->info.db_props.maxDescriptorBufferBindings < 3) {
-            if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB) {
-               mesa_loge("Cannot use db descriptor mode with compact descriptors with maxDescriptorBufferBindings < 3");
-               goto fail;
-            }
-            can_db = false;
-         }
-      } else {
-         if (screen->info.db_props.maxDescriptorBufferBindings < 5) {
-            if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB) {
-               mesa_loge("Cannot use db descriptor mode with maxDescriptorBufferBindings < 5");
-               goto fail;
-            }
+      if (screen->info.db_props.maxDescriptorBufferBindings < 2 || screen->info.db_props.maxSamplerDescriptorBufferBindings < 2) {
+         if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB) {
+            /* allow for testing, but disable bindless */
+            mesa_logw("Cannot use bindless and db descriptor mode with (maxDescriptorBufferBindings||maxSamplerDescriptorBufferBindings) < 2");
+         } else {
             can_db = false;
          }
       }

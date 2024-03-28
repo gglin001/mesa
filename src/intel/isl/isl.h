@@ -1150,6 +1150,8 @@ typedef uint64_t isl_surf_usage_flags_t;
 #define ISL_SURF_USAGE_2D_3D_COMPATIBLE_BIT    (1u << 19)
 #define ISL_SURF_USAGE_SPARSE_BIT              (1u << 20)
 #define ISL_SURF_USAGE_NO_AUX_TT_ALIGNMENT_BIT (1u << 21)
+#define ISL_SURF_USAGE_BLITTER_DST_BIT         (1u << 22)
+#define ISL_SURF_USAGE_BLITTER_SRC_BIT         (1u << 23)
 /** @} */
 
 /**
@@ -2268,6 +2270,16 @@ isl_tiling_to_i915_tiling(enum isl_tiling tiling);
 
 enum isl_tiling
 isl_tiling_from_i915_tiling(uint32_t tiling);
+
+
+/**
+ * Return an isl_aux_state to describe an auxiliary surface that is either
+ * uninitialized or zeroed.
+ */
+enum isl_aux_state
+isl_aux_get_initial_state(const struct intel_device_info *devinfo,
+                          enum isl_aux_usage usage,
+                          bool zeroed);
 
 /**
  * Return an isl_aux_op needed to enable an access to occur in an

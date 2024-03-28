@@ -84,7 +84,8 @@ pack_lod_and_array_index(nir_builder *b, nir_tex_instr *tex)
    /* Second, replace the coordinate with a new value that has one fewer
     * component (i.e., drop the array index).
     */
-   nir_def *reduced_coord = nir_trim_vector(b, coord, 2);
+   nir_def *reduced_coord = nir_trim_vector(b, coord,
+                                            tex->coord_components - 1);
    tex->coord_components--;
 
    /* Finally, remove the old sources and add the new. */
@@ -92,6 +93,71 @@ pack_lod_and_array_index(nir_builder *b, nir_tex_instr *tex)
 
    nir_tex_instr_remove_src(tex, lod_index);
    nir_tex_instr_add_src(tex, nir_tex_src_backend1, lod_ai);
+
+   return true;
+}
+
+/**
+ * Pack either the explicit LOD/Bias and the offset together.
+ */
+static bool
+pack_lod_or_bias_and_offset(nir_builder *b, nir_tex_instr *tex)
+{
+   int offset_index = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   if (offset_index < 0)
+      return false;
+
+   /* If 32-bit texture coordinates are used, pack either the explicit LOD or
+    * LOD bias and the array index into a single (32-bit) value.
+    */
+   int lod_index = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   if (lod_index < 0) {
+      lod_index = nir_tex_instr_src_index(tex, nir_tex_src_bias);
+
+      /* The explicit LOD or LOD bias may not be found if this lowering has
+       * already occured.  The explicit LOD may also not be found in some
+       * cases where it is zero.
+       */
+      if (lod_index < 0)
+         return false;
+   }
+
+   assert(nir_tex_instr_src_type(tex, lod_index) == nir_type_float);
+
+   /* Also do not perform this packing if the explicit LOD is zero. */
+   if (nir_src_is_const(tex->src[lod_index].src) &&
+       nir_src_as_float(tex->src[lod_index].src) == 0.0) {
+      return false;
+   }
+
+   nir_def *lod = tex->src[lod_index].src.ssa;
+   nir_def *offset = tex->src[offset_index].src.ssa;
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   /* When using the programmable offsets instruction gather4_po_l_c with
+    * SIMD16 or SIMD32 the U, V offsets are combined with LOD/bias parameters
+    * on the 12 LSBs. For the offset parameters on gather instructions the 6
+    * least significant bits are honored as signed value with a range
+    * [-32..31].
+    *
+    * Pack Offset U, and V for texture gather with offsets.
+    *
+    *    ------------------------------------------
+    *    |Bits     | [31:12]  | [11:6]  | [5:0]   |
+    *    ------------------------------------------
+    *    |OffsetUV | LOD/Bias | OffsetV | OffsetU |
+    *    ------------------------------------------
+    */
+   nir_def *offu = nir_iand_imm(b, nir_channel(b, offset, 0), 0x3F);
+   nir_def *offv = nir_iand_imm(b, nir_channel(b, offset, 1), 0x3F);
+
+   nir_def *offsetUV = nir_ior(b, offu, nir_ishl_imm(b, offv, 6));
+
+   nir_def *lod_offsetUV = nir_ior(b, offsetUV,
+                                   nir_iand_imm(b, lod, 0xFFFFF000));
+   nir_tex_instr_remove_src(tex, offset_index);
+   nir_tex_instr_add_src(tex, nir_tex_src_backend2, lod_offsetUV);
 
    return true;
 }
@@ -108,11 +174,17 @@ intel_nir_lower_texture_instr(nir_builder *b, nir_instr *instr, void *cb_data)
    switch (tex->op) {
    case nir_texop_txl:
    case nir_texop_txb:
+   case nir_texop_tg4:
       if (tex->is_array &&
           tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE &&
           opts->combined_lod_and_array_index) {
          return pack_lod_and_array_index(b, tex);
       }
+
+      if (tex->op == nir_texop_tg4 && opts->combined_lod_or_bias_and_offset) {
+         return pack_lod_or_bias_and_offset(b, tex);
+      }
+
       return false;
    default:
       /* Nothing to do */

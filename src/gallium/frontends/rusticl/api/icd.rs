@@ -398,6 +398,12 @@ macro_rules! impl_cl_type_trait_base {
 
         impl $crate::api::icd::BaseCLObject<'_, $err, $cl> for $t {}
 
+        impl $t {
+            fn _ensure_send_sync(&self) -> impl Send + Sync + '_ {
+                self
+            }
+        }
+
         // there are two reason to implement those traits for all objects
         //   1. it speeds up operations
         //   2. we want to check for real equality more explicit to stay conformant with the API
@@ -504,6 +510,11 @@ extern "C" fn cl_get_extension_function_address(
         "clGetGLObjectInfo" => cl_get_gl_object_info as *mut ::std::ffi::c_void,
         "clGetGLTextureInfo" => cl_get_gl_texture_info as *mut ::std::ffi::c_void,
 
+        // cl_khr_suggested_local_work_size
+        "clGetKernelSuggestedLocalWorkSizeKHR" => {
+            cl_get_kernel_suggested_local_work_size_khr as *mut ::std::ffi::c_void
+        }
+
         // cl_arm_shared_virtual_memory
         "clEnqueueSVMFreeARM" => cl_enqueue_svm_free_arm as *mut ::std::ffi::c_void,
         "clEnqueueSVMMapARM" => cl_enqueue_svm_map_arm as *mut ::std::ffi::c_void,
@@ -570,7 +581,7 @@ extern "C" fn cl_svm_alloc(
 }
 
 extern "C" fn cl_svm_free(context: cl_context, svm_pointer: *mut ::std::os::raw::c_void) {
-    svm_free(context, svm_pointer).ok();
+    svm_free(context, svm_pointer as usize).ok();
 }
 
 extern "C" fn cl_get_kernel_sub_group_info(

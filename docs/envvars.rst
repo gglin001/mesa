@@ -1275,8 +1275,6 @@ RADV driver environment variables
       disable HIZ for depthstencil images
    ``noibs``
       disable directly recording command buffers in GPU-visible memory
-   ``nomemorycache``
-      disable memory shaders cache
    ``nomeshshader``
       disable mesh shader support on GFX10.3+
    ``nongg``
@@ -1365,8 +1363,7 @@ RADV driver environment variables
    ``sam``
       enable optimizations to move more driver internal objects to VRAM.
    ``shader_object``
-      enable experimental implementation of VK_EXT_shader_object (GFX6-8 and
-      VEGA10)
+      enable experimental implementation of VK_EXT_shader_object
    ``transfer_queue``
       enable experimental transfer queue support (GFX9+, not yet spec compliant)
    ``video_decode``

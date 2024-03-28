@@ -18,7 +18,6 @@ use mesa_rust_util::math::*;
 use mesa_rust_util::serialize::*;
 use rusticl_opencl_gen::*;
 
-use std::cell::RefCell;
 use std::cmp;
 use std::collections::HashMap;
 use std::convert::TryInto;
@@ -26,6 +25,8 @@ use std::os::raw::c_void;
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 
 // ugh, we are not allowed to take refs, so...
 #[derive(Clone)]
@@ -299,8 +300,8 @@ pub struct Kernel {
     pub base: CLObjectBase<CL_INVALID_KERNEL>,
     pub prog: Arc<Program>,
     pub name: String,
-    pub values: Vec<RefCell<Option<KernelArgValue>>>,
-    pub builds: HashMap<&'static Device, Arc<NirKernelBuild>>,
+    values: Mutex<Vec<Option<KernelArgValue>>>,
+    builds: HashMap<&'static Device, Arc<NirKernelBuild>>,
     pub kernel_info: KernelInfo,
 }
 
@@ -459,22 +460,8 @@ fn lower_and_optimize_nir(
     let mut args = KernelArg::from_spirv_nir(args, nir);
     let mut internal_args = Vec::new();
 
-    let dv_opts = nir_remove_dead_variables_options {
-        can_remove_var: Some(can_remove_var),
-        can_remove_var_data: ptr::null_mut(),
-    };
-    nir_pass!(
-        nir,
-        nir_remove_dead_variables,
-        nir_variable_mode::nir_var_uniform
-            | nir_variable_mode::nir_var_image
-            | nir_variable_mode::nir_var_mem_constant
-            | nir_variable_mode::nir_var_mem_shared
-            | nir_variable_mode::nir_var_function_temp,
-        &dv_opts,
-    );
-
-    // asign locations for inline samplers
+    // asign locations for inline samplers.
+    // IMPORTANT: this needs to happen before nir_remove_dead_variables.
     let mut last_loc = -1;
     for v in nir
         .variables_with_mode(nir_variable_mode::nir_var_uniform | nir_variable_mode::nir_var_image)
@@ -501,6 +488,21 @@ fn lower_and_optimize_nir(
             last_loc = v.data.location;
         }
     }
+
+    let dv_opts = nir_remove_dead_variables_options {
+        can_remove_var: Some(can_remove_var),
+        can_remove_var_data: ptr::null_mut(),
+    };
+    nir_pass!(
+        nir,
+        nir_remove_dead_variables,
+        nir_variable_mode::nir_var_uniform
+            | nir_variable_mode::nir_var_image
+            | nir_variable_mode::nir_var_mem_constant
+            | nir_variable_mode::nir_var_mem_shared
+            | nir_variable_mode::nir_var_function_temp,
+        &dv_opts,
+    );
 
     nir_pass!(nir, nir_lower_readonly_images_to_tex, true);
     nir_pass!(
@@ -818,38 +820,30 @@ impl Kernel {
             .filter_map(|(&dev, b)| b.kernels.get(&name).map(|k| (dev, k.clone())))
             .collect();
 
-        // can't use vec!...
-        let values = kernel_info
-            .args
-            .iter()
-            .map(|_| RefCell::new(None))
-            .collect();
-
+        let values = vec![None; kernel_info.args.len()];
         Arc::new(Self {
             base: CLObjectBase::new(RusticlTypes::Kernel),
             prog: prog.clone(),
             name: name,
-            values: values,
+            values: Mutex::new(values),
             builds: builds,
             kernel_info: kernel_info,
         })
     }
 
-    fn optimize_local_size(&self, d: &Device, grid: &mut [u32; 3], block: &mut [u32; 3]) {
-        let mut threads = self.max_threads_per_block(d) as u32;
+    pub fn suggest_local_size(
+        &self,
+        d: &Device,
+        work_dim: usize,
+        grid: &mut [usize],
+        block: &mut [usize],
+    ) {
+        let mut threads = self.max_threads_per_block(d);
         let dim_threads = d.max_block_sizes();
-        let subgroups = self.preferred_simd_size(d) as u32;
+        let subgroups = self.preferred_simd_size(d);
 
-        if !block.contains(&0) {
-            for i in 0..3 {
-                // we already made sure everything is fine
-                grid[i] /= block[i];
-            }
-            return;
-        }
-
-        for i in 0..3 {
-            let t = cmp::min(threads, dim_threads[i] as u32);
+        for i in 0..work_dim {
+            let t = cmp::min(threads, dim_threads[i]);
             let gcd = gcd(t, grid[i]);
 
             block[i] = gcd;
@@ -860,9 +854,9 @@ impl Kernel {
         }
 
         // if we didn't fill the subgroup we can do a bit better if we have threads remaining
-        let total_threads = block[0] * block[1] * block[2];
+        let total_threads = block.iter().take(work_dim).product::<usize>();
         if threads != 1 && total_threads < subgroups {
-            for i in 0..3 {
+            for i in 0..work_dim {
                 if grid[i] * total_threads < threads {
                     block[i] *= grid[i];
                     grid[i] = 1;
@@ -870,6 +864,31 @@ impl Kernel {
                     break;
                 }
             }
+        }
+    }
+
+    fn optimize_local_size(&self, d: &Device, grid: &mut [u32; 3], block: &mut [u32; 3]) {
+        if !block.contains(&0) {
+            for i in 0..3 {
+                // we already made sure everything is fine
+                grid[i] /= block[i];
+            }
+            return;
+        }
+
+        let mut usize_grid = [0usize; 3];
+        let mut usize_block = [0usize; 3];
+
+        for i in 0..3 {
+            usize_grid[i] = grid[i] as usize;
+            usize_block[i] = block[i] as usize;
+        }
+
+        self.suggest_local_size(d, 3, &mut usize_grid, &mut usize_block);
+
+        for i in 0..3 {
+            grid[i] = usize_grid[i] as u32;
+            block[i] = usize_block[i] as u32;
         }
     }
 
@@ -908,7 +927,8 @@ impl Kernel {
 
         self.optimize_local_size(q.device, &mut grid, &mut block);
 
-        for (arg, val) in self.kernel_info.args.iter().zip(&self.values) {
+        let arg_values = self.arg_values();
+        for (arg, val) in self.kernel_info.args.iter().zip(arg_values.iter()) {
             if arg.dead {
                 continue;
             }
@@ -920,7 +940,7 @@ impl Kernel {
             {
                 input.resize(arg.offset, 0);
             }
-            match val.borrow().as_ref().unwrap() {
+            match val.as_ref().unwrap() {
                 KernelArgValue::Constant(c) => input.extend_from_slice(c),
                 KernelArgValue::Buffer(buffer) => {
                     let res = buffer.get_res_of_dev(q.device)?;
@@ -1153,6 +1173,20 @@ impl Kernel {
         }))
     }
 
+    pub fn arg_values(&self) -> MutexGuard<Vec<Option<KernelArgValue>>> {
+        self.values.lock().unwrap()
+    }
+
+    pub fn set_kernel_arg(&self, idx: usize, arg: KernelArgValue) -> CLResult<()> {
+        self.values
+            .lock()
+            .unwrap()
+            .get_mut(idx)
+            .ok_or(CL_INVALID_ARG_INDEX)?
+            .replace(arg);
+        Ok(())
+    }
+
     pub fn access_qualifier(&self, idx: cl_uint) -> cl_kernel_arg_access_qualifier {
         let aq = self.kernel_info.args[idx as usize].spirv.access_qualifier;
 
@@ -1298,7 +1332,7 @@ impl Clone for Kernel {
             base: CLObjectBase::new(RusticlTypes::Kernel),
             prog: self.prog.clone(),
             name: self.name.clone(),
-            values: self.values.clone(),
+            values: Mutex::new(self.arg_values().clone()),
             builds: self.builds.clone(),
             kernel_info: self.kernel_info.clone(),
         }
