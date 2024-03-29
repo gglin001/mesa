@@ -29,7 +29,7 @@ PKG_CONFIG_PATH=/opt/spirv-tools/lib/pkgconfig:/opt/llvm-spirv/lib/pkgconfig:/op
 CC=/usr/bin/clang CXX=/usr/bin/clang++ \
   meson setup --reconfigure build \
   --buildtype=release \
-  -Dprefix=/opt/mesa \
+  -Dprefix=$PWD/build/install \
   -Dplatforms=wayland \
   -Dopengl=true \
   -Dgles1=disabled \
