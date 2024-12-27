@@ -31,6 +31,7 @@ PKG_CONFIG_PATH=/opt/spirv-tools/lib/pkgconfig:/opt/llvm-spirv/lib/pkgconfig:/op
   -Dgallium-drivers="swrast" \
   -Dgallium-opencl=standalone \
   -Dgallium-rusticl=false \
+  -Dopencl-spirv=true \
   -Dvulkan-drivers="swrast" \
   -Dperfetto=false \
   -Dbuild-tests=false \
