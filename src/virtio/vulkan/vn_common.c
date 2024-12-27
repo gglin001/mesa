@@ -43,7 +43,6 @@ static const struct debug_control vn_perf_options[] = {
    { "no_async_queue_submit", VN_PERF_NO_ASYNC_QUEUE_SUBMIT },
    { "no_event_feedback", VN_PERF_NO_EVENT_FEEDBACK },
    { "no_fence_feedback", VN_PERF_NO_FENCE_FEEDBACK },
-   { "no_memory_suballoc", VN_PERF_NO_MEMORY_SUBALLOC },
    { "no_cmd_batching", VN_PERF_NO_CMD_BATCHING },
    { "no_semaphore_feedback", VN_PERF_NO_SEMAPHORE_FEEDBACK },
    { "no_query_feedback", VN_PERF_NO_QUERY_FEEDBACK },
@@ -167,6 +166,8 @@ vn_relax_reason_string(enum vn_relax_reason reason)
    switch (reason) {
    case VN_RELAX_REASON_RING_SEQNO:
       return "ring seqno";
+   case VN_RELAX_REASON_TLS_RING_SEQNO:
+      return "tls ring seqno";
    case VN_RELAX_REASON_RING_SPACE:
       return "ring space";
    case VN_RELAX_REASON_FENCE:
@@ -204,6 +205,7 @@ vn_relax_get_profile(enum vn_relax_reason reason)
          .warn_order = 12,
          .abort_order = 16,
       };
+   case VN_RELAX_REASON_TLS_RING_SEQNO:
    case VN_RELAX_REASON_RING_SPACE:
    case VN_RELAX_REASON_FENCE:
    case VN_RELAX_REASON_SEMAPHORE:
@@ -331,7 +333,8 @@ vn_tls_get_ring(struct vn_instance *instance)
    struct vn_ring_layout layout;
    vn_ring_get_layout(buf_size, extra_size, &layout);
 
-   tls_ring->ring = vn_ring_create(instance, &layout, direct_order);
+   tls_ring->ring =
+      vn_ring_create(instance, &layout, direct_order, true /* is_tls_ring */);
    if (!tls_ring->ring) {
       free(tls_ring);
       return NULL;

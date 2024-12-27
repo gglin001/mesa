@@ -10,6 +10,8 @@
 
 #include "vk_log.h"
 
+#define PANVK_MAX_BUFFER_SIZE (1 << 30)
+
 VKAPI_ATTR VkDeviceAddress VKAPI_CALL
 panvk_GetBufferDeviceAddress(VkDevice _device,
                              const VkBufferDeviceAddressInfo *pInfo)
@@ -19,25 +21,49 @@ panvk_GetBufferDeviceAddress(VkDevice _device,
    return buffer->dev_addr;
 }
 
-VKAPI_ATTR void VKAPI_CALL
-panvk_GetBufferMemoryRequirements2(VkDevice device,
-                                   const VkBufferMemoryRequirementsInfo2 *pInfo,
-                                   VkMemoryRequirements2 *pMemoryRequirements)
+VKAPI_ATTR uint64_t VKAPI_CALL
+panvk_GetBufferOpaqueCaptureAddress(VkDevice _device,
+                                    const VkBufferDeviceAddressInfo *pInfo)
 {
-   VK_FROM_HANDLE(panvk_buffer, buffer, pInfo->buffer);
+   return panvk_GetBufferDeviceAddress(_device, pInfo);
+}
 
+VKAPI_ATTR void VKAPI_CALL
+panvk_GetDeviceBufferMemoryRequirements(VkDevice device,
+                                        const VkDeviceBufferMemoryRequirements *pInfo,
+                                        VkMemoryRequirements2 *pMemoryRequirements)
+{
    const uint64_t align = 64;
-   const uint64_t size = align64(buffer->vk.size, align);
+   const uint64_t size = align64(pInfo->pCreateInfo->size, align);
 
    pMemoryRequirements->memoryRequirements.memoryTypeBits = 1;
    pMemoryRequirements->memoryRequirements.alignment = align;
    pMemoryRequirements->memoryRequirements.size = size;
+
+   vk_foreach_struct_const(ext, pMemoryRequirements->pNext) {
+      switch (ext->sType) {
+      case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
+         VkMemoryDedicatedRequirements *dedicated = (void *)ext;
+         dedicated->requiresDedicatedAllocation = false;
+         dedicated->prefersDedicatedAllocation = dedicated->requiresDedicatedAllocation;
+         break;
+      }
+      default:
+         vk_debug_ignored_stype(ext->sType);
+         break;
+      }
+   }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
-panvk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
+panvk_BindBufferMemory2(VkDevice _device, uint32_t bindInfoCount,
                         const VkBindBufferMemoryInfo *pBindInfos)
 {
+   VK_FROM_HANDLE(panvk_device, device, _device);
+   const struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(device->vk.physical);
+   const unsigned arch = pan_arch(phys_dev->kmod.props.gpu_prod_id);
+
    for (uint32_t i = 0; i < bindInfoCount; ++i) {
       VK_FROM_HANDLE(panvk_device_memory, mem, pBindInfos[i].memory);
       VK_FROM_HANDLE(panvk_buffer, buffer, pBindInfos[i].buffer);
@@ -55,7 +81,7 @@ panvk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
        *
        * Make sure this goes away as soon as we fixed indirect draws.
        */
-      if (buffer->vk.usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT) {
+      if (arch < 9 && (buffer->vk.usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT)) {
          VkDeviceSize offset = pBindInfos[i].memoryOffset;
          VkDeviceSize pgsize = getpagesize();
          off_t map_start = offset & ~(pgsize - 1);
@@ -82,10 +108,13 @@ panvk_CreateBuffer(VkDevice _device, const VkBufferCreateInfo *pCreateInfo,
 
    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
 
+   if (pCreateInfo->size > PANVK_MAX_BUFFER_SIZE)
+      return panvk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
    buffer =
       vk_buffer_create(&device->vk, pCreateInfo, pAllocator, sizeof(*buffer));
    if (buffer == NULL)
-      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    *pBuffer = panvk_buffer_to_handle(buffer);
 

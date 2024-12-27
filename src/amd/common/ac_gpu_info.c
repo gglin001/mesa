@@ -8,6 +8,8 @@
 #include "ac_shader_util.h"
 #include "ac_debug.h"
 #include "ac_surface.h"
+#include "ac_fake_hw_db.h"
+#include "ac_linux_drm.h"
 
 #include "addrlib/src/amdgpu_asic_addr.h"
 #include "sid.h"
@@ -21,7 +23,7 @@
 #include <ctype.h>
 
 #define AMDGPU_MI100_RANGE       0x32, 0x3C
-#define AMDGPU_MI200_RANGE       0x3C, 0xFF
+#define AMDGPU_MI200_RANGE       0x3C, 0x46
 #define AMDGPU_GFX940_RANGE      0x46, 0xFF
 
 #define ASICREV_IS_MI100(r)      ASICREV_IS(r, MI100)
@@ -76,6 +78,16 @@
 #define AMDGPU_VRAM_TYPE_DDR5  10
 #define AMDGPU_VRAM_TYPE_LPDDR4 11
 #define AMDGPU_VRAM_TYPE_LPDDR5 12
+
+#define AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_MPEG2 0
+#define AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_MPEG4 1
+#define AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_VC1 2
+#define AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_MPEG4_AVC 3
+#define AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_HEVC 4
+#define AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_JPEG 5
+#define AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_VP9 6
+#define AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_AV1 7
+#define AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_COUNT 8
 
 struct drm_amdgpu_heap_info {
    uint64_t total_heap_size;
@@ -198,6 +210,20 @@ struct drm_amdgpu_info_hw_ip {
    uint32_t available_rings;
    uint32_t ip_discovery_version;
 };
+
+struct drm_amdgpu_info_uq_fw_areas_gfx {
+   uint32_t shadow_size;
+   uint32_t shadow_alignment;
+   uint32_t csa_size;
+   uint32_t csa_alignment;
+};
+
+struct drm_amdgpu_info_uq_fw_areas {
+   union {
+      struct drm_amdgpu_info_uq_fw_areas_gfx gfx;
+   };
+};
+
 typedef struct _drmPciBusInfo {
    uint16_t domain;
    uint8_t bus;
@@ -219,14 +245,6 @@ struct amdgpu_bo_alloc_request {
    uint64_t phys_alignment;
    uint32_t preferred_heap;
    uint64_t flags;
-};
-struct amdgpu_gds_resource_info {
-   uint32_t gds_gfx_partition_size;
-   uint32_t gds_total_size;
-};
-struct amdgpu_buffer_size_alignments {
-   uint64_t size_local;
-   uint64_t size_remote;
 };
 struct amdgpu_heap_info {
    uint64_t heap_size;
@@ -275,56 +293,8 @@ static int amdgpu_bo_free(amdgpu_bo_handle buf_handle)
 {
    return -EINVAL;
 }
-static int amdgpu_query_buffer_size_alignment(amdgpu_device_handle dev,
-   struct amdgpu_buffer_size_alignments
-   *info)
-{
-   return -EINVAL;
-}
-static int amdgpu_query_firmware_version(amdgpu_device_handle dev, unsigned fw_type,
-   unsigned ip_instance, unsigned index,
-   uint32_t *version, uint32_t *feature)
-{
-   return -EINVAL;
-}
-static int amdgpu_query_hw_ip_info(amdgpu_device_handle dev, unsigned type,
-   unsigned ip_instance,
-   struct drm_amdgpu_info_hw_ip *info)
-{
-   return -EINVAL;
-}
-static int amdgpu_query_hw_ip_count(amdgpu_device_handle dev, unsigned type,
-   uint32_t *count)
-{
-   return -EINVAL;
-}
-static int amdgpu_query_heap_info(amdgpu_device_handle dev, uint32_t heap,
-   uint32_t flags, struct amdgpu_heap_info *info)
-{
-   return -EINVAL;
-}
-static int amdgpu_query_gpu_info(amdgpu_device_handle dev,
-   struct amdgpu_gpu_info *info)
-{
-   return -EINVAL;
-}
-static int amdgpu_query_info(amdgpu_device_handle dev, unsigned info_id,
-   unsigned size, void *value)
-{
-   return -EINVAL;
-}
 static int amdgpu_query_sw_info(amdgpu_device_handle dev, enum amdgpu_sw_info info,
    void *value)
-{
-   return -EINVAL;
-}
-static int amdgpu_query_gds_info(amdgpu_device_handle dev,
-   struct amdgpu_gds_resource_info *gds_info)
-{
-   return -EINVAL;
-}
-static int amdgpu_query_video_caps_info(amdgpu_device_handle dev, unsigned cap_type,
-                                 unsigned size, void *value)
 {
    return -EINVAL;
 }
@@ -335,6 +305,11 @@ static const char *amdgpu_get_marketing_name(amdgpu_device_handle dev)
 static intptr_t readlink(const char *path, char *buf, size_t bufsiz)
 {
    return -1;
+}
+static char *
+drmGetFormatModifierName(uint64_t modifier)
+{
+   return NULL;
 }
 #else
 #include "drm-uapi/amdgpu_drm.h"
@@ -575,14 +550,12 @@ static void handle_env_var_force_family(struct radeon_info *info)
    if (!family)
       return;
 
-   for (unsigned i = CHIP_TAHITI; i < CHIP_LAST; i++) {
-      if (!strcmp(family, ac_get_llvm_processor_name(i))) {
-         /* Override family and gfx_level. */
-         info->family = i;
+   for (size_t i = 0; i < ARRAY_SIZE(ac_fake_hw_db); i++) {
+      if (!strcmp(family, ac_fake_hw_db[i].name)) {
+         get_radeon_info(info, &ac_fake_hw_db[i]);
          info->name = "NOOP";
-         info->gfx_level = ac_get_gfx_level(i);
-         info->family_id = ac_get_family_id(i);
          info->family_overridden = true;
+         info->chip_rev = 1;
          return;
       }
    }
@@ -596,9 +569,8 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
 {
    struct amdgpu_gpu_info amdinfo;
    struct drm_amdgpu_info_device device_info = {0};
-   struct amdgpu_buffer_size_alignments alignment_info = {0};
-   uint32_t vce_version = 0, vce_feature = 0, uvd_version = 0, uvd_feature = 0,
-            vcn_version = 0, vcn_feature = 0;
+   uint32_t vidip_fw_version = 0, vidip_fw_feature = 0;
+   uint32_t num_instances = 0;
    int r, i, j;
    amdgpu_device_handle dev = dev_p;
 
@@ -638,28 +610,22 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    }
 
    /* Query hardware and driver information. */
-   r = amdgpu_query_gpu_info(dev, &amdinfo);
+   r = ac_drm_query_gpu_info(fd, &amdinfo);
    if (r) {
-      fprintf(stderr, "amdgpu: amdgpu_query_gpu_info failed.\n");
+      fprintf(stderr, "amdgpu: ac_drm_query_gpu_info failed.\n");
       return false;
    }
 
-   r = amdgpu_query_info(dev, AMDGPU_INFO_DEV_INFO, sizeof(device_info), &device_info);
+   r = ac_drm_query_info(fd, AMDGPU_INFO_DEV_INFO, sizeof(device_info), &device_info);
    if (r) {
-      fprintf(stderr, "amdgpu: amdgpu_query_info(dev_info) failed.\n");
-      return false;
-   }
-
-   r = amdgpu_query_buffer_size_alignment(dev, &alignment_info);
-   if (r) {
-      fprintf(stderr, "amdgpu: amdgpu_query_buffer_size_alignment failed.\n");
+      fprintf(stderr, "amdgpu: ac_drm_query_info(dev_info) failed.\n");
       return false;
    }
 
    for (unsigned ip_type = 0; ip_type < AMD_NUM_IP_TYPES; ip_type++) {
       struct drm_amdgpu_info_hw_ip ip_info = {0};
 
-      r = amdgpu_query_hw_ip_info(dev, ip_type, 0, &ip_info);
+      r = ac_drm_query_hw_ip_info(fd, ip_type, 0, &ip_info);
       if (r || !ip_info.available_rings)
          continue;
 
@@ -685,15 +651,12 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
                   device_info.family == FAMILY_MDN)
             info->ip[AMD_IP_GFX].ver_minor = info->ip[AMD_IP_COMPUTE].ver_minor = 3;
       }
-      if (ip_type >= AMD_IP_VCN_DEC && ip_type <= AMD_IP_VCN_JPEG) {
-         uint32_t num_inst;
-         r = amdgpu_query_hw_ip_count(dev, ip_type, &num_inst);
-         if (r)
-            fprintf(stderr, "amdgpu: failed to query ip count for vcn or jpeg\n");
-         else
-            info->ip[ip_type].num_queues = num_inst;
-      } else
-         info->ip[ip_type].num_queues = util_bitcount(ip_info.available_rings);
+      info->ip[ip_type].num_queues = util_bitcount(ip_info.available_rings);
+
+      /* query ip count */
+      r = ac_drm_query_hw_ip_count(fd, ip_type, &num_instances);
+      if (!r)
+         info->ip[ip_type].num_instances = num_instances;
 
       /* According to the kernel, only SDMA and VPE require 256B alignment, but use it
        * for all queues because the kernel reports wrong limits for some of the queues.
@@ -722,43 +685,55 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
       return false;
    }
 
-   r = amdgpu_query_firmware_version(dev, AMDGPU_INFO_FW_GFX_ME, 0, 0, &info->me_fw_version,
+   r = ac_drm_query_firmware_version(fd, AMDGPU_INFO_FW_GFX_ME, 0, 0, &info->me_fw_version,
                                      &info->me_fw_feature);
    if (r) {
-      fprintf(stderr, "amdgpu: amdgpu_query_firmware_version(me) failed.\n");
+      fprintf(stderr, "amdgpu: ac_drm_query_firmware_version(me) failed.\n");
       return false;
    }
 
-   r = amdgpu_query_firmware_version(dev, AMDGPU_INFO_FW_GFX_MEC, 0, 0, &info->mec_fw_version,
+   r = ac_drm_query_firmware_version(fd, AMDGPU_INFO_FW_GFX_MEC, 0, 0, &info->mec_fw_version,
                                      &info->mec_fw_feature);
    if (r) {
-      fprintf(stderr, "amdgpu: amdgpu_query_firmware_version(mec) failed.\n");
+      fprintf(stderr, "amdgpu: ac_drm_query_firmware_version(mec) failed.\n");
       return false;
    }
 
-   r = amdgpu_query_firmware_version(dev, AMDGPU_INFO_FW_GFX_PFP, 0, 0, &info->pfp_fw_version,
+   r = ac_drm_query_firmware_version(fd, AMDGPU_INFO_FW_GFX_PFP, 0, 0, &info->pfp_fw_version,
                                      &info->pfp_fw_feature);
    if (r) {
-      fprintf(stderr, "amdgpu: amdgpu_query_firmware_version(pfp) failed.\n");
+      fprintf(stderr, "amdgpu: ac_drm_query_firmware_version(pfp) failed.\n");
       return false;
    }
 
-   r = amdgpu_query_firmware_version(dev, AMDGPU_INFO_FW_UVD, 0, 0, &uvd_version, &uvd_feature);
-   if (r) {
-      fprintf(stderr, "amdgpu: amdgpu_query_firmware_version(uvd) failed.\n");
-      return false;
-   }
+   if (info->ip[AMD_IP_VCN_DEC].num_queues || info->ip[AMD_IP_VCN_UNIFIED].num_queues) {
+      r = ac_drm_query_firmware_version(fd, AMDGPU_INFO_FW_VCN, 0, 0, &vidip_fw_version, &vidip_fw_feature);
+      if (r) {
+         fprintf(stderr, "amdgpu: ac_drm_query_firmware_version(vcn) failed.\n");
+         return false;
+      } else {
+         info->vcn_dec_version = (vidip_fw_version & 0x0F000000) >> 24;
+         info->vcn_enc_major_version = (vidip_fw_version & 0x00F00000) >> 20;
+         info->vcn_enc_minor_version = (vidip_fw_version & 0x000FF000) >> 12;
+      }
+   } else {
+      if (info->ip[AMD_IP_VCE].num_queues) {
+         r = ac_drm_query_firmware_version(fd, AMDGPU_INFO_FW_VCE, 0, 0, &vidip_fw_version, &vidip_fw_feature);
+         if (r) {
+            fprintf(stderr, "amdgpu: ac_drm_query_firmware_version(vce) failed.\n");
+            return false;
+         } else
+            info->vce_fw_version = vidip_fw_version;
+      }
 
-   r = amdgpu_query_firmware_version(dev, AMDGPU_INFO_FW_VCE, 0, 0, &vce_version, &vce_feature);
-   if (r) {
-      fprintf(stderr, "amdgpu: amdgpu_query_firmware_version(vce) failed.\n");
-      return false;
-   }
-
-   r = amdgpu_query_firmware_version(dev, AMDGPU_INFO_FW_VCN, 0, 0, &vcn_version, &vcn_feature);
-   if (r) {
-      fprintf(stderr, "amdgpu: amdgpu_query_firmware_version(vcn) failed.\n");
-      return false;
+      if (info->ip[AMD_IP_UVD].num_queues) {
+         r = ac_drm_query_firmware_version(fd, AMDGPU_INFO_FW_UVD, 0, 0, &vidip_fw_version, &vidip_fw_feature);
+         if (r) {
+            fprintf(stderr, "amdgpu: ac_drm_query_firmware_version(uvd) failed.\n");
+            return false;
+         } else
+            info->uvd_fw_version = vidip_fw_version;
+      }
    }
 
    r = amdgpu_query_sw_info(dev, amdgpu_sw_info_address32_hi, &info->address32_hi);
@@ -769,9 +744,9 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
 
    struct drm_amdgpu_memory_info meminfo = {0};
 
-   r = amdgpu_query_info(dev, AMDGPU_INFO_MEMORY, sizeof(meminfo), &meminfo);
+   r = ac_drm_query_info(fd, AMDGPU_INFO_MEMORY, sizeof(meminfo), &meminfo);
    if (r) {
-      fprintf(stderr, "amdgpu: amdgpu_query_info(memory) failed.\n");
+      fprintf(stderr, "amdgpu: ac_drm_query_info(memory) failed.\n");
       return false;
    }
 
@@ -781,9 +756,9 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    info->vram_vis_size_kb = DIV_ROUND_UP(meminfo.cpu_accessible_vram.total_heap_size, 1024);
 
    if (info->drm_minor >= 41) {
-      amdgpu_query_video_caps_info(dev, AMDGPU_INFO_VIDEO_CAPS_DECODE,
+      ac_drm_query_video_caps_info(fd, AMDGPU_INFO_VIDEO_CAPS_DECODE,
                                    sizeof(info->dec_caps), &(info->dec_caps));
-      amdgpu_query_video_caps_info(dev, AMDGPU_INFO_VIDEO_CAPS_ENCODE,
+      ac_drm_query_video_caps_info(fd, AMDGPU_INFO_VIDEO_CAPS_ENCODE,
                                    sizeof(info->enc_caps), &(info->enc_caps));
    }
 
@@ -873,17 +848,27 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
          identify_chip(NAVI32);
          identify_chip(NAVI33);
          break;
-      case FAMILY_GFX1103:
-         identify_chip(GFX1103_R1);
-         identify_chip(GFX1103_R2);
+      case FAMILY_PHX:
+         identify_chip2(PHOENIX1, PHOENIX);
+         identify_chip(PHOENIX2);
+         identify_chip2(HAWK_POINT1, PHOENIX);
+         identify_chip2(HAWK_POINT2, PHOENIX2);
          break;
       case FAMILY_GFX1150:
          identify_chip(GFX1150);
          identify_chip(GFX1151);
+         identify_chip(GFX1152);
+         identify_chip(GFX1153);
+         break;
+      case FAMILY_GFX12:
+         identify_chip(GFX1200);
+         identify_chip(GFX1201);
          break;
       }
 
-      if (info->ip[AMD_IP_GFX].ver_major == 11 && info->ip[AMD_IP_GFX].ver_minor == 5)
+      if (info->ip[AMD_IP_GFX].ver_major == 12 && info->ip[AMD_IP_GFX].ver_minor == 0)
+         info->gfx_level = GFX12;
+      else if (info->ip[AMD_IP_GFX].ver_major == 11 && info->ip[AMD_IP_GFX].ver_minor == 5)
          info->gfx_level = GFX11_5;
       else if (info->ip[AMD_IP_GFX].ver_major == 11 && info->ip[AMD_IP_GFX].ver_minor == 0)
          info->gfx_level = GFX11;
@@ -1000,6 +985,9 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
       case VCN_IP_VERSION(4, 0, 6):
          info->vcn_ip_version = VCN_4_0_6;
          break;
+      case VCN_IP_VERSION(5, 0, 0):
+         info->vcn_ip_version = VCN_5_0_0;
+         break;
       default:
          info->vcn_ip_version = VCN_UNKNOWN;
       }
@@ -1031,16 +1019,16 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    info->max_se = device_info.num_shader_engines;
    info->max_sa_per_se = device_info.num_shader_arrays_per_engine;
    info->num_cu_per_sh = device_info.num_cu_per_sh;
-   info->uvd_fw_version = info->ip[AMD_IP_UVD].num_queues ? uvd_version : 0;
-   info->vce_fw_version = info->ip[AMD_IP_VCE].num_queues ? vce_version : 0;
-   info->vcn_dec_version = (vcn_version & 0x0F000000) >> 24;
-   info->vcn_enc_major_version = (vcn_version & 0x00F00000) >> 20;
-   info->vcn_enc_minor_version = (vcn_version & 0x000FF000) >> 12;
+   info->enabled_rb_mask = device_info.enabled_rb_pipes_mask;
+   if (info->drm_minor >= 52)
+      info->enabled_rb_mask |= (uint64_t)device_info.enabled_rb_pipes_mask_hi << 32;
 
    info->memory_freq_mhz_effective *= ac_memory_ops_per_clock(info->vram_type);
 
    info->has_userptr = true;
+   info->has_syncobj = true;
    info->has_timeline_syncobj = has_timeline_syncobj(fd);
+   info->has_fence_to_handle = true;
    info->has_local_buffers = true;
    info->has_bo_metadata = true;
    info->has_eqaa_surface_allocator = info->gfx_level < GFX11;
@@ -1056,6 +1044,12 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    info->uses_kernel_cu_mask = false; /* Not implemented in the kernel. */
    info->has_graphics = info->ip[AMD_IP_GFX].num_queues > 0;
 
+   /* On GFX8, the TBA/TMA registers can be configured from the userspace.
+    * On GFX9+, they are privileged registers and they need to be configured
+    * from the kernel but it's not suppported yet.
+    */
+   info->has_trap_handler_support = info->gfx_level == GFX8;
+
    info->pa_sc_tile_steering_override = device_info.pa_sc_tile_steering_override;
    info->max_render_backends = device_info.num_rb_pipes;
    /* The value returned by the kernel driver was wrong. */
@@ -1067,8 +1061,9 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
       fprintf(stderr, "amdgpu: clock crystal frequency is 0, timestamps will be wrong\n");
       info->clock_crystal_freq = 1;
    }
+
    if (info->gfx_level >= GFX10) {
-      info->tcc_cache_line_size = 128;
+      info->tcc_cache_line_size = info->gfx_level >= GFX12 ? 256 : 128;
 
       if (info->drm_minor >= 35) {
          info->num_tcc_blocks = info->max_tcc_blocks - util_bitcount64(device_info.tcc_disabled_mask);
@@ -1087,7 +1082,10 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
       info->num_tcc_blocks = info->max_tcc_blocks;
    }
 
-   info->tcc_rb_non_coherent = !util_is_power_of_two_or_zero(info->num_tcc_blocks);
+   info->tcc_rb_non_coherent = info->gfx_level < GFX12 &&
+                               !util_is_power_of_two_or_zero(info->num_tcc_blocks) &&
+                               info->num_rb != info->num_tcc_blocks;
+   info->cp_sdma_ge_use_system_memory_scope = info->gfx_level == GFX12;
 
    if (info->drm_minor >= 52) {
       info->sqc_inst_cache_size = device_info.sqc_inst_cache_size * 1024;
@@ -1144,15 +1142,19 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
          info->l2_cache_size = info->num_tcc_blocks * 256 * 1024;
          break;
       case CHIP_REMBRANDT:
-      case CHIP_GFX1103_R1:
+      case CHIP_PHOENIX:
          info->l2_cache_size = info->num_tcc_blocks * 512 * 1024;
          break;
       }
    }
 
    info->mc_arb_ramcfg = amdinfo.mc_arb_ramcfg;
-   info->gb_addr_config = amdinfo.gb_addr_cfg;
+   if (!info->family_overridden)
+      info->gb_addr_config = amdinfo.gb_addr_cfg;
    if (info->gfx_level >= GFX9) {
+      if (!info->has_graphics && info->family >= CHIP_GFX940)
+         info->gb_addr_config = 0;
+
       info->num_tile_pipes = 1 << G_0098F8_NUM_PIPES(info->gb_addr_config);
       info->pipe_interleave_bytes = 256 << G_0098F8_PIPE_INTERLEAVE_SIZE_GFX9(info->gb_addr_config);
    } else {
@@ -1183,13 +1185,25 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
     * on GFX6. Some CLEAR_STATE cause asic hang on radeon kernel, etc.
     * SPI_VS_OUT_CONFIG. So only enable GFX7 CLEAR_STATE on amdgpu kernel.
     */
-   info->has_clear_state = info->gfx_level >= GFX7;
+   info->has_clear_state = info->gfx_level >= GFX7 && info->gfx_level < GFX12;
 
    info->has_distributed_tess =
       info->gfx_level >= GFX10 || (info->gfx_level >= GFX8 && info->max_se >= 2);
 
    info->has_dcc_constant_encode =
       info->family == CHIP_RAVEN2 || info->family == CHIP_RENOIR || info->gfx_level >= GFX10;
+
+   /* TC-compat HTILE is only available on GFX8-GFX11.5.
+    *
+    * There are issues with TC-compatible HTILE on Tonga (and Iceland is the same design), and
+    * documented bug workarounds don't help. For example, this fails:
+    *   piglit/bin/tex-miplevel-selection 'texture()' 2DShadow -auto
+    */
+   info->has_tc_compatible_htile = info->gfx_level >= GFX8 && info->gfx_level < GFX12 &&
+                                   info->family != CHIP_TONGA && info->family != CHIP_ICELAND;
+
+   info->has_etc_support = info->family == CHIP_STONEY || info->family == CHIP_VEGA10 ||
+                           info->family == CHIP_RAVEN || info->family == CHIP_RAVEN2;
 
    info->has_rbplus = info->family == CHIP_STONEY || info->gfx_level >= GFX9;
 
@@ -1306,6 +1320,12 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
 
    info->has_export_conflict_bug = info->gfx_level == GFX11;
 
+   /* When LLVM is fixed to handle multiparts shaders, this value will depend
+    * on the known good versions of LLVM. Until then, enable the equivalent WA
+    * in the nir -> llvm backend.
+    */
+   info->needs_llvm_wait_wa = info->gfx_level == GFX11;
+
    /* Convert the SDMA version in the current GPU to an enum. */
    info->sdma_ip_version =
       (enum sdma_version)SDMA_VERSION_VALUE(info->ip[AMD_IP_SDMA].ver_major,
@@ -1345,22 +1365,37 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
       }
    }
 
-   /* Derive the number of enabled SEs from the CU mask. */
    if (info->gfx_level >= GFX10_3 && info->max_se > 1) {
-      info->num_se = 0;
+      uint32_t enabled_se_mask = 0;
 
+      /* Derive the enabled SE mask from the CU mask. */
       for (unsigned se = 0; se < info->max_se; se++) {
          for (unsigned sa = 0; sa < info->max_sa_per_se; sa++) {
             if (info->cu_mask[se][sa]) {
-               info->num_se++;
+               enabled_se_mask |= BITFIELD_BIT(se);
                break;
             }
+         }
+      }
+      info->num_se = util_bitcount(enabled_se_mask);
+
+      /* Trim the number of enabled RBs based on the number of enabled SEs because the RB mask
+       * might include disabled SEs.
+       */
+      if (info->gfx_level >= GFX12) {
+         unsigned num_rb_per_se = info->max_render_backends / info->max_se;
+
+         for (unsigned se = 0; se < info->max_se; se++) {
+            if (!(BITFIELD_BIT(se) & enabled_se_mask))
+               info->enabled_rb_mask &= ~(BITFIELD_MASK(num_rb_per_se) << (se * num_rb_per_se));
          }
       }
    } else {
       /* GFX10 and older always enable all SEs because they don't support SE harvesting. */
       info->num_se = info->max_se;
    }
+
+   info->num_rb = util_bitcount64(info->enabled_rb_mask);
 
    /* On GFX10, only whole WGPs (in units of 2 CUs) can be disabled,
     * and max - min <= 2.
@@ -1372,22 +1407,20 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    info->min_good_cu_per_sa =
       (info->num_cu / (info->num_se * info->max_sa_per_se * cu_group)) * cu_group;
 
-   memcpy(info->si_tile_mode_array, amdinfo.gb_tile_mode, sizeof(amdinfo.gb_tile_mode));
-
-   info->enabled_rb_mask = device_info.enabled_rb_pipes_mask;
-   if (info->drm_minor >= 52)
-      info->enabled_rb_mask |= (uint64_t)device_info.enabled_rb_pipes_mask_hi << 32;
+   if (!info->family_overridden)
+      memcpy(info->si_tile_mode_array, amdinfo.gb_tile_mode, sizeof(amdinfo.gb_tile_mode));
 
    memcpy(info->cik_macrotile_mode_array, amdinfo.gb_macro_tile_mode,
           sizeof(amdinfo.gb_macro_tile_mode));
 
-   info->pte_fragment_size = alignment_info.size_local;
-   info->gart_page_size = alignment_info.size_remote;
+   info->pte_fragment_size = device_info.pte_fragment_size;
+   info->gart_page_size = device_info.gart_page_size;
 
-   if (info->gfx_level == GFX6)
-      info->gfx_ib_pad_with_type2 = true;
+   info->gfx_ib_pad_with_type2 = info->gfx_level == GFX6;
+   /* CDNA starting with GFX940 shouldn't use CP DMA. */
+   info->has_cp_dma = info->has_graphics || info->family < CHIP_GFX940;
 
-   if (info->gfx_level >= GFX11) {
+   if (info->gfx_level >= GFX11 && info->gfx_level < GFX12) {
       /* With num_cu = 4 in gfx11 measured power for idle, video playback and observed
        * power savings, hence enable dcc with retile for gfx11 with num_cu >= 4.
        */
@@ -1410,7 +1443,9 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
 
    info->has_stable_pstate = info->drm_minor >= 45;
 
-   if (info->gfx_level >= GFX11) {
+   if (info->gfx_level >= GFX12) {
+      /* Gfx12 doesn't use pc_lines and pbb_max_alloc_count. */
+   } else if (info->gfx_level >= GFX11) {
       info->pc_lines = 1024;
       info->pbb_max_alloc_count = 16; /* minimum is 2, maximum is 256 */
    } else if (info->gfx_level >= GFX9 && info->has_graphics) {
@@ -1525,7 +1560,7 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    /* BIG_PAGE is supported since gfx10.3 and requires VRAM. VRAM is only guaranteed
     * with AMDGPU_GEM_CREATE_DISCARDABLE. DISCARDABLE was added in DRM 3.47.0.
     */
-   info->discardable_allows_big_page = info->gfx_level >= GFX10_3 &&
+   info->discardable_allows_big_page = info->gfx_level >= GFX10_3 && info->gfx_level < GFX12 &&
                                        info->has_dedicated_vram &&
                                        info->drm_minor >= 47;
 
@@ -1537,7 +1572,8 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    const unsigned max_waves_per_tg = 32; /* 1024 threads in Wave32 */
    info->max_scratch_waves = MAX2(32 * info->min_good_cu_per_sa * info->max_sa_per_se * info->num_se,
                                   max_waves_per_tg);
-   info->num_rb = util_bitcount64(info->enabled_rb_mask);
+   info->has_scratch_base_registers = info->gfx_level >= GFX11 ||
+                                      (!info->has_graphics && info->family >= CHIP_GFX940);
    info->max_gflops = (info->gfx_level >= GFX11 ? 256 : 128) * info->num_cu * info->max_gpu_freq_mhz / 1000;
    info->memory_bandwidth_gbps = DIV_ROUND_UP(info->memory_freq_mhz_effective * info->memory_bus_width / 8, 1000);
    info->has_pcie_bandwidth_info = info->drm_minor >= 51;
@@ -1577,7 +1613,7 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
     * It can be calculated according to the kernel source code as:
     * (ring->max_dw - emit_frame_size) / emit_ib_size
     */
-   r = amdgpu_query_info(dev, AMDGPU_INFO_MAX_IBS,
+   r = ac_drm_query_info(fd, AMDGPU_INFO_MAX_IBS,
                          sizeof(info->max_submitted_ibs), info->max_submitted_ibs);
    if (r) {
       /* When the number of IBs can't be queried from the kernel, we choose a
@@ -1597,7 +1633,13 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    }
 
    if (info->gfx_level >= GFX11) {
-      if (info->l3_cache_size_mb) {
+      unsigned num_prim_exports = 0, num_pos_exports = 0;
+
+      if (info->gfx_level >= GFX12) {
+         info->attribute_ring_size_per_se = 1024 * 1024;
+         num_prim_exports = 16368; /* also includes gs_alloc_req */
+         num_pos_exports = 16384;
+      } else if (info->l3_cache_size_mb || info->family_overridden) {
          info->attribute_ring_size_per_se = 1400 * 1024;
       } else {
          assert(info->num_se == 1);
@@ -1612,12 +1654,41 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
       info->attribute_ring_size_per_se = align(info->attribute_ring_size_per_se, 64 * 1024);
       assert(info->attribute_ring_size_per_se * info->max_se <= 16 * 1024 * 1024);
 
+      /* Compute the pos and prim ring sizes and offsets. */
+      info->pos_ring_size_per_se = align(num_pos_exports * 16, 32);
+      info->prim_ring_size_per_se = align(num_prim_exports * 4, 32);
+      assert(info->gfx_level >= GFX12 ||
+             (!info->pos_ring_size_per_se && !info->prim_ring_size_per_se));
+
+      uint32_t max_se_squared = info->max_se * info->max_se;
+      uint32_t attribute_ring_size = info->attribute_ring_size_per_se * info->max_se;
+      uint32_t pos_ring_size = align(info->pos_ring_size_per_se * max_se_squared, 64 * 1024);
+      uint32_t prim_ring_size = align(info->prim_ring_size_per_se * max_se_squared, 64 * 1024);
+
+      info->pos_ring_offset = attribute_ring_size;
+      info->prim_ring_offset = info->pos_ring_offset + pos_ring_size;
+      info->total_attribute_pos_prim_ring_size = info->prim_ring_offset + prim_ring_size;
+
       info->conformant_trunc_coord =
          info->drm_minor >= 52 &&
          device_info.ids_flags & AMDGPU_IDS_FLAGS_CONFORMANT_TRUNC_COORD;
    }
 
-   if (info->gfx_level >= GFX11 && device_info.shadow_size > 0) {
+   if (info->gfx_level >= GFX11 && debug_get_bool_option("AMD_USERQ", false)) {
+      struct drm_amdgpu_info_uq_fw_areas fw_info;
+
+      r = ac_drm_query_uq_fw_area_info(fd, AMDGPU_HW_IP_GFX, 0, &fw_info);
+      if (r) {
+         fprintf(stderr, "amdgpu: amdgpu_query_uq_fw_area_info() failed.\n");
+         return false;
+      }
+
+      info->has_fw_based_shadowing = true;
+      info->fw_based_mcbp.shadow_size = fw_info.gfx.shadow_size;
+      info->fw_based_mcbp.shadow_alignment = fw_info.gfx.shadow_alignment;
+      info->fw_based_mcbp.csa_size = fw_info.gfx.csa_size;
+      info->fw_based_mcbp.csa_alignment = fw_info.gfx.csa_alignment;
+   } else if (info->gfx_level >= GFX11 && device_info.shadow_size > 0) {
       info->has_fw_based_shadowing = true;
       info->fw_based_mcbp.shadow_size = device_info.shadow_size;
       info->fw_based_mcbp.shadow_alignment = device_info.shadow_alignment;
@@ -1629,7 +1700,11 @@ bool ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    info->register_shadowing_required = device_info.ids_flags & AMDGPU_IDS_FLAGS_PREEMPTION &&
                                        info->gfx_level < GFX11;
 
-   if (info->gfx_level >= GFX11 && info->has_dedicated_vram) {
+   if (info->gfx_level >= GFX12) {
+      info->has_set_context_pairs = true;
+      info->has_set_sh_pairs = true;
+      info->has_set_uconfig_pairs = true;
+   } else if (info->gfx_level >= GFX11 && info->has_dedicated_vram) {
       info->has_set_context_pairs_packed = true;
       info->has_set_sh_pairs_packed = info->register_shadowing_required;
    }
@@ -1724,7 +1799,7 @@ void ac_print_gpu_info(const struct radeon_info *info, FILE *f)
 
    fprintf(f, "    tcp_cache_size = %i KB\n", DIV_ROUND_UP(info->tcp_cache_size, 1024));
 
-   if (info->gfx_level >= GFX10)
+   if (info->gfx_level >= GFX10 && info->gfx_level < GFX12)
       fprintf(f, "    l1_cache_size = %i KB\n", DIV_ROUND_UP(info->l1_cache_size, 1024));
 
    fprintf(f, "    l2_cache_size = %i KB\n", DIV_ROUND_UP(info->l2_cache_size, 1024));
@@ -1744,22 +1819,10 @@ void ac_print_gpu_info(const struct radeon_info *info, FILE *f)
    fprintf(f, "    pcie_bandwidth = %1.1f GB/s\n", info->pcie_bandwidth_mbps / 1024.0);
    fprintf(f, "    clock_crystal_freq = %i KHz\n", info->clock_crystal_freq);
 
-   const char *ip_string[AMD_NUM_IP_TYPES] = {
-      [AMD_IP_GFX] = "GFX",
-      [AMD_IP_COMPUTE] = "COMP",
-      [AMD_IP_SDMA] = "SDMA",
-      [AMD_IP_UVD] = "UVD",
-      [AMD_IP_VCE] = "VCE",
-      [AMD_IP_UVD_ENC] = "UVD_ENC",
-      [AMD_IP_VCN_DEC] = "VCN_DEC",
-      [AMD_IP_VCN_ENC] = (info->vcn_ip_version >= VCN_4_0_0) ? "VCN" : "VCN_ENC",
-      [AMD_IP_VCN_JPEG] = "VCN_JPG",
-      [AMD_IP_VPE] = "VPE",
-   };
-
    for (unsigned i = 0; i < AMD_NUM_IP_TYPES; i++) {
       if (info->ip[i].num_queues) {
-         fprintf(f, "    IP %-7s %2u.%u \tqueues:%u \talign:%u \tpad_dw:0x%x\n", ip_string[i],
+         fprintf(f, "    IP %-7s %2u.%u \tqueues:%u \talign:%u \tpad_dw:0x%x\n",
+                 ac_get_ip_type_string(info, i),
                  info->ip[i].ver_major, info->ip[i].ver_minor, info->ip[i].num_queues,
                  info->ip[i].ib_alignment, info->ip[i].ib_pad_dw_mask);
       }
@@ -1805,13 +1868,18 @@ void ac_print_gpu_info(const struct radeon_info *info, FILE *f)
    fprintf(f, "    never_send_perfcounter_stop = %i\n", info->never_send_perfcounter_stop);
    fprintf(f, "    discardable_allows_big_page = %i\n", info->discardable_allows_big_page);
    fprintf(f, "    has_taskmesh_indirect0_bug = %i\n", info->has_taskmesh_indirect0_bug);
+   fprintf(f, "    has_set_context_pairs = %i\n", info->has_set_context_pairs);
    fprintf(f, "    has_set_context_pairs_packed = %i\n", info->has_set_context_pairs_packed);
+   fprintf(f, "    has_set_sh_pairs = %i\n", info->has_set_sh_pairs);
    fprintf(f, "    has_set_sh_pairs_packed = %i\n", info->has_set_sh_pairs_packed);
+   fprintf(f, "    has_set_uconfig_pairs = %i\n", info->has_set_uconfig_pairs);
    fprintf(f, "    conformant_trunc_coord = %i\n", info->conformant_trunc_coord);
 
-   fprintf(f, "Display features:\n");
-   fprintf(f, "    use_display_dcc_unaligned = %u\n", info->use_display_dcc_unaligned);
-   fprintf(f, "    use_display_dcc_with_retile_blit = %u\n", info->use_display_dcc_with_retile_blit);
+   if (info->gfx_level < GFX12) {
+      fprintf(f, "Display features:\n");
+      fprintf(f, "    use_display_dcc_unaligned = %u\n", info->use_display_dcc_unaligned);
+      fprintf(f, "    use_display_dcc_with_retile_blit = %u\n", info->use_display_dcc_with_retile_blit);
+   }
 
    fprintf(f, "Memory info:\n");
    fprintf(f, "    pte_fragment_size = %u\n", info->pte_fragment_size);
@@ -1828,6 +1896,7 @@ void ac_print_gpu_info(const struct radeon_info *info, FILE *f)
    fprintf(f, "    max_tcc_blocks = %i\n", info->max_tcc_blocks);
    fprintf(f, "    tcc_cache_line_size = %u\n", info->tcc_cache_line_size);
    fprintf(f, "    tcc_rb_non_coherent = %u\n", info->tcc_rb_non_coherent);
+   fprintf(f, "    cp_sdma_ge_use_system_memory_scope = %u\n", info->cp_sdma_ge_use_system_memory_scope);
    fprintf(f, "    pc_lines = %u\n", info->pc_lines);
    fprintf(f, "    lds_size_per_workgroup = %u\n", info->lds_size_per_workgroup);
    fprintf(f, "    lds_alloc_granularity = %i\n", info->lds_alloc_granularity);
@@ -1836,6 +1905,7 @@ void ac_print_gpu_info(const struct radeon_info *info, FILE *f)
 
    fprintf(f, "CP info:\n");
    fprintf(f, "    gfx_ib_pad_with_type2 = %i\n", info->gfx_ib_pad_with_type2);
+   fprintf(f, "    has_cp_dma = %i\n", info->has_cp_dma);
    fprintf(f, "    me_fw_version = %i\n", info->me_fw_version);
    fprintf(f, "    me_fw_feature = %i\n", info->me_fw_feature);
    fprintf(f, "    mec_fw_version = %i\n", info->mec_fw_version);
@@ -1844,18 +1914,58 @@ void ac_print_gpu_info(const struct radeon_info *info, FILE *f)
    fprintf(f, "    pfp_fw_feature = %i\n", info->pfp_fw_feature);
 
    fprintf(f, "Multimedia info:\n");
-   fprintf(f, "    vce_encode = %u\n", info->ip[AMD_IP_VCE].num_queues);
+   if (info->ip[AMD_IP_VCN_DEC].num_queues || info->ip[AMD_IP_VCN_UNIFIED].num_queues) {
+      if (info->family >= CHIP_NAVI31 || info->family == CHIP_GFX940)
+         fprintf(f, "    vcn_unified = %u\n", info->ip[AMD_IP_VCN_UNIFIED].num_instances);
+      else {
+         fprintf(f, "    vcn_decode = %u\n", info->ip[AMD_IP_VCN_DEC].num_instances);
+         fprintf(f, "    vcn_encode = %u\n", info->ip[AMD_IP_VCN_ENC].num_instances);
+      }
+      fprintf(f, "    vcn_enc_major_version = %u\n", info->vcn_enc_major_version);
+      fprintf(f, "    vcn_enc_minor_version = %u\n", info->vcn_enc_minor_version);
+      fprintf(f, "    vcn_dec_version = %u\n", info->vcn_dec_version);
+   } else if (info->ip[AMD_IP_VCE].num_queues) {
+      fprintf(f, "    vce_encode = %u\n", info->ip[AMD_IP_VCE].num_queues);
+      fprintf(f, "    vce_fw_version = %u\n", info->vce_fw_version);
+      fprintf(f, "    vce_harvest_config = %i\n", info->vce_harvest_config);
+   } else if (info->ip[AMD_IP_UVD].num_queues)
+      fprintf(f, "    uvd_fw_version = %u\n", info->uvd_fw_version);
 
-   if (info->family >= CHIP_NAVI31 || info->family == CHIP_GFX940)
-      fprintf(f, "    vcn_unified = %u\n", info->ip[AMD_IP_VCN_UNIFIED].num_queues);
-   else {
-      fprintf(f, "    vcn_decode = %u\n", info->ip[AMD_IP_VCN_DEC].num_queues);
-      fprintf(f, "    vcn_encode = %u\n", info->ip[AMD_IP_VCN_ENC].num_queues);
+   if (info->ip[AMD_IP_VCN_JPEG].num_queues)
+      fprintf(f, "    jpeg_decode = %u\n", info->ip[AMD_IP_VCN_JPEG].num_instances);
+
+   if ((info->drm_minor >= 41) &&
+       (info->ip[AMD_IP_VCN_DEC].num_queues || info->ip[AMD_IP_VCN_UNIFIED].num_queues
+       || info->ip[AMD_IP_VCE].num_queues || info->ip[AMD_IP_UVD].num_queues)) {
+      char max_res_dec[64] = {0}, max_res_enc[64] = {0};
+      char codec_str[][8] = {
+         [AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_MPEG2] = "mpeg2",
+         [AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_MPEG4] = "mpeg4",
+         [AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_VC1] = "vc1",
+         [AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_MPEG4_AVC] = "h264",
+         [AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_HEVC] = "hevc",
+         [AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_JPEG] = "jpeg",
+         [AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_VP9] = "vp9",
+         [AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_AV1] = "av1",
+      };
+      fprintf(f, "    %-8s %-4s %-16s %-4s %-16s\n",
+              "codec", "dec", "max_resolution", "enc", "max_resolution");
+      for (unsigned i = 0; i < AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_COUNT; i++) {
+         if (info->dec_caps.codec_info[i].valid)
+            sprintf(max_res_dec, "%ux%u", info->dec_caps.codec_info[i].max_width,
+                    info->dec_caps.codec_info[i].max_height);
+         else
+            sprintf(max_res_dec, "%s", "-");
+         if (info->enc_caps.codec_info[i].valid)
+            sprintf(max_res_enc, "%ux%u", info->enc_caps.codec_info[i].max_width,
+                    info->enc_caps.codec_info[i].max_height);
+         else
+            sprintf(max_res_enc, "%s", "-");
+         fprintf(f, "    %-8s %-4s %-16s %-4s %-16s\n", codec_str[i],
+                 info->dec_caps.codec_info[i].valid ? "*" : "-", max_res_dec,
+                 info->enc_caps.codec_info[i].valid ? "*" : "-", max_res_enc);
+      }
    }
-
-   fprintf(f, "    uvd_fw_version = %u\n", info->uvd_fw_version);
-   fprintf(f, "    vce_fw_version = %u\n", info->vce_fw_version);
-   fprintf(f, "    vce_harvest_config = %i\n", info->vce_harvest_config);
 
    fprintf(f, "Kernel & winsys capabilities:\n");
    fprintf(f, "    drm = %i.%i.%i\n", info->drm_major, info->drm_minor, info->drm_patchlevel);
@@ -1881,9 +1991,10 @@ void ac_print_gpu_info(const struct radeon_info *info, FILE *f)
    }
 
    fprintf(f, "    has_tmz_support = %u\n", info->has_tmz_support);
+   fprintf(f, "    has_trap_handler_support = %u\n", info->has_trap_handler_support);
    for (unsigned i = 0; i < AMD_NUM_IP_TYPES; i++) {
       if (info->max_submitted_ibs[i]) {
-         fprintf(f, "    IP %-7s max_submitted_ibs = %u\n", ip_string[i],
+         fprintf(f, "    IP %-7s max_submitted_ibs = %u\n", ac_get_ip_type_string(info, i),
                  info->max_submitted_ibs[i]);
       }
    }
@@ -1916,7 +2027,16 @@ void ac_print_gpu_info(const struct radeon_info *info, FILE *f)
    fprintf(f, "    max_vgpr_alloc = %i\n", info->max_vgpr_alloc);
    fprintf(f, "    wave64_vgpr_alloc_granularity = %i\n", info->wave64_vgpr_alloc_granularity);
    fprintf(f, "    max_scratch_waves = %i\n", info->max_scratch_waves);
-   fprintf(f, "    attribute_ring_size_per_se = %u\n", info->attribute_ring_size_per_se);
+   fprintf(f, "    has_scratch_base_registers = %i\n", info->has_scratch_base_registers);
+   fprintf(f, "Ring info:\n");
+   fprintf(f, "    attribute_ring_size_per_se = %u KB\n",
+           DIV_ROUND_UP(info->attribute_ring_size_per_se, 1024));
+   if (info->gfx_level >= GFX12) {
+      fprintf(f, "    pos_ring_size_per_se = %u KB\n", DIV_ROUND_UP(info->pos_ring_size_per_se, 1024));
+      fprintf(f, "    prim_ring_size_per_se = %u KB\n", DIV_ROUND_UP(info->prim_ring_size_per_se, 1024));
+   }
+   fprintf(f, "    total_attribute_pos_prim_ring_size = %u KB\n",
+           DIV_ROUND_UP(info->total_attribute_pos_prim_ring_size, 1024));
 
    fprintf(f, "Render backend info:\n");
    fprintf(f, "    pa_sc_tile_steering_override = 0x%x\n", info->pa_sc_tile_steering_override);
@@ -1928,7 +2048,12 @@ void ac_print_gpu_info(const struct radeon_info *info, FILE *f)
    fprintf(f, "    pbb_max_alloc_count = %u\n", info->pbb_max_alloc_count);
 
    fprintf(f, "GB_ADDR_CONFIG: 0x%08x\n", info->gb_addr_config);
-   if (info->gfx_level >= GFX10) {
+   if (info->gfx_level >= GFX12) {
+      fprintf(f, "    num_pipes = %u\n", 1 << G_0098F8_NUM_PIPES(info->gb_addr_config));
+      fprintf(f, "    pipe_interleave_size = %u\n",
+              256 << G_0098F8_PIPE_INTERLEAVE_SIZE_GFX9(info->gb_addr_config));
+      fprintf(f, "    num_pkrs = %u\n", 1 << G_0098F8_NUM_PKRS(info->gb_addr_config));
+   } else if (info->gfx_level >= GFX10) {
       fprintf(f, "    num_pipes = %u\n", 1 << G_0098F8_NUM_PIPES(info->gb_addr_config));
       fprintf(f, "    pipe_interleave_size = %u\n",
               256 << G_0098F8_PIPE_INTERLEAVE_SIZE_GFX9(info->gb_addr_config));
@@ -1971,6 +2096,27 @@ void ac_print_gpu_info(const struct radeon_info *info, FILE *f)
               G_0098F8_MULTI_GPU_TILE_SIZE(info->gb_addr_config));
       fprintf(f, "    row_size = %u\n", 1024 << G_0098F8_ROW_SIZE(info->gb_addr_config));
       fprintf(f, "    num_lower_pipes = %u (raw)\n", G_0098F8_NUM_LOWER_PIPES(info->gb_addr_config));
+   }
+
+   struct ac_modifier_options modifier_options = {
+      .dcc = true,
+      .dcc_retile = true,
+   };
+   uint64_t modifiers[256];
+   unsigned modifier_count = ARRAY_SIZE(modifiers);
+
+   /* Get the number of modifiers. */
+   if (ac_get_supported_modifiers(info, &modifier_options, PIPE_FORMAT_R8G8B8A8_UNORM,
+                                  &modifier_count, modifiers)) {
+      if (modifier_count)
+         fprintf(f, "Modifiers (32bpp):\n");
+
+      for (unsigned i = 0; i < modifier_count; i++) {
+         char *name = drmGetFormatModifierName(modifiers[i]);
+
+         fprintf(f, "    %s\n", name);
+         free(name);
+      }
    }
 }
 
@@ -2207,6 +2353,10 @@ ac_get_compute_resource_limits(const struct radeon_info *info, unsigned waves_pe
                             info->max_waves_per_simd;
       }
 
+      /* On GFX12+, WAVES_PER_SH means waves per SE. */
+      if (info->gfx_level >= GFX12)
+         max_waves_per_sh *= info->max_sa_per_se;
+
       /* Force even distribution on all SIMDs in CU if the workgroup
        * size is 64. This has shown some good improvements if # of CUs
        * per SE is not a multiple of 4.
@@ -2379,4 +2529,16 @@ uint32_t ac_memory_ops_per_clock(uint32_t vram_type)
    case AMDGPU_VRAM_TYPE_GDDR6:
       return 16;
    }
+}
+
+uint32_t ac_gfx103_get_cu_mask_ps(const struct radeon_info *info)
+{
+   /* It's wasteful to enable all CUs for PS if shader arrays have a different
+    * number of CUs. The reason is that the hardware sends the same number of PS
+    * waves to each shader array, so the slowest shader array limits the performance.
+    * Disable the extra CUs for PS in other shader arrays to save power and thus
+    * increase clocks for busy CUs. In the future, we might disable or enable this
+    * tweak only for certain apps.
+    */
+   return u_bit_consecutive(0, info->min_good_cu_per_sa);
 }

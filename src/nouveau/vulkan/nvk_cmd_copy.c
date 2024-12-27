@@ -10,17 +10,15 @@
 #include "nvk_entrypoints.h"
 #include "nvk_format.h"
 #include "nvk_image.h"
+#include "nvk_image_view.h"
 #include "nvk_physical_device.h"
 
 #include "vk_format.h"
 
-#include "nouveau_bo.h"
-#include "nouveau_context.h"
-
 #include "nvtypes.h"
-#include "nvk_cl902d.h"
-#include "nvk_cl90b5.h"
-#include "nvk_clc1b5.h"
+#include "nv_push_cl902d.h"
+#include "nv_push_cl90b5.h"
+#include "nv_push_clc1b5.h"
 
 static inline uint16_t
 nvk_cmd_buffer_copy_cls(struct nvk_cmd_buffer *cmd)
@@ -33,8 +31,8 @@ nvk_cmd_buffer_copy_cls(struct nvk_cmd_buffer *cmd)
 struct nouveau_copy_buffer {
    uint64_t base_addr;
    VkImageType image_type;
-   struct nil_offset4d offset_el;
-   struct nil_extent4d extent_el;
+   struct nil_Offset4D_Elements offset_el;
+   struct nil_Extent4D_Elements extent_el;
    uint32_t bpp;
    uint32_t row_stride;
    uint32_t array_stride;
@@ -48,7 +46,7 @@ struct nouveau_copy {
       uint8_t comp_size;
       uint8_t dst[4];
    } remap;
-   struct nil_extent4d extent_el;
+   struct nil_Extent4D_Elements extent_el;
 };
 
 static struct nouveau_copy_buffer
@@ -65,29 +63,39 @@ nouveau_copy_rect_buffer(struct nvk_buffer *buf,
    };
 }
 
-static struct nil_offset4d
+static struct nil_Offset4D_Pixels
 vk_to_nil_offset(VkOffset3D offset, uint32_t base_array_layer)
 {
-   return nil_offset4d(offset.x, offset.y, offset.z, base_array_layer);
+   return (struct nil_Offset4D_Pixels) {
+      .x = offset.x,
+      .y = offset.y,
+      .z = offset.z,
+      .a = base_array_layer
+   };
 }
 
-static struct nil_extent4d
+static struct nil_Extent4D_Pixels
 vk_to_nil_extent(VkExtent3D extent, uint32_t array_layers)
 {
-   return nil_extent4d(extent.width, extent.height, extent.depth, array_layers);
+   return (struct nil_Extent4D_Pixels) {
+      .width      = extent.width,
+      .height     = extent.height,
+      .depth      = extent.depth,
+      .array_len  = array_layers,
+   };
 }
 
 static struct nouveau_copy_buffer
-nouveau_copy_rect_image(struct nvk_image *img,
-                        struct nvk_image_plane *plane,
+nouveau_copy_rect_image(const struct nvk_image *img,
+                        const struct nvk_image_plane *plane,
                         VkOffset3D offset_px,
                         const VkImageSubresourceLayers *sub_res)
 {
-   const struct nil_extent4d lvl_extent4d_px =
+   const struct nil_Extent4D_Pixels lvl_extent4d_px =
       nil_image_level_extent_px(&plane->nil, sub_res->mipLevel);
 
    offset_px = vk_image_sanitize_offset(&img->vk, offset_px);
-   const struct nil_offset4d offset4d_px =
+   const struct nil_Offset4D_Pixels offset4d_px =
       vk_to_nil_offset(offset_px, sub_res->baseArrayLayer);
 
    struct nouveau_copy_buffer buf = {
@@ -98,7 +106,7 @@ nouveau_copy_rect_image(struct nvk_image *img,
                                          plane->nil.sample_layout),
       .extent_el = nil_extent4d_px_to_el(lvl_extent4d_px, plane->nil.format,
                                          plane->nil.sample_layout),
-      .bpp = util_format_get_blocksize(plane->nil.format),
+      .bpp = util_format_get_blocksize(plane->nil.format.p_format),
       .row_stride = plane->nil.levels[sub_res->mipLevel].row_stride_B,
       .array_stride = plane->nil.array_stride_B,
       .tiling = plane->nil.levels[sub_res->mipLevel].tiling,
@@ -189,7 +197,7 @@ nouveau_copy_rect(struct nvk_cmd_buffer *cmd, struct nouveau_copy *copy)
       });
    } else {
       /* When component remapping is disabled, dimensions are in units of
-       * bytes (an implicit block widht of 1B).
+       * bytes (an implicit block width of 1B).
        */
       assert(copy->src.bpp == copy->dst.bpp);
       src_bw = copy->src.bpp;
@@ -197,7 +205,8 @@ nouveau_copy_rect(struct nvk_cmd_buffer *cmd, struct nouveau_copy *copy)
    }
 
    assert(copy->extent_el.depth == 1 || copy->extent_el.array_len == 1);
-   for (unsigned z = 0; z < MAX2(copy->extent_el.d, copy->extent_el.a); z++) {
+   uint32_t layers = MAX2(copy->extent_el.depth, copy->extent_el.array_len);
+   for (unsigned z = 0; z < layers; z++) {
       VkDeviceSize src_addr = copy->src.base_addr;
       VkDeviceSize dst_addr = copy->dst.base_addr;
 
@@ -207,12 +216,12 @@ nouveau_copy_rect(struct nvk_cmd_buffer *cmd, struct nouveau_copy *copy)
       if (copy->dst.image_type != VK_IMAGE_TYPE_3D)
          dst_addr += (z + copy->dst.offset_el.a) * copy->dst.array_stride;
 
-      if (!copy->src.tiling.is_tiled) {
+      if (copy->src.tiling.gob_type == NIL_GOB_TYPE_LINEAR) {
          src_addr += copy->src.offset_el.x * copy->src.bpp +
                      copy->src.offset_el.y * copy->src.row_stride;
       }
 
-      if (!copy->dst.tiling.is_tiled) {
+      if (copy->dst.tiling.gob_type == NIL_GOB_TYPE_LINEAR) {
          dst_addr += copy->dst.offset_el.x * copy->dst.bpp +
                      copy->dst.offset_el.y * copy->dst.row_stride;
       }
@@ -230,15 +239,14 @@ nouveau_copy_rect(struct nvk_cmd_buffer *cmd, struct nouveau_copy *copy)
       P_NV90B5_LINE_COUNT(p, copy->extent_el.height);
 
       uint32_t src_layout = 0, dst_layout = 0;
-      if (copy->src.tiling.is_tiled) {
+      if (copy->src.tiling.gob_type != NIL_GOB_TYPE_LINEAR) {
          P_MTHD(p, NV90B5, SET_SRC_BLOCK_SIZE);
+         assert(nil_gob_type_height(copy->src.tiling.gob_type) == 8);
          P_NV90B5_SET_SRC_BLOCK_SIZE(p, {
             .width = 0, /* Tiles are always 1 GOB wide */
             .height = copy->src.tiling.y_log2,
             .depth = copy->src.tiling.z_log2,
-            .gob_height = copy->src.tiling.gob_height_8 ?
-                          GOB_HEIGHT_GOB_HEIGHT_FERMI_8 :
-                          GOB_HEIGHT_GOB_HEIGHT_TESLA_4,
+            .gob_height = GOB_HEIGHT_GOB_HEIGHT_FERMI_8,
          });
          /* We use the stride for copies because the copy hardware has no
           * concept of a tile width.  Instead, we just set the width to the
@@ -271,15 +279,14 @@ nouveau_copy_rect(struct nvk_cmd_buffer *cmd, struct nouveau_copy *copy)
          src_layout = NV90B5_LAUNCH_DMA_SRC_MEMORY_LAYOUT_PITCH;
       }
 
-      if (copy->dst.tiling.is_tiled) {
+      if (copy->dst.tiling.gob_type != NIL_GOB_TYPE_LINEAR) {
          P_MTHD(p, NV90B5, SET_DST_BLOCK_SIZE);
+         assert(nil_gob_type_height(copy->dst.tiling.gob_type) == 8);
          P_NV90B5_SET_DST_BLOCK_SIZE(p, {
             .width = 0, /* Tiles are always 1 GOB wide */
             .height = copy->dst.tiling.y_log2,
             .depth = copy->dst.tiling.z_log2,
-            .gob_height = copy->dst.tiling.gob_height_8 ?
-                          GOB_HEIGHT_GOB_HEIGHT_FERMI_8 :
-                          GOB_HEIGHT_GOB_HEIGHT_TESLA_4,
+            .gob_height = GOB_HEIGHT_GOB_HEIGHT_FERMI_8,
          });
          /* We use the stride for copies because the copy hardware has no
           * concept of a tile width.  Instead, we just set the width to the
@@ -385,7 +392,7 @@ nvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
          vk_image_sanitize_extent(&dst->vk, region->imageExtent);
       const uint32_t layer_count =
          vk_image_subresource_layer_count(&dst->vk, &region->imageSubresource);
-      const struct nil_extent4d extent4d_px =
+      const struct nil_Extent4D_Pixels extent4d_px =
          vk_to_nil_extent(extent_px, layer_count);
 
       const VkImageAspectFlagBits aspects = region->imageSubresource.aspectMask;
@@ -454,13 +461,13 @@ nvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
       }
 
       nouveau_copy_rect(cmd, &copy);
-      if (copy2.extent_el.w > 0)
+      if (copy2.extent_el.width > 0)
          nouveau_copy_rect(cmd, &copy2);
 
       vk_foreach_struct_const(ext, region->pNext) {
          switch (ext->sType) {
          default:
-            nvk_debug_ignored_stype(ext->sType);
+            vk_debug_ignored_stype(ext->sType);
             break;
          }
       }
@@ -469,7 +476,7 @@ nvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
    vk_foreach_struct_const(ext, pCopyBufferToImageInfo->pNext) {
       switch (ext->sType) {
       default:
-         nvk_debug_ignored_stype(ext->sType);
+         vk_debug_ignored_stype(ext->sType);
          break;
       }
    }
@@ -492,7 +499,7 @@ nvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
          vk_image_sanitize_extent(&src->vk, region->imageExtent);
       const uint32_t layer_count =
          vk_image_subresource_layer_count(&src->vk, &region->imageSubresource);
-      const struct nil_extent4d extent4d_px =
+      const struct nil_Extent4D_Pixels extent4d_px =
          vk_to_nil_extent(extent_px, layer_count);
 
       const VkImageAspectFlagBits aspects = region->imageSubresource.aspectMask;
@@ -561,13 +568,13 @@ nvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
       }
 
       nouveau_copy_rect(cmd, &copy);
-      if (copy2.extent_el.w > 0)
+      if (copy2.extent_el.width > 0)
          nouveau_copy_rect(cmd, &copy2);
 
       vk_foreach_struct_const(ext, region->pNext) {
          switch (ext->sType) {
          default:
-            nvk_debug_ignored_stype(ext->sType);
+            vk_debug_ignored_stype(ext->sType);
             break;
          }
       }
@@ -576,10 +583,58 @@ nvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
    vk_foreach_struct_const(ext, pCopyImageToBufferInfo->pNext) {
       switch (ext->sType) {
       default:
-         nvk_debug_ignored_stype(ext->sType);
+         vk_debug_ignored_stype(ext->sType);
          break;
       }
    }
+}
+
+void
+nvk_linear_render_copy(struct nvk_cmd_buffer *cmd,
+                       const struct nvk_image_view *iview,
+                       VkRect2D copy_rect,
+                       bool copy_to_tiled_shadow)
+{
+   const struct nvk_image *image = (struct nvk_image *)iview->vk.image;
+
+   const uint8_t ip = iview->planes[0].image_plane;
+   const struct nvk_image_plane *src_plane = NULL, *dst_plane = NULL;
+   if (copy_to_tiled_shadow) {
+      src_plane = &image->planes[ip];
+      dst_plane = &image->linear_tiled_shadow;
+   } else {
+      src_plane = &image->linear_tiled_shadow;
+      dst_plane = &image->planes[ip];
+   }
+
+   const struct VkImageSubresourceLayers subres = {
+      .aspectMask = iview->vk.aspects,
+      .baseArrayLayer = iview->vk.base_array_layer,
+      .layerCount = iview->vk.layer_count,
+      .mipLevel = iview->vk.base_mip_level,
+   };
+
+   const VkOffset3D offset_px = {
+      .x = copy_rect.offset.x,
+      .y = copy_rect.offset.y,
+      .z = 0,
+   };
+   const struct nil_Extent4D_Pixels extent4d_px = {
+      .width = copy_rect.extent.width,
+      .height = copy_rect.extent.height,
+      .depth = 1,
+      .array_len = 1,
+   };
+
+   struct nouveau_copy copy = {
+      .src = nouveau_copy_rect_image(image, src_plane, offset_px, &subres),
+      .dst = nouveau_copy_rect_image(image, dst_plane, offset_px, &subres),
+      .extent_el = nil_extent4d_px_to_el(extent4d_px, src_plane->nil.format,
+                                         src_plane->nil.sample_layout),
+   };
+
+   copy.remap = nouveau_copy_remap_format(image->vk.format);
+   nouveau_copy_rect(cmd, &copy);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -603,7 +658,7 @@ nvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
          vk_image_sanitize_extent(&src->vk, region->extent);
       const uint32_t layer_count =
          vk_image_subresource_layer_count(&src->vk, &region->srcSubresource);
-      const struct nil_extent4d extent4d_px =
+      const struct nil_Extent4D_Pixels extent4d_px =
          vk_to_nil_extent(extent_px, layer_count);
 
       const VkImageAspectFlagBits src_aspects =
@@ -640,6 +695,25 @@ nvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
             copy.remap.dst[1] = NV90B5_SET_REMAP_COMPONENTS_DST_Y_NO_WRITE;
             copy.remap.dst[2] = NV90B5_SET_REMAP_COMPONENTS_DST_Z_NO_WRITE;
             copy.remap.dst[3] = NV90B5_SET_REMAP_COMPONENTS_DST_W_SRC_W;
+         } else {
+            /* If we're copying both, there's nothing special to do */
+            assert(src_aspects == (VK_IMAGE_ASPECT_DEPTH_BIT |
+                               VK_IMAGE_ASPECT_STENCIL_BIT));
+         }
+         break;
+      case VK_FORMAT_D32_SFLOAT_S8_UINT:
+         if (src_aspects == VK_IMAGE_ASPECT_DEPTH_BIT) {
+            copy.remap.comp_size = 4;
+            copy.remap.dst[0] = NV90B5_SET_REMAP_COMPONENTS_DST_W_SRC_X;
+            copy.remap.dst[1] = NV90B5_SET_REMAP_COMPONENTS_DST_Y_NO_WRITE;
+            copy.remap.dst[2] = NV90B5_SET_REMAP_COMPONENTS_DST_Z_NO_WRITE;
+            copy.remap.dst[3] = NV90B5_SET_REMAP_COMPONENTS_DST_W_NO_WRITE;
+         } else if (src_aspects == VK_IMAGE_ASPECT_STENCIL_BIT) {
+            copy.remap.comp_size = 4;
+            copy.remap.dst[0] = NV90B5_SET_REMAP_COMPONENTS_DST_X_NO_WRITE;
+            copy.remap.dst[1] = NV90B5_SET_REMAP_COMPONENTS_DST_Y_SRC_Y;
+            copy.remap.dst[2] = NV90B5_SET_REMAP_COMPONENTS_DST_Z_NO_WRITE;
+            copy.remap.dst[3] = NV90B5_SET_REMAP_COMPONENTS_DST_W_NO_WRITE;
          } else {
             /* If we're copying both, there's nothing special to do */
             assert(src_aspects == (VK_IMAGE_ASPECT_DEPTH_BIT |

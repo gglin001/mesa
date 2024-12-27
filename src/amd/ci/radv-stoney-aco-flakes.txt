@@ -11,4 +11,3 @@ multisample-dEQP-GLES31.functional.blend_equation_advanced.barrier.multiply
 multisample-dEQP-GLES31.functional.blend_equation_advanced.basic.colordodge
 multisample-dEQP-GLES31.functional.blend_equation_advanced.basic.darken
 multisample-dEQP-GLES31.functional.blend_equation_advanced.basic.overlay
-

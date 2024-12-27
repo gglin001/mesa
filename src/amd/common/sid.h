@@ -116,6 +116,9 @@
 #define   WAIT_REG_MEM_PFP                            (1 << 8)
 #define PKT3_MEM_WRITE                             0x3D /* GFX6 only */
 #define PKT3_INDIRECT_BUFFER                       0x3F /* GFX6+ */
+#define   S_3F3_INHERIT_VMID_MQD_GFX(x)               (((unsigned)(x)&0x1) << 22) /* userqueue only */
+#define   S_3F3_VALID_COMPUTE(x)                      (((unsigned)(x)&0x1) << 23) /* userqueue only */
+#define   S_3F3_INHERIT_VMID_MQD_COMPUTE(x)           (((unsigned)(x)&0x1) << 30) /* userqueue only */
 #define PKT3_COPY_DATA                             0x40
 #define   COPY_DATA_SRC_SEL(x)                        ((x)&0xf)
 #define   COPY_DATA_REG                               0
@@ -245,8 +248,11 @@
 #define PKT3_INCREMENT_CE_COUNTER                  0x84
 #define PKT3_INCREMENT_DE_COUNTER                  0x85
 #define PKT3_WAIT_ON_CE_COUNTER                    0x86
+#define PKT3_HDP_FLUSH                             0x95
 #define PKT3_SET_SH_REG_INDEX                      0x9B
 #define PKT3_LOAD_CONTEXT_REG_INDEX                0x9F /* GFX8+ */
+#define PKT3_DISPATCH_DIRECT_INTERLEAVED           0xA7 /* GFX12+ */
+#define PKT3_DISPATCH_INDIRECT_INTERLEAVED         0xA8 /* GFX12+ */
 #define PKT3_DISPATCH_TASK_STATE_INIT              0xA9 /* Tells the HW about the task control buffer, GFX10.3+ */
 #define PKT3_DISPATCH_TASKMESH_DIRECT_ACE          0xAA /* Direct task + mesh shader dispatch [ACE side], GFX10.3+ */
 #define PKT3_DISPATCH_TASKMESH_INDIRECT_MULTI_ACE  0xAD /* Indirect task + mesh shader dispatch [ACE side], GFX10.3+ */
@@ -271,12 +277,22 @@
  *      - The SH_*_PACKED* variants require register shadowing to be enabled.
  *      - The *_N variant is identical to the non-N variant, but the maximum allowed "count" is 14
  *        and it's faster.
+ *
+ * Use these on GFX12 because they are the fastest SET packets there. The PACKED variants don't
+ * exist on GFX12.
+ *    SET_CONTEXT_REG_PAIRS:
+ *    SET_SH_REG_PAIRS:
+ *    SET_UCONFIG_REG_PAIRS:
+ *      Format: header, (offset, value)^n.
+ *      - Consecutive offsets must not be equal.
+ *      - RESET_FILTER_CAM must be set to 1.
  */
-#define PKT3_SET_CONTEXT_REG_PAIRS                 0xB8 /* GFX11+, don't use */
-#define PKT3_SET_CONTEXT_REG_PAIRS_PACKED          0xB9 /* GFX11+ */
-#define PKT3_SET_SH_REG_PAIRS                      0xBA /* GFX11+, don't use */
-#define PKT3_SET_SH_REG_PAIRS_PACKED               0xBB /* GFX11+ */
-#define PKT3_SET_SH_REG_PAIRS_PACKED_N             0xBD /* GFX11+ */
+#define PKT3_SET_CONTEXT_REG_PAIRS                 0xB8 /* GFX11+; only use on GFX12, not GFX11 */
+#define PKT3_SET_CONTEXT_REG_PAIRS_PACKED          0xB9 /* GFX11 dGPUs only */
+#define PKT3_SET_SH_REG_PAIRS                      0xBA /* GFX11+; only use on GFX12, not GFX11 */
+#define PKT3_SET_SH_REG_PAIRS_PACKED               0xBB /* GFX11 dGPUs only */
+#define PKT3_SET_SH_REG_PAIRS_PACKED_N             0xBD /* GFX11 dGPUs only */
+#define PKT3_SET_UCONFIG_REG_PAIRS                 0xBE /* GFX12+ */
 
 #define PKT_TYPE_S(x)         (((unsigned)(x)&0x3) << 30)
 #define PKT_TYPE_G(x)         (((x) >> 30) & 0x3)
@@ -294,6 +310,13 @@
 #define PKT3_RESET_FILTER_CAM_G(x) (((unsigned)(x) >> 2) & 0x1)
 #define PKT3(op, count, predicate)                                                                 \
    (PKT_TYPE_S(3) | PKT_COUNT_S(count) | PKT3_IT_OPCODE_S(op) | PKT3_PREDICATE(predicate))
+
+#define PKT3_PROTECTED_FENCE_SIGNAL                0xD0
+#define PKT3_FENCE_WAIT_MULTI                      0xD1
+#define   S_D10_ENGINE_SEL(x)                         ((x & 1) << 0)
+#define   S_D10_PREEMPTABLE(x)                        ((x & 1) << 1)
+#define   S_D10_CACHE_POLICY(x)                       ((x & 3) << 2)
+#define   S_D10_POLL_INTERVAL(x)                      ((x & 0xFFFF) << 16)
 
 #define PKT2_NOP_PAD PKT_TYPE_S(2)
 #define PKT3_NOP_PAD PKT3(PKT3_NOP, 0x3fff, 0) /* header-only version */

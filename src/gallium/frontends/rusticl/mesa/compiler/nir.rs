@@ -3,9 +3,9 @@ use mesa_rust_util::bitset;
 use mesa_rust_util::offset_of;
 
 use std::convert::TryInto;
-use std::ffi::c_void;
-use std::ffi::CString;
+use std::ffi::CStr;
 use std::marker::PhantomData;
+use std::ops::Not;
 use std::ptr;
 use std::ptr::NonNull;
 use std::slice;
@@ -34,8 +34,8 @@ impl<'a, T: 'a> Iterator for ExecListIter<'a, T> {
         if self.n.next.is_null() {
             None
         } else {
-            let t: *mut c_void = (self.n as *mut exec_node).cast();
-            Some(unsafe { &mut *(t.sub(self.offset).cast()) })
+            let t: *mut _ = self.n;
+            Some(unsafe { &mut *(t.byte_sub(self.offset).cast()) })
         }
     }
 }
@@ -156,29 +156,17 @@ impl NirShader {
     }
 
     pub fn deserialize(
-        input: &mut &[u8],
-        len: usize,
+        blob: &mut blob_reader,
         options: *const nir_shader_compiler_options,
     ) -> Option<Self> {
-        let mut reader = blob_reader::default();
-
-        let (bin, rest) = input.split_at(len);
-        *input = rest;
-
-        unsafe {
-            blob_reader_init(&mut reader, bin.as_ptr().cast(), len);
-            Self::new(nir_deserialize(ptr::null_mut(), options, &mut reader))
-        }
+        // we already create the NirShader here so it gets automatically deallocated on overrun.
+        let nir = Self::new(unsafe { nir_deserialize(ptr::null_mut(), options, blob) })?;
+        blob.overrun.not().then_some(nir)
     }
 
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut blob = blob::default();
+    pub fn serialize(&self, blob: &mut blob) {
         unsafe {
-            blob_init(&mut blob);
-            nir_serialize(&mut blob, self.nir.as_ptr(), false);
-            let res = slice::from_raw_parts(blob.data, blob.size).to_vec();
-            blob_finish(&mut blob);
-            res
+            nir_serialize(blob, self.nir.as_ptr(), false);
         }
     }
 
@@ -241,7 +229,7 @@ impl NirShader {
 
     #[cfg(debug_assertions)]
     pub fn validate(&self, when: &str) {
-        let cstr = CString::new(when).unwrap();
+        let cstr = std::ffi::CString::new(when).unwrap();
         unsafe { nir_validate_shader(self.nir.as_ptr(), cstr.as_ptr()) }
     }
 
@@ -361,6 +349,20 @@ impl NirShader {
         }
     }
 
+    pub fn set_workgroup_size(&mut self, size: [u16; 3]) {
+        let nir = unsafe { self.nir.as_mut() };
+        nir.info.set_workgroup_size_variable(false);
+        nir.info.workgroup_size = size;
+    }
+
+    pub fn workgroup_size_variable(&self) -> bool {
+        unsafe { self.nir.as_ref() }.info.workgroup_size_variable()
+    }
+
+    pub fn workgroup_size_hint(&self) -> [u16; 3] {
+        unsafe { self.nir.as_ref().info.anon_1.cs.workgroup_size_hint }
+    }
+
     pub fn set_has_variable_shared_mem(&mut self, val: bool) {
         unsafe {
             self.nir
@@ -440,7 +442,12 @@ impl NirShader {
     pub fn get_constant_buffer(&self) -> &[u8] {
         unsafe {
             let nir = self.nir.as_ref();
-            slice::from_raw_parts(nir.constant_data.cast(), nir.constant_data_size as usize)
+            // Sometimes, constant_data can be a null pointer if the size is 0
+            if nir.constant_data_size == 0 {
+                &[]
+            } else {
+                slice::from_raw_parts(nir.constant_data.cast(), nir.constant_data_size as usize)
+            }
         }
     }
 
@@ -470,12 +477,19 @@ impl NirShader {
         mode: nir_variable_mode,
         glsl_type: *const glsl_type,
         loc: usize,
-        name: &str,
+        name: &CStr,
     ) {
-        let name = CString::new(name).unwrap();
         unsafe {
             let var = nir_variable_create(self.nir.as_ptr(), mode, glsl_type, name.as_ptr());
             (*var).data.location = loc.try_into().unwrap();
+        }
+    }
+}
+
+impl Clone for NirShader {
+    fn clone(&self) -> Self {
+        Self {
+            nir: unsafe { NonNull::new_unchecked(self.dup_for_driver()) },
         }
     }
 }

@@ -97,7 +97,7 @@ struct vk_instance;
 
 struct driOptionCache;
 
-#define VK_ICD_WSI_PLATFORM_MAX (VK_ICD_WSI_PLATFORM_HEADLESS + 1)
+#define VK_ICD_WSI_PLATFORM_MAX (VK_ICD_WSI_PLATFORM_METAL + 1)
 
 struct wsi_device {
    /* Allocator for the instance */
@@ -112,8 +112,10 @@ struct wsi_device {
    VkPhysicalDevicePCIBusInfoPropertiesEXT pci_bus_info;
 
    VkExternalSemaphoreHandleTypeFlags semaphore_export_handle_types;
+   VkExternalSemaphoreHandleTypeFlags timeline_semaphore_export_handle_types;
 
    bool has_import_memory_host;
+   bool has_timeline_semaphore;
 
    /** Indicates if wsi_image_create_info::scanout is supported
     *
@@ -200,6 +202,11 @@ struct wsi_device {
     * to be able to synchronize with the WSI present semaphore being unsignalled.
     * This requires VK_KHR_timeline_semaphore. */
    bool khr_present_wait;
+
+   struct {
+      /* Don't use the commit-timing protocol for pacing */
+      bool disable_timestamps;
+   } wayland;
 
    /*
     * This sets the ownership for a WSI memory object:
@@ -353,6 +360,9 @@ wsi_common_vk_instance_supports_present_wait(const struct vk_instance *instance)
 
 VkImageUsageFlags
 wsi_caps_get_image_usage(void);
+
+bool
+wsi_device_supports_explicit_sync(struct wsi_device *device);
 
 #define wsi_common_vk_warn_once(warning) \
    do { \

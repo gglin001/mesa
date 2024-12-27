@@ -42,6 +42,12 @@ static uint8_t si_vectorize_callback(const nir_instr *instr, const void *data)
       switch (alu->op) {
       case nir_op_unpack_32_2x16_split_x:
       case nir_op_unpack_32_2x16_split_y:
+      case nir_op_extract_i8:
+      case nir_op_extract_u8:
+      case nir_op_extract_i16:
+      case nir_op_extract_u16:
+      case nir_op_insert_u8:
+      case nir_op_insert_u16:
          return 1;
       default:
          return 2;
@@ -49,28 +55,9 @@ static uint8_t si_vectorize_callback(const nir_instr *instr, const void *data)
    }
 }
 
-static unsigned si_lower_bit_size_callback(const nir_instr *instr, void *data)
-{
-   if (instr->type != nir_instr_type_alu)
-      return 0;
-
-   nir_alu_instr *alu = nir_instr_as_alu(instr);
-
-   switch (alu->op) {
-   case nir_op_imul_high:
-   case nir_op_umul_high:
-      if (alu->def.bit_size < 32)
-         return 32;
-      break;
-   default:
-      break;
-   }
-
-   return 0;
-}
-
 void si_nir_opts(struct si_screen *sscreen, struct nir_shader *nir, bool first)
 {
+   bool use_aco = sscreen->use_aco || nir->info.use_aco_amd;
    bool progress;
 
    do {
@@ -80,7 +67,7 @@ void si_nir_opts(struct si_screen *sscreen, struct nir_shader *nir, bool first)
 
       NIR_PASS(progress, nir, nir_lower_vars_to_ssa);
       NIR_PASS(progress, nir, nir_lower_alu_to_scalar,
-               nir->options->lower_to_scalar_filter, (void *)sscreen->use_aco);
+               nir->options->lower_to_scalar_filter, (void *)use_aco);
       NIR_PASS(progress, nir, nir_lower_phis_to_scalar, false);
 
       if (first) {
@@ -103,7 +90,7 @@ void si_nir_opts(struct si_screen *sscreen, struct nir_shader *nir, bool first)
 
       if (lower_alu_to_scalar) {
          NIR_PASS_V(nir, nir_lower_alu_to_scalar,
-                    nir->options->lower_to_scalar_filter, (void *)sscreen->use_aco);
+                    nir->options->lower_to_scalar_filter, (void *)use_aco);
       }
       if (lower_phis_to_scalar)
          NIR_PASS_V(nir, nir_lower_phis_to_scalar, false);
@@ -113,8 +100,8 @@ void si_nir_opts(struct si_screen *sscreen, struct nir_shader *nir, bool first)
       NIR_PASS(progress, nir, nir_opt_peephole_select, 8, true, true);
 
       /* Needed for algebraic lowering */
-      NIR_PASS(progress, nir, nir_lower_bit_size, si_lower_bit_size_callback, NULL);
       NIR_PASS(progress, nir, nir_opt_algebraic);
+      NIR_PASS(progress, nir, nir_opt_generate_bfi);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
 
       if (!nir->info.flrp_lowered) {
@@ -145,10 +132,8 @@ void si_nir_opts(struct si_screen *sscreen, struct nir_shader *nir, bool first)
       if (nir->info.stage == MESA_SHADER_FRAGMENT)
          NIR_PASS_V(nir, nir_opt_move_discards_to_top);
 
-      if (sscreen->info.has_packed_math_16bit) {
-         NIR_PASS(progress, nir, nir_opt_vectorize, si_vectorize_callback,
-                  (void *)sscreen->use_aco);
-      }
+      if (sscreen->info.has_packed_math_16bit)
+         NIR_PASS(progress, nir, nir_opt_vectorize, si_vectorize_callback, (void *)use_aco);
    } while (progress);
 
    NIR_PASS_V(nir, nir_lower_var_copies);
@@ -193,7 +178,7 @@ static void si_late_optimize_16bit_samplers(struct si_screen *sscreen, nir_shade
     * We only use a16/g16 if all of the affected sources are 16bit.
     */
    bool has_g16 = sscreen->info.gfx_level >= GFX10;
-   struct nir_fold_tex_srcs_options fold_srcs_options[] = {
+   struct nir_opt_tex_srcs_options opt_srcs_options[] = {
       {
          .sampler_dims =
             ~(BITFIELD_BIT(GLSL_SAMPLER_DIM_CUBE) | BITFIELD_BIT(GLSL_SAMPLER_DIM_BUF)),
@@ -207,16 +192,18 @@ static void si_late_optimize_16bit_samplers(struct si_screen *sscreen, nir_shade
          .src_types = (1 << nir_tex_src_ddx) | (1 << nir_tex_src_ddy),
       },
    };
-   struct nir_fold_16bit_tex_image_options fold_16bit_options = {
-      .rounding_mode = nir_rounding_mode_rtz,
-      .fold_tex_dest_types = nir_type_float,
-      .fold_image_dest_types = nir_type_float,
-      .fold_image_store_data = true,
-      .fold_srcs_options_count = has_g16 ? 2 : 1,
-      .fold_srcs_options = fold_srcs_options,
+   struct nir_opt_16bit_tex_image_options opt_16bit_options = {
+      .rounding_mode = nir_rounding_mode_undef,
+      .opt_tex_dest_types = nir_type_float | nir_type_int | nir_type_uint,
+      .opt_image_dest_types = nir_type_float | nir_type_int | nir_type_uint,
+      .integer_dest_saturates = true,
+      .opt_image_store_data = true,
+      .opt_image_srcs = true,
+      .opt_srcs_options_count = has_g16 ? 2 : 1,
+      .opt_srcs_options = opt_srcs_options,
    };
    bool changed = false;
-   NIR_PASS(changed, nir, nir_fold_16bit_tex_image, &fold_16bit_options);
+   NIR_PASS(changed, nir, nir_opt_16bit_tex_image, &opt_16bit_options);
 
    if (changed) {
       si_nir_opts(sscreen, nir, false);
@@ -254,22 +241,6 @@ static bool si_lower_intrinsics(nir_shader *nir)
                                         NULL);
 }
 
-const nir_lower_subgroups_options si_nir_subgroups_options = {
-   .subgroup_size = 64,
-   .ballot_bit_size = 64,
-   .ballot_components = 1,
-   .lower_to_scalar = true,
-   .lower_subgroup_masks = true,
-   .lower_relative_shuffle = true,
-   .lower_shuffle_to_32bit = true,
-   .lower_vote_trivial = false,
-   .lower_vote_eq = true,
-   .lower_vote_bool_eq = true,
-   .lower_inverse_ballot = true,
-   .lower_boolean_reduce = true,
-   .lower_boolean_shuffle = true,
-};
-
 void si_lower_mediump_io(nir_shader *nir)
 {
    NIR_PASS_V(nir, nir_lower_mediump_io,
@@ -294,8 +265,6 @@ static void si_lower_nir(struct si_screen *sscreen, struct nir_shader *nir)
     * - ensure constant offsets for texture instructions are folded
     *   and copy-propagated
     */
-   NIR_PASS_V(nir, nir_lower_int64);
-
    const struct nir_lower_tex_options lower_tex_options = {
       .lower_txp = ~0u,
       .lower_txf_offset = true,
@@ -309,17 +278,14 @@ static void si_lower_nir(struct si_screen *sscreen, struct nir_shader *nir)
 
    const struct nir_lower_image_options lower_image_options = {
       .lower_cube_size = true,
-      .lower_to_fragment_mask_load_amd = sscreen->info.gfx_level < GFX11,
+      .lower_to_fragment_mask_load_amd = sscreen->info.gfx_level < GFX11 &&
+                                         !(sscreen->debug_flags & DBG(NO_FMASK)),
    };
    NIR_PASS_V(nir, nir_lower_image, &lower_image_options);
 
    NIR_PASS_V(nir, si_lower_intrinsics);
 
    NIR_PASS_V(nir, ac_nir_lower_sin_cos);
-
-   NIR_PASS_V(nir, nir_lower_subgroups, &si_nir_subgroups_options);
-
-   NIR_PASS_V(nir, nir_lower_discard_or_demote, true);
 
    /* Lower load constants to scalar and then clean up the mess */
    NIR_PASS_V(nir, nir_lower_load_const_to_scalar);
@@ -344,18 +310,27 @@ static void si_lower_nir(struct si_screen *sscreen, struct nir_shader *nir)
       NIR_PASS_V(nir, nir_lower_gs_intrinsics, flags);
    }
 
-   if (nir->info.stage == MESA_SHADER_COMPUTE) {
+   if (gl_shader_stage_is_compute(nir->info.stage)) {
       nir_lower_compute_system_values_options options = {0};
 
       /* gl_LocalInvocationIndex must be derived from gl_LocalInvocationID.xyz to make it correct
        * with quad derivatives. Using gl_SubgroupID for that (which is what we do by default) is
        * incorrect with a non-linear thread order.
+       *
+       * On Gfx12, we always use a non-linear thread order if the workgroup X and Y size is
+       * divisible by 2.
        */
       options.lower_local_invocation_index =
-         nir->info.cs.derivative_group == DERIVATIVE_GROUP_QUADS;
+         nir->info.derivative_group == DERIVATIVE_GROUP_QUADS ||
+         (sscreen->info.gfx_level >= GFX12 &&
+          nir->info.derivative_group == DERIVATIVE_GROUP_NONE &&
+          (nir->info.workgroup_size_variable ||
+           (nir->info.workgroup_size[0] % 2 == 0 && nir->info.workgroup_size[1] % 2 == 0)));
       NIR_PASS_V(nir, nir_lower_compute_system_values, &options);
 
-      if (nir->info.cs.derivative_group == DERIVATIVE_GROUP_QUADS) {
+      /* Gfx12 supports this in hw. */
+      if (sscreen->info.gfx_level < GFX12 &&
+          nir->info.derivative_group == DERIVATIVE_GROUP_QUADS) {
          nir_opt_cse(nir); /* CSE load_local_invocation_id */
          memset(&options, 0, sizeof(options));
          options.shuffle_local_ids_for_quad_derivatives = true;
@@ -367,7 +342,7 @@ static void si_lower_nir(struct si_screen *sscreen, struct nir_shader *nir)
    /* Run late optimizations to fuse ffma and eliminate 16-bit conversions. */
    si_nir_late_opts(nir);
 
-   if (sscreen->b.get_shader_param(&sscreen->b, PIPE_SHADER_FRAGMENT, PIPE_SHADER_CAP_FP16))
+   if (sscreen->info.gfx_level >= GFX9)
       si_late_optimize_16bit_samplers(sscreen, nir);
 
    NIR_PASS_V(nir, nir_remove_dead_variables, nir_var_function_temp, NULL);
@@ -404,7 +379,7 @@ static bool si_mark_divergent_texture_non_uniform(struct nir_shader *nir)
 
          nir_tex_instr *tex = nir_instr_as_tex(instr);
          for (int i = 0; i < tex->num_srcs; i++) {
-            bool divergent = tex->src[i].src.ssa->divergent;
+            bool divergent = nir_src_is_divergent(&tex->src[i].src);
 
             switch (tex->src[i].src_type) {
             case nir_tex_src_texture_deref:
@@ -430,10 +405,9 @@ static bool si_mark_divergent_texture_non_uniform(struct nir_shader *nir)
    return divergence_changed;
 }
 
-char *si_finalize_nir(struct pipe_screen *screen, void *nirptr)
+char *si_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir)
 {
    struct si_screen *sscreen = (struct si_screen *)screen;
-   struct nir_shader *nir = (struct nir_shader *)nirptr;
 
    nir_lower_io_passes(nir, false);
    NIR_PASS_V(nir, nir_remove_dead_variables, nir_var_shader_in | nir_var_shader_out, NULL);
@@ -441,11 +415,6 @@ char *si_finalize_nir(struct pipe_screen *screen, void *nirptr)
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       NIR_PASS_V(nir, nir_lower_color_inputs);
 
-   NIR_PASS_V(nir, ac_nir_lower_subdword_loads,
-              (ac_nir_lower_subdword_options) {
-                 .modes_1_comp = nir_var_mem_ubo,
-                 .modes_N_comps = nir_var_mem_ubo | nir_var_mem_ssbo
-              });
    NIR_PASS_V(nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
 
    /* Remove dead derefs, so that we can remove uniforms. */
@@ -484,7 +453,6 @@ char *si_finalize_nir(struct pipe_screen *screen, void *nirptr)
    if (progress)
       si_nir_opts(sscreen, nir, false);
 
-   NIR_PASS_V(nir, nir_convert_to_lcssa, true, true); /* required by divergence analysis */
    NIR_PASS_V(nir, nir_divergence_analysis); /* to find divergent loops */
 
    /* Must be after divergence analysis. */

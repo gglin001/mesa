@@ -32,6 +32,7 @@
 #include "vk_util.h"
 #include "stdarg.h"
 #include "util/u_dynarray.h"
+#include "util/u_printf.h"
 
 void
 vk_debug_message(struct vk_instance *instance,
@@ -80,6 +81,44 @@ vk_debug_message_instance(struct vk_instance *instance,
           (messenger->type & types))
          messenger->callback(severity, types, &cbData, messenger->data);
    }
+}
+
+void
+vk_address_binding_report(struct vk_instance *instance,
+                          struct vk_object_base *object, 
+                          uint64_t base_address,
+                          uint64_t size,
+                          VkDeviceAddressBindingTypeEXT type)
+{
+   if (list_is_empty(&instance->debug_utils.callbacks))
+      return;
+
+   VkDeviceAddressBindingCallbackDataEXT addr_binding = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT,
+      .flags = object->client_visible ? 0 : VK_DEVICE_ADDRESS_BINDING_INTERNAL_OBJECT_BIT_EXT,
+      .baseAddress = base_address,
+      .size = size,
+      .bindingType = type,
+   };
+
+   VkDebugUtilsObjectNameInfoEXT object_name_info = {
+         .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
+         .pNext = NULL,
+         .objectType = object->type,
+         .objectHandle = (uint64_t)(uintptr_t)object,
+         .pObjectName = object->object_name,
+   };
+
+   VkDebugUtilsMessengerCallbackDataEXT cb_data = {
+      .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CALLBACK_DATA_EXT,
+      .pNext = &addr_binding,
+      .objectCount = 1,
+      .pObjects = &object_name_info,
+   };
+
+   vk_debug_message(instance, VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT,
+                    VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT,
+                    &cb_data);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -264,10 +303,12 @@ vk_common_SetDebugUtilsObjectNameEXT(
       vk_free(alloc, object->object_name);
       object->object_name = NULL;
    }
-   object->object_name = vk_strdup(alloc, pNameInfo->pObjectName,
-                                   VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-   if (!object->object_name)
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   if (pNameInfo->pObjectName != NULL) {
+      object->object_name = vk_strdup(alloc, pNameInfo->pObjectName,
+                                      VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (!object->object_name)
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
 
    return VK_SUCCESS;
 }
@@ -418,4 +459,16 @@ vk_common_QueueInsertDebugUtilsLabelEXT(
                                 &queue->labels,
                                 pLabelInfo);
    queue->region_begin = false;
+}
+
+VkResult
+vk_check_printf_status(struct vk_device *dev, struct u_printf_ctx *ctx,
+                       struct u_printf_info *info, uint32_t count)
+{
+   if (u_printf_check_abort(stdout, ctx, info, count)) {
+      vk_device_set_lost(dev, "GPU abort.");
+      return VK_ERROR_DEVICE_LOST;
+   } else {
+      return VK_SUCCESS;
+   }
 }

@@ -5,30 +5,13 @@
  * based in part on anv driver which is:
  * Copyright © 2015 Intel Corporation
  *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
+#include "radv_nir_to_llvm.h"
 #include "nir/nir.h"
 #include "radv_debug.h"
 #include "radv_llvm_helper.h"
-#include "radv_private.h"
 #include "radv_shader.h"
 #include "radv_shader_args.h"
 
@@ -210,10 +193,9 @@ radv_load_output(struct radv_shader_context *ctx, unsigned index, unsigned chan)
 }
 
 static void
-ac_llvm_finalize_module(struct radv_shader_context *ctx, LLVMPassManagerRef passmgr)
+ac_llvm_finalize_module(struct radv_shader_context *ctx, struct ac_midend_optimizer *meo)
 {
-   LLVMRunPassManager(passmgr, ctx->ac.module);
-
+   ac_llvm_optimize_module(meo, ctx->ac.module);
    ac_llvm_context_dispose(&ctx->ac);
 }
 
@@ -368,7 +350,7 @@ ac_translate_nir_to_llvm(struct ac_llvm_compiler *ac_llvm, const struct radv_nir
           * and contains a barrier, it will wait there and then
           * reach s_endpgm.
           */
-         ac_build_waitcnt(&ctx.ac, AC_WAIT_LGKM);
+         ac_build_waitcnt(&ctx.ac, AC_WAIT_DS);
          ac_build_s_barrier(&ctx.ac, shaders[shader_idx]->info.stage);
       }
 
@@ -407,7 +389,7 @@ ac_translate_nir_to_llvm(struct ac_llvm_compiler *ac_llvm, const struct radv_nir
       fprintf(stderr, "\n");
    }
 
-   ac_llvm_finalize_module(&ctx, ac_llvm->passmgr);
+   ac_llvm_finalize_module(&ctx, ac_llvm->meo);
 
    free(name);
 

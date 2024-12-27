@@ -56,7 +56,6 @@ meson setup `
 -Dgles2=enabled `
 -Dgallium-opencl=icd `
 -Dgallium-rusticl=false `
--Dopencl-spirv=true `
 -Dmicrosoft-clc=enabled `
 -Dstatic-libclc=all `
 -Dspirv-to-dxil=true `
@@ -83,5 +82,7 @@ Copy-Item ".\.gitlab-ci\windows\spirv2dxil_check.ps1" -Destination $installdir
 Copy-Item ".\.gitlab-ci\windows\spirv2dxil_run.ps1" -Destination $installdir
 
 Copy-Item ".\.gitlab-ci\windows\deqp_runner_run.ps1" -Destination $installdir
+
+Copy-Item ".\.gitlab-ci\windows\vainfo_run.ps1" -Destination $installdir
 
 Get-ChildItem -Recurse -Filter "ci" | Get-ChildItem -Include "*.txt","*.toml" | Copy-Item -Destination $installdir

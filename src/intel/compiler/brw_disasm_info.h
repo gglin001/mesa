@@ -21,8 +21,7 @@
  * IN THE SOFTWARE.
  */
 
-#ifndef _INTEL_ASM_ANNOTATION_H
-#define _INTEL_ASM_ANNOTATION_H
+#pragma once
 
 #include "compiler/glsl/list.h"
 
@@ -48,8 +47,7 @@ struct inst_group {
    struct bblock_t *block_start;
    struct bblock_t *block_end;
 
-   /* Annotation for the generated IR.  One of the two can be set. */
-   const void *ir;
+   /* Annotation for the generated IR. */
    const char *annotation;
 };
 
@@ -86,5 +84,3 @@ disasm_insert_error(struct disasm_info *disasm, int offset,
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
-
-#endif /* _INTEL_ASM_ANNOTATION_H */

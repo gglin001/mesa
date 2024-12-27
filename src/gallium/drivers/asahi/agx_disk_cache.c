@@ -20,7 +20,7 @@
 #include "agx_state.h"
 
 /* Flags that are allowed and do not disable the disk cache */
-#define ALLOWED_FLAGS (AGX_DBG_NO16 | AGX_DBG_COMPBLIT)
+#define ALLOWED_FLAGS (AGX_DBG_NO16)
 
 /**
  * Compute a disk cache key for the given uncompiled shader and shader key.
@@ -39,11 +39,10 @@ agx_disk_cache_compute_key(struct disk_cache *cache,
       key_size = sizeof(shader_key->vs);
    else if (uncompiled->type == PIPE_SHADER_GEOMETRY)
       key_size = sizeof(shader_key->gs);
-   else if (uncompiled->type == PIPE_SHADER_TESS_CTRL)
-      key_size = sizeof(shader_key->tcs);
    else if (uncompiled->type == PIPE_SHADER_FRAGMENT)
       key_size = sizeof(shader_key->fs);
-   else if (uncompiled->type == PIPE_SHADER_COMPUTE)
+   else if (uncompiled->type == PIPE_SHADER_COMPUTE ||
+            uncompiled->type == PIPE_SHADER_TESS_CTRL)
       key_size = 0;
    else
       unreachable("Unsupported shader stage");
@@ -60,10 +59,16 @@ static void
 write_shader(struct blob *blob, const struct agx_compiled_shader *binary,
              bool is_root_gs)
 {
-   uint32_t shader_size = binary->bo->size;
-   blob_write_uint32(blob, shader_size);
-   blob_write_bytes(blob, binary->bo->ptr.cpu, shader_size);
-   blob_write_bytes(blob, &binary->info, sizeof(binary->info));
+   blob_write_bytes(blob, &binary->b.info, sizeof(binary->b.info));
+
+   if (binary->b.info.binary_size) {
+      blob_write_bytes(blob, binary->b.binary, binary->b.info.binary_size);
+   }
+
+   blob_write_bytes(blob, &binary->uvs, sizeof(binary->uvs));
+   blob_write_bytes(blob, &binary->attrib_components_read,
+                    sizeof(binary->attrib_components_read));
+   blob_write_bytes(blob, &binary->epilog_key, sizeof(binary->epilog_key));
    blob_write_uint32(blob, binary->push_range_count);
    blob_write_bytes(blob, binary->push,
                     sizeof(binary->push[0]) * binary->push_range_count);
@@ -91,12 +96,31 @@ read_shader(struct agx_screen *screen, struct blob_reader *blob,
    binary->stage = uncompiled->type;
    binary->so = uncompiled;
 
-   uint32_t binary_size = blob_read_uint32(blob);
-   binary->bo = agx_bo_create(&screen->dev, binary_size,
-                              AGX_BO_EXEC | AGX_BO_LOW_VA, "Executable");
-   blob_copy_bytes(blob, binary->bo->ptr.cpu, binary_size);
+   blob_copy_bytes(blob, &binary->b.info, sizeof(binary->b.info));
+   size_t size = binary->b.info.binary_size;
 
-   blob_copy_bytes(blob, &binary->info, sizeof(binary->info));
+   if (uncompiled->type == PIPE_SHADER_VERTEX ||
+       uncompiled->type == PIPE_SHADER_TESS_EVAL ||
+       uncompiled->type == PIPE_SHADER_FRAGMENT) {
+
+      binary->b.binary = malloc(size);
+      blob_copy_bytes(blob, binary->b.binary, size);
+
+      if (size) {
+         binary->bo = agx_bo_create(&screen->dev, size, 0,
+                                    AGX_BO_EXEC | AGX_BO_LOW_VA, "Executable");
+         memcpy(agx_bo_map(binary->bo), binary->b.binary, size);
+      }
+   } else if (size) {
+      binary->bo = agx_bo_create(&screen->dev, size, 0,
+                                 AGX_BO_EXEC | AGX_BO_LOW_VA, "Executable");
+      blob_copy_bytes(blob, agx_bo_map(binary->bo), size);
+   }
+
+   blob_copy_bytes(blob, &binary->uvs, sizeof(binary->uvs));
+   blob_copy_bytes(blob, &binary->attrib_components_read,
+                   sizeof(binary->attrib_components_read));
+   blob_copy_bytes(blob, &binary->epilog_key, sizeof(binary->epilog_key));
    binary->push_range_count = blob_read_uint32(blob);
    blob_copy_bytes(blob, binary->push,
                    sizeof(binary->push[0]) * binary->push_range_count);
@@ -131,8 +155,6 @@ agx_disk_cache_store(struct disk_cache *cache,
 #ifdef ENABLE_SHADER_CACHE
    if (!cache)
       return;
-
-   assert(binary->bo->ptr.cpu != NULL && "shaders must be CPU mapped");
 
    cache_key cache_key;
    agx_disk_cache_compute_key(cache, uncompiled, key, cache_key);

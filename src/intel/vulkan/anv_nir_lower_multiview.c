@@ -204,7 +204,11 @@ anv_nir_lower_multiview(nir_shader *shader, uint32_t view_mask,
     * implement multiview.
     */
    if (use_primitive_replication) {
-      bool progress = nir_lower_multiview(shader, view_mask);
+      nir_lower_multiview_options options = {
+         .view_mask = view_mask,
+         .allowed_per_view_outputs = VARYING_BIT_POS
+      };
+      bool progress = nir_lower_multiview(shader, options);
 
       if (progress) {
          nir_builder b = nir_builder_at(nir_before_impl(entrypoint));
@@ -275,13 +279,11 @@ anv_nir_lower_multiview(nir_shader *shader, uint32_t view_mask,
          switch (load->intrinsic) {
          case nir_intrinsic_load_instance_id:
             if (&load->def != state.instance_id_with_views) {
-               nir_def_rewrite_uses(&load->def, build_instance_id(&state));
-               nir_instr_remove(&load->instr);
+               nir_def_replace(&load->def, build_instance_id(&state));
             }
             break;
          case nir_intrinsic_load_view_index:
-            nir_def_rewrite_uses(&load->def, view_index);
-            nir_instr_remove(&load->instr);
+            nir_def_replace(&load->def, view_index);
             break;
          case nir_intrinsic_emit_vertex_with_counter:
             /* In geometry shaders, outputs become undefined after every
@@ -299,8 +301,7 @@ anv_nir_lower_multiview(nir_shader *shader, uint32_t view_mask,
       }
    }
 
-   nir_metadata_preserve(entrypoint, nir_metadata_block_index |
-                                     nir_metadata_dominance);
+   nir_metadata_preserve(entrypoint, nir_metadata_control_flow);
 
    return true;
 }
@@ -342,5 +343,9 @@ anv_check_for_primitive_replication(struct anv_device *device,
    if (view_count == 1 || view_count > primitive_replication_max_views)
       return false;
 
-   return nir_can_lower_multiview(shaders[MESA_SHADER_VERTEX]);
+   nir_lower_multiview_options options = {
+      .view_mask = view_mask,
+      .allowed_per_view_outputs = VARYING_BIT_POS
+   };
+   return nir_can_lower_multiview(shaders[MESA_SHADER_VERTEX], options);
 }

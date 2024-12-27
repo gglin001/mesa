@@ -17,33 +17,6 @@
 
 #include "vn_wsi.h"
 
-struct vn_physical_device_properties {
-   VkPhysicalDeviceProperties vulkan_1_0;
-   VkPhysicalDeviceVulkan11Properties vulkan_1_1;
-   VkPhysicalDeviceVulkan12Properties vulkan_1_2;
-   VkPhysicalDeviceVulkan13Properties vulkan_1_3;
-
-   /* KHR */
-   VkPhysicalDeviceFragmentShadingRatePropertiesKHR fragment_shading_rate;
-   VkPhysicalDevicePushDescriptorPropertiesKHR push_descriptor;
-
-   /* EXT */
-   VkPhysicalDeviceConservativeRasterizationPropertiesEXT
-      conservative_rasterization;
-   VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color;
-   VkPhysicalDeviceExtendedDynamicState3PropertiesEXT extended_dynamic_state_3;
-   VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT
-      graphics_pipeline_library;
-   VkPhysicalDeviceLineRasterizationPropertiesEXT line_rasterization;
-   VkPhysicalDeviceMultiDrawPropertiesEXT multi_draw;
-   VkPhysicalDevicePCIBusInfoPropertiesEXT pci_bus_info;
-   VkPhysicalDeviceProvokingVertexPropertiesEXT provoking_vertex;
-   VkPhysicalDeviceRobustness2PropertiesEXT robustness_2;
-   VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback;
-   VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT
-      vertex_attribute_divisor;
-};
-
 struct vn_format_properties_entry {
    atomic_bool valid;
    VkFormatProperties properties;
@@ -100,16 +73,18 @@ struct vn_physical_device {
    struct vk_device_extension_table renderer_extensions;
    uint32_t *extension_spec_versions;
 
-   struct vn_physical_device_properties properties;
-   enum VkDriverId renderer_driver_id;
+   /* Venus feedback encounters cacheline overflush issue on Intel JSL, and
+    * has to workaround by further aligning up the feedback buffer alignment.
+    */
+   uint32_t wa_min_fb_align;
+
+   VkDriverId renderer_driver_id;
 
    VkQueueFamilyProperties2 *queue_family_properties;
    uint32_t queue_family_count;
    bool sparse_binding_disabled;
 
    VkPhysicalDeviceMemoryProperties memory_properties;
-   uint32_t coherent_uncached;
-   uint32_t incoherent_cached;
 
    struct {
       VkExternalMemoryHandleTypeFlagBits renderer_handle_type;

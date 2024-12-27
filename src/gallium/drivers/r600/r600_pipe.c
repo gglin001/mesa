@@ -1,25 +1,8 @@
 /*
  * Copyright 2010 Jerome Glisse <glisse@freedesktop.org>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * on the rights to use, copy, modify, merge, publish, distribute, sub
- * license, and/or sell copies of the Software, and to permit persons to whom
- * the Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHOR(S) AND/OR THEIR SUPPLIERS BE LIABLE FOR ANY CLAIM,
- * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
- * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
- * USE OR OTHER DEALINGS IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
+
 #include "r600_pipe.h"
 #include "r600_public.h"
 #include "r600_isa.h"
@@ -278,9 +261,6 @@ static int r600_get_param(struct pipe_screen* pscreen, enum pipe_cap param)
 	case PIPE_CAP_VERTEX_COLOR_UNCLAMPED:
 	case PIPE_CAP_QUADS_FOLLOW_PROVOKING_VERTEX_CONVENTION:
 	case PIPE_CAP_VS_INSTANCEID:
-	case PIPE_CAP_VERTEX_BUFFER_OFFSET_4BYTE_ALIGNED_ONLY:
-	case PIPE_CAP_VERTEX_BUFFER_STRIDE_4BYTE_ALIGNED_ONLY:
-	case PIPE_CAP_VERTEX_ELEMENT_SRC_OFFSET_4BYTE_ALIGNED_ONLY:
 	case PIPE_CAP_START_INSTANCE:
 	case PIPE_CAP_MAX_DUAL_SOURCE_RENDER_TARGETS:
 	case PIPE_CAP_TEXTURE_BUFFER_OBJECTS:
@@ -307,6 +287,9 @@ static int r600_get_param(struct pipe_screen* pscreen, enum pipe_cap param)
 	case PIPE_CAP_ALLOW_MAPPED_BUFFERS_DURING_EXECUTION:
 	case PIPE_CAP_ROBUST_BUFFER_ACCESS_BEHAVIOR:
       return 1;
+
+	case PIPE_CAP_VERTEX_INPUT_ALIGNMENT:
+		return PIPE_VERTEX_INPUT_ALIGNMENT_4BYTE;
 
 	case PIPE_CAP_NIR_ATOMICS_AS_DEREF:
 	case PIPE_CAP_GL_SPIRV:
@@ -590,8 +573,6 @@ static int r600_get_shader_param(struct pipe_screen* pscreen,
 		return 1;
 	case PIPE_SHADER_CAP_TGSI_SQRT_SUPPORTED:
 		return 1;
-	case PIPE_SHADER_CAP_INDIRECT_INPUT_ADDR:
-	case PIPE_SHADER_CAP_INDIRECT_OUTPUT_ADDR:
 	case PIPE_SHADER_CAP_INDIRECT_TEMP_ADDR:
 	case PIPE_SHADER_CAP_INDIRECT_CONST_ADDR:
 		return 1;

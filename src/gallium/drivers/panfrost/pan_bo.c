@@ -80,7 +80,9 @@ panfrost_bo_alloc(struct panfrost_device *dev, size_t size, uint32_t flags,
 
    kmod_bo = pan_kmod_bo_alloc(dev->kmod.dev, exclusive_vm, size,
                                to_kmod_bo_flags(flags));
-   assert(kmod_bo);
+
+   if (kmod_bo == NULL)
+      goto err_alloc;
 
    bo = pan_lookup_bo(dev, kmod_bo->handle);
    assert(!memcmp(bo, &((struct panfrost_bo){0}), sizeof(*bo)));
@@ -100,15 +102,23 @@ panfrost_bo_alloc(struct panfrost_device *dev, size_t size, uint32_t flags,
          },
    };
 
-   ASSERTED int ret =
+   int ret =
       pan_kmod_vm_bind(dev->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &vm_op, 1);
-   assert(!ret);
+
+   if (ret)
+      goto err_bind;
 
    bo->ptr.gpu = vm_op.va.start;
    bo->flags = flags;
    bo->dev = dev;
    bo->label = label;
    return bo;
+err_bind:
+   pan_kmod_bo_put(kmod_bo);
+   /* BO will be freed with the sparse array, but zero to indicate free */
+   memset(bo, 0, sizeof(*bo));
+err_alloc:
+   return NULL;
 }
 
 static void
@@ -323,19 +333,20 @@ panfrost_bo_cache_evict_all(struct panfrost_device *dev)
    pthread_mutex_unlock(&dev->bo_cache.lock);
 }
 
-void
+int
 panfrost_bo_mmap(struct panfrost_bo *bo)
 {
    if (bo->ptr.cpu)
-      return;
+      return 0;
 
    bo->ptr.cpu = pan_kmod_bo_mmap(bo->kmod_bo, 0, panfrost_bo_size(bo),
                                   PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
    if (bo->ptr.cpu == MAP_FAILED) {
       bo->ptr.cpu = NULL;
-      fprintf(stderr, "mmap failed: result=%p size=0x%llx\n", bo->ptr.cpu,
-              (long long)panfrost_bo_size(bo));
+      return -1;
    }
+
+   return 0;
 }
 
 static void
@@ -345,7 +356,7 @@ panfrost_bo_munmap(struct panfrost_bo *bo)
       return;
 
    if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {
-      perror("munmap");
+      mesa_loge("munmap failed: %s", strerror(errno));
       abort();
    }
 
@@ -358,6 +369,14 @@ panfrost_bo_create(struct panfrost_device *dev, size_t size, uint32_t flags,
 {
    struct panfrost_bo *bo;
 
+   if (dev->debug & PAN_DBG_DUMP) {
+      /* Make sure to CPU-map all BOs except growable ones, so that
+         we can dump them when PAN_MESA_DEBUG=dump. */
+      if (!(flags & PAN_BO_GROWABLE)) {
+         flags &= ~PAN_BO_INVISIBLE;
+      }
+      flags &= ~PAN_BO_DELAY_MMAP;
+   }
    /* Kernel will fail (confusingly) with EPERM otherwise */
    assert(size > 0);
 
@@ -383,17 +402,19 @@ panfrost_bo_create(struct panfrost_device *dev, size_t size, uint32_t flags,
       bo = panfrost_bo_alloc(dev, size, flags, label);
    }
 
-   if (!bo) {
-      unreachable("BO creation failed. We don't handle that yet.");
+   if (!bo)
       return NULL;
-   }
 
    /* Only mmap now if we know we need to. For CPU-invisible buffers, we
     * never map since we don't care about their contents; they're purely
     * for GPU-internal use. But we do trace them anyway. */
 
-   if (!(flags & (PAN_BO_INVISIBLE | PAN_BO_DELAY_MMAP)))
-      panfrost_bo_mmap(bo);
+   if (!(flags & (PAN_BO_INVISIBLE | PAN_BO_DELAY_MMAP))) {
+      if (panfrost_bo_mmap(bo)) {
+         panfrost_bo_free(bo);
+         return NULL;
+      }
+   }
 
    p_atomic_set(&bo->refcnt, 1);
 
@@ -491,6 +512,10 @@ panfrost_bo_import(struct panfrost_device *dev, int fd)
       bo->ptr.gpu = vm_op.va.start;
       bo->flags = PAN_BO_SHARED;
       p_atomic_set(&bo->refcnt, 1);
+
+      /* mmap imported BOs when PAN_MESA_DEBUG=dump */
+      if ((dev->debug & PAN_DBG_DUMP) && panfrost_bo_mmap(bo))
+         mesa_loge("failed to mmap");
    } else {
       /* bo->refcnt == 0 can happen if the BO
        * was being released but panfrost_bo_import() acquired the

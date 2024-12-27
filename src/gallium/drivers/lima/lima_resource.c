@@ -72,8 +72,10 @@ lima_resource_create_scanout(struct pipe_screen *pscreen,
 
    scanout = renderonly_scanout_for_resource(&scanout_templat,
                                              screen->ro, &handle);
-   if (!scanout)
+   if (!scanout) {
+      FREE(res);
       return NULL;
+   }
 
    res->base = *templat;
    res->base.screen = pscreen;
@@ -879,7 +881,7 @@ lima_blit(struct pipe_context *pctx, const struct pipe_blit_info *blit_info)
 
    lima_util_blitter_save_states(ctx);
 
-   util_blitter_blit(ctx->blitter, &info);
+   util_blitter_blit(ctx->blitter, &info, NULL);
 }
 
 static void

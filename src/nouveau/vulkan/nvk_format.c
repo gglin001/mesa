@@ -17,6 +17,21 @@
 #include "cl9097.h"
 #include "cl90c0.h"
 
+bool
+nvk_format_supports_atomics(const struct nv_device_info *dev,
+                            enum pipe_format p_format)
+{
+   switch (p_format) {
+   case PIPE_FORMAT_R32_UINT:
+   case PIPE_FORMAT_R32_SINT:
+   case PIPE_FORMAT_R64_UINT:
+   case PIPE_FORMAT_R64_SINT:
+      return true;
+   default:
+      return false;
+   }
+}
+
 #define VA_FMT(vk_fmt, widths, swap_rb, type) \
    [VK_FORMAT_##vk_fmt] = \
    { NV9097_SET_VERTEX_ATTRIBUTE_A_COMPONENT_BIT_WIDTHS_##widths, \
@@ -161,9 +176,9 @@ nvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
 
    VkFormatFeatureFlags2 linear2, optimal2, buffer2;
    linear2 = nvk_get_image_format_features(pdevice, format,
-                                           VK_IMAGE_TILING_LINEAR);
+                                           VK_IMAGE_TILING_LINEAR, 0);
    optimal2 = nvk_get_image_format_features(pdevice, format,
-                                            VK_IMAGE_TILING_OPTIMAL);
+                                            VK_IMAGE_TILING_OPTIMAL, 0);
    buffer2 = nvk_get_buffer_format_features(pdevice, format);
 
    pFormatProperties->formatProperties = (VkFormatProperties) {
@@ -182,8 +197,13 @@ nvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
          break;
       }
 
+      case VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT:
+      case VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT:
+         nvk_get_drm_format_modifier_properties_list(pdevice, format, ext);
+         break;
+
       default:
-         nvk_debug_ignored_stype(ext->sType);
+         vk_debug_ignored_stype(ext->sType);
          break;
       }
    }

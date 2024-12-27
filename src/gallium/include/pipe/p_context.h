@@ -650,9 +650,10 @@ struct pipe_context {
                                         struct pipe_stream_output_target *);
 
    void (*set_stream_output_targets)(struct pipe_context *,
-                              unsigned num_targets,
-                              struct pipe_stream_output_target **targets,
-                              const unsigned *offsets);
+                                     unsigned num_targets,
+                                     struct pipe_stream_output_target **targets,
+                                     const unsigned *offsets,
+                                     enum mesa_prim output_prim);
 
    uint32_t (*stream_output_target_offset)(struct pipe_stream_output_target *target);
 
@@ -1023,6 +1024,7 @@ struct pipe_context {
                        const struct pipe_grid_info *info);
 
    void (*draw_mesh_tasks)(struct pipe_context *context,
+                           unsigned drawid_offset,
                            const struct pipe_grid_info *info);
    /*@}*/
 
@@ -1257,11 +1259,16 @@ struct pipe_context {
     *
     * \param ctx         pipe context
     * \param subgraph    previously-compiled subgraph
-    * \param input       tensor to use as the input
+    * \param inputs_count number of input tensors to copy in
+    * \param input_idxs   array with the indices of input tensors
+    * \param inputs       array of buffers to copy the tensor data from
+    * \param is_signed    per-buffer signed integer flag
     */
    void (*ml_subgraph_invoke)(struct pipe_context *context,
                               struct pipe_ml_subgraph *subgraph,
-                              struct pipe_tensor *input);
+                              unsigned inputs_count,
+                              unsigned input_idxs[],
+                              void *inputs[], bool is_signed[]);
 
    /**
     * After a ML subgraph has been invoked, copy the contents of the output
@@ -1272,10 +1279,12 @@ struct pipe_context {
     * \param outputs_count number of output tensors to copy out
     * \param output_idxs   array with the indices of output tensors
     * \param outputs       array of buffers to copy the tensor data to
+    * \param is_signed     per-buffer signed integer flag
     */
    void (*ml_subgraph_read_output)(struct pipe_context *context,
                                    struct pipe_ml_subgraph *subgraph,
-                                   unsigned outputs_count, unsigned output_idxs[], void *outputs[]);
+                                   unsigned outputs_count, unsigned output_idxs[],
+                                   void *outputs[], bool is_signed[]);
 
    /**
     * Release all resources allocated by the implementation of ml_subgraph_create

@@ -1,41 +1,26 @@
 # Copyright © 2017 Intel Corporation
-
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
+# SPDX-License-Identifier: MIT
 
 gen_xml_files = [
-  'gen4.xml',
+  'gen40.xml',
   'gen45.xml',
-  'gen5.xml',
-  'gen6.xml',
-  'gen7.xml',
+  'gen50.xml',
+  'gen60.xml',
+  'gen70.xml',
   'gen75.xml',
-  'gen8.xml',
-  'gen9.xml',
-  'gen11.xml',
-  'gen12.xml',
+  'gen80.xml',
+  'gen90.xml',
+  'gen110.xml',
+  'gen120.xml',
   'gen125.xml',
-  'gen20.xml',
+  'gen200.xml',
+  'gen300.xml',
 ]
 
 gen_xml_rt_files = [
   'gen125_rt.xml',
-  'gen20_rt.xml',
+  'gen200_rt.xml',
+  'gen300_rt.xml',
 ]
 
 gen_pack_header_deps = files('intel_genxml.py', 'util.py')
@@ -119,6 +104,8 @@ endforeach
 
 genX_cl_included_symbols = [
   # instructions
+  '3DSTATE_DS',
+  '3DSTATE_HS',
   '3DSTATE_INDEX_BUFFER',
   '3DSTATE_VERTEX_BUFFERS',
   '3DPRIMITIVE',

@@ -51,17 +51,20 @@ struct si_shader_args {
 
    /* API TCS & TES */
    /* Layout of TCS outputs in the offchip buffer
+    * # 7 bits
+    *   [0:6] = the number of patches per threadgroup - 1, max = 127
+    * # 5 bits
+    *   [7:11] = the number of output vertices per patch - 1, max = 31
+    * # 5 bits
+    *   [12:16] = the number of input vertices per patch - 1, max = 31 (TCS only)
     * # 6 bits
-    *   [0:5] = the number of patches per threadgroup - 1, max = 63
-    * # 5 bits
-    *   [6:10] = the number of output vertices per patch - 1, max = 31
-    * # 5 bits
-    *   [11:15] = the number of input vertices per patch - 1, max = 31 (TCS only)
-    * # 16 bits
-    *   [16:31] = the offset of per patch attributes in the buffer in bytes.
-    *       64 outputs are implied by SI_UNIQUE_SLOT_* values.
-    *       max = 32(CPs) * 64(outputs) * 16(vec4) * 64(num_patches) = 2M,
-    *       clamped to 32K(LDS limit) = 32K
+    *   [17:22] = the number of LS outputs in LDS, max = 63
+    * # 6 bits
+    *   [23:28] = the number of HS per-vertex outputs in memory, max = 63
+    * # 2 bits
+    *   [29:30] = TES output primitive type
+    * # 1 bit
+    *   [31] = whether TES reads tess factor outputs from TCS
     */
    struct ac_arg tcs_offchip_layout;
 
@@ -72,7 +75,7 @@ struct si_shader_args {
    struct ac_arg color_start;
    /* CS */
    struct ac_arg block_size;
-   struct ac_arg cs_user_data;
+   struct ac_arg cs_user_data[2];
    struct ac_arg cs_shaderbuf[3];
    struct ac_arg cs_image[3];
 };
@@ -91,12 +94,7 @@ bool si_is_multi_part_shader(struct si_shader *shader);
 bool si_is_merged_shader(struct si_shader *shader);
 void si_add_arg_checked(struct ac_shader_args *args, enum ac_arg_regfile file, unsigned registers,
                         enum ac_arg_type type, struct ac_arg *arg, unsigned idx);
-void si_init_shader_args(struct si_shader *shader, struct si_shader_args *args);
 unsigned si_get_max_workgroup_size(const struct si_shader *shader);
-struct nir_shader *si_get_nir_shader(struct si_shader *shader, struct si_shader_args *args,
-                                     bool *free_nir, uint64_t tcs_vgpr_only_inputs,
-                                     ac_nir_gs_output_info *output_info);
-void si_get_tcs_epilog_key(struct si_shader *shader, union si_shader_part_key *key);
 bool si_need_ps_prolog(const union si_shader_part_key *key);
 void si_get_ps_prolog_key(struct si_shader *shader, union si_shader_part_key *key);
 void si_get_ps_epilog_key(struct si_shader *shader, union si_shader_part_key *key);
@@ -106,13 +104,6 @@ nir_shader *si_get_prev_stage_nir_shader(struct si_shader *shader,
                                          struct si_shader *prev_shader,
                                          struct si_shader_args *args,
                                          bool *free_nir);
-unsigned si_get_tcs_out_patch_stride(const struct si_shader_info *info);
-void si_get_tcs_epilog_args(enum amd_gfx_level gfx_level,
-                            struct si_shader_args *args,
-                            struct ac_arg *rel_patch_id,
-                            struct ac_arg *invocation_id,
-                            struct ac_arg *tf_lds_offset,
-                            struct ac_arg tess_factors[6]);
 void si_get_ps_prolog_args(struct si_shader_args *args,
                            const union si_shader_part_key *key);
 void si_get_ps_epilog_args(struct si_shader_args *args,
@@ -122,7 +113,6 @@ void si_get_ps_epilog_args(struct si_shader_args *args,
                            struct ac_arg *sample_mask);
 
 /* gfx10_shader_ngg.c */
-unsigned gfx10_ngg_get_vertices_per_prim(struct si_shader *shader);
 bool gfx10_ngg_export_prim_early(struct si_shader *shader);
 unsigned gfx10_ngg_get_scratch_dw_size(struct si_shader *shader);
 bool gfx10_ngg_calculate_subgroup_info(struct si_shader *shader);

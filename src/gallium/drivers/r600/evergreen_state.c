@@ -1,25 +1,8 @@
 /*
  * Copyright 2010 Jerome Glisse <glisse@freedesktop.org>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * on the rights to use, copy, modify, merge, publish, distribute, sub
- * license, and/or sell copies of the Software, and to permit persons to whom
- * the Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHOR(S) AND/OR THEIR SUPPLIERS BE LIABLE FOR ANY CLAIM,
- * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
- * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
- * USE OR OTHER DEALINGS IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
+
 #include "r600_formats.h"
 #include "r600_shader.h"
 #include "r600_query.h"
@@ -612,7 +595,8 @@ static void *evergreen_create_sampler_state(struct pipe_context *ctx,
 	 * MIP_FILTER will also be set to NONE. However, if more then one LOD is
 	 * configured, then the texture lookup seems to fail for some specific texture
 	 * formats. Forcing the number of LODs to one in this case fixes it. */
-	if (state->min_mip_filter == PIPE_TEX_MIPFILTER_NONE)
+	if (state->min_mip_filter == PIPE_TEX_MIPFILTER_NONE &&
+	    state->mag_img_filter == state->min_img_filter)
 		max_lod = state->min_lod;
 
 	ss->border_color_use = sampler_state_needs_border_color(state);
@@ -2137,7 +2121,8 @@ static void evergreen_emit_vertex_buffers(struct r600_context *rctx,
 {
 	struct radeon_cmdbuf *cs = &rctx->b.gfx.cs;
 	struct r600_fetch_shader *shader = (struct r600_fetch_shader*)rctx->vertex_fetch_shader.cso;
-	uint32_t dirty_mask = state->dirty_mask & shader->buffer_mask;
+	uint32_t buffer_mask = shader ? shader->buffer_mask : ~0;
+	uint32_t dirty_mask = state->dirty_mask & buffer_mask;
 
 	while (dirty_mask) {
 		struct pipe_vertex_buffer *vb;
@@ -2157,7 +2142,7 @@ static void evergreen_emit_vertex_buffers(struct r600_context *rctx,
 		radeon_emit(cs, PKT3(PKT3_SET_RESOURCE, 8, 0) | pkt_flags);
 		radeon_emit(cs, (resource_offset + buffer_index) * 8);
 		radeon_emit(cs, va); /* RESOURCEi_WORD0 */
-		radeon_emit(cs, rbuffer->b.b.width0 - vb->buffer_offset - 1); /* RESOURCEi_WORD1 */
+		radeon_emit(cs, rbuffer->b.b.width0 - vb->buffer_offset - 1 + shader->width_correction[buffer_index]); /* RESOURCEi_WORD1 */
 		radeon_emit(cs, /* RESOURCEi_WORD2 */
 				 S_030008_ENDIAN_SWAP(r600_endian_swap(32)) |
 				 S_030008_STRIDE(stride) |
@@ -2176,7 +2161,7 @@ static void evergreen_emit_vertex_buffers(struct r600_context *rctx,
 		radeon_emit(cs, radeon_add_to_buffer_list(&rctx->b, &rctx->b.gfx, rbuffer,
 						      RADEON_USAGE_READ | RADEON_PRIO_VERTEX_BUFFER));
 	}
-	state->dirty_mask &= ~shader->buffer_mask;
+	state->dirty_mask &= ~buffer_mask;
 }
 
 static void evergreen_fs_emit_vertex_buffers(struct r600_context *rctx, struct r600_atom * atom)

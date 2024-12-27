@@ -47,6 +47,13 @@ for path in '/dut-env-vars.sh' '/set-job-env-vars.sh' './set-job-env-vars.sh'; d
 done
 . "$SCRIPTS_DIR"/setup-test-env.sh
 
+# Flush out anything which might be stuck in a serial buffer
+echo
+echo
+echo
+
+section_switch init_stage2 "Pre-testing hardware setup"
+
 set -ex
 
 # Set up any devices required by the jobs
@@ -113,7 +120,7 @@ export PYTHONPATH=$(python3 -c "import sys;print(\":\".join(sys.path))")
 if [ -n "$MESA_LOADER_DRIVER_OVERRIDE" ]; then
   rm /install/lib/dri/!($MESA_LOADER_DRIVER_OVERRIDE)_dri.so
 fi
-ls -1 /install/lib/dri/*_dri.so
+ls -1 /install/lib/dri/*_dri.so || true
 
 if [ "$HWCI_FREQ_MAX" = "true" ]; then
   # Ensure initialization of the DRM device (needed by MSM)
@@ -158,6 +165,9 @@ if [ -x /capture-devcoredump.sh ]; then
   BACKGROUND_PIDS="$! $BACKGROUND_PIDS"
 fi
 
+ARCH=$(uname -m)
+export VK_DRIVER_FILES="/install/share/vulkan/icd.d/${VK_DRIVER}_icd.$ARCH.json"
+
 # If we want Xorg to be running for the test, then we start it up before the
 # HWCI_TEST_SCRIPT because we need to use xinit to start X (otherwise
 # without using -displayfd you can race with Xorg's startup), but xinit will eat
@@ -165,8 +175,7 @@ fi
 if [ -n "$HWCI_START_XORG" ]; then
   echo "touch /xorg-started; sleep 100000" > /xorg-script
   env \
-    VK_ICD_FILENAMES="/install/share/vulkan/icd.d/${VK_DRIVER}_icd.$(uname -m).json" \
-    xinit /bin/sh /xorg-script -- /usr/bin/Xorg -noreset -s 0 -dpms -logfile /Xorg.0.log &
+    xinit /bin/sh /xorg-script -- /usr/bin/Xorg -noreset -s 0 -dpms -logfile "$RESULTS_DIR/Xorg.0.log" &
   BACKGROUND_PIDS="$! $BACKGROUND_PIDS"
 
   # Wait for xorg to be ready for connections.
@@ -192,22 +201,24 @@ if [ -n "$HWCI_START_WESTON" ]; then
   mkdir -p /tmp/.X11-unix
 
   env \
-    VK_ICD_FILENAMES="/install/share/vulkan/icd.d/${VK_DRIVER}_icd.$(uname -m).json" \
     weston -Bheadless-backend.so --use-gl -Swayland-0 --xwayland --idle-time=0 &
   BACKGROUND_PIDS="$! $BACKGROUND_PIDS"
 
   while [ ! -S "$WESTON_X11_SOCK" ]; do sleep 1; done
 fi
 
+set +x
+
+section_end init_stage2
+
+echo "Running ${HWCI_TEST_SCRIPT} ${HWCI_TEST_ARGS} ..."
+
 set +e
-bash -c ". $SCRIPTS_DIR/setup-test-env.sh && $HWCI_TEST_SCRIPT"
-EXIT_CODE=$?
+$HWCI_TEST_SCRIPT ${HWCI_TEST_ARGS:-}; EXIT_CODE=$?
 set -e
 
-# Let's make sure the results are always stored in current working directory
-mv -f ${CI_PROJECT_DIR}/results ./ 2>/dev/null || true
-
-[ ${EXIT_CODE} -ne 0 ] || rm -rf results/trace/"$PIGLIT_REPLAY_DEVICE_NAME"
+section_start post_test_cleanup "Cleaning up after testing, uploading results"
+set -x
 
 # Make sure that capture-devcoredump is done before we start trying to tar up
 # artifacts -- if it's writing while tar is reading, tar will throw an error and
@@ -217,7 +228,7 @@ cleanup
 # upload artifacts
 if [ -n "$S3_RESULTS_UPLOAD" ]; then
   tar --zstd -cf results.tar.zst results/;
-  ci-fairy s3cp --token-file "${CI_JOB_JWT_FILE}" results.tar.zst https://"$S3_RESULTS_UPLOAD"/results.tar.zst;
+  ci-fairy s3cp --token-file "${S3_JWT_FILE}" results.tar.zst https://"$S3_RESULTS_UPLOAD"/results.tar.zst;
 fi
 
 # We still need to echo the hwci: mesa message, as some scripts rely on it, such
@@ -225,11 +236,12 @@ fi
 [ ${EXIT_CODE} -eq 0 ] && RESULT=pass || RESULT=fail
 
 set +x
+section_end post_test_cleanup
 
 # Print the final result; both bare-metal and LAVA look for this string to get
 # the result of our run, so try really hard to get it out rather than losing
 # the run. The device gets shut down right at this point, and a630 seems to
 # enjoy corrupting the last line of serial output before shutdown.
-for _ in $(seq 0 3); do echo "hwci: mesa: $RESULT"; sleep 1; echo; done
+for _ in $(seq 0 3); do echo "hwci: mesa: $RESULT, exit_code: $EXIT_CODE"; sleep 1; echo; done
 
 exit $EXIT_CODE

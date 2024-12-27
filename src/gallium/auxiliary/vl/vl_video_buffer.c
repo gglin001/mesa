@@ -73,23 +73,31 @@ vl_video_buffer_plane_order(enum pipe_format format)
 {
    switch(format) {
    case PIPE_FORMAT_YV12:
-   case PIPE_FORMAT_IYUV:
       return const_resource_plane_order_YVU;
 
    case PIPE_FORMAT_NV12:
    case PIPE_FORMAT_NV21:
    case PIPE_FORMAT_Y8_U8_V8_444_UNORM:
+   case PIPE_FORMAT_Y8_U8_V8_440_UNORM:
    case PIPE_FORMAT_R8G8B8A8_UNORM:
    case PIPE_FORMAT_R8G8B8X8_UNORM:
    case PIPE_FORMAT_B8G8R8A8_UNORM:
    case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+   case PIPE_FORMAT_R10G10B10X2_UNORM:
+   case PIPE_FORMAT_B10G10R10A2_UNORM:
+   case PIPE_FORMAT_B10G10R10X2_UNORM:
    case PIPE_FORMAT_YUYV:
    case PIPE_FORMAT_UYVY:
    case PIPE_FORMAT_P010:
+   case PIPE_FORMAT_P012:
    case PIPE_FORMAT_P016:
+   case PIPE_FORMAT_Y8_400_UNORM:
+   case PIPE_FORMAT_IYUV:
       return const_resource_plane_order_YUV;
 
    default:
+      assert(0);
       return NULL;
    }
 }
@@ -114,6 +122,9 @@ vl_video_buffer_is_format_supported(struct pipe_screen *screen,
 {
    enum pipe_format resource_formats[VL_NUM_COMPONENTS];
    unsigned i;
+
+   if (entrypoint == PIPE_VIDEO_ENTRYPOINT_PROCESSING && format == PIPE_FORMAT_R8_G8_B8_UNORM)
+      return false;
 
    vl_get_video_buffer_formats(screen, format, resource_formats);
 
@@ -192,6 +203,7 @@ vl_video_buffer_template(struct pipe_resource *templ,
    templ->array_size = array_size;
    templ->bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET | tmpl->bind;
    templ->usage = usage;
+   templ->flags = tmpl->flags;
 
    vl_video_buffer_adjust_size(&templ->width0, &height, plane,
                                chroma_format, false);
@@ -314,7 +326,6 @@ vl_video_buffer_sampler_view_components(struct pipe_video_buffer *buffer)
             goto error;
       }
    }
-   assert(component == VL_NUM_COMPONENTS);
 
    return buf->sampler_view_components;
 
@@ -509,6 +520,7 @@ vl_video_buffer_create_as_resource(struct pipe_context *pipe,
    templ.array_size = array_size;
    templ.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET | tmpl->bind;
    templ.usage = PIPE_USAGE_DEFAULT;
+   templ.flags = tmpl->flags;
 
    if (tmpl->buffer_format == PIPE_FORMAT_YUYV)
       templ.format = PIPE_FORMAT_R8G8_R8B8_UNORM;
@@ -535,5 +547,6 @@ vl_video_buffer_create_as_resource(struct pipe_context *pipe,
    struct pipe_video_buffer vidtemplate = *tmpl;
    vidtemplate.width = templ.width0;
    vidtemplate.height = templ.height0 * array_size;
+   vidtemplate.contiguous_planes = true;
    return vl_video_buffer_create_ex2(pipe, &vidtemplate, resources);
 }

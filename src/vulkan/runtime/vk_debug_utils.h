@@ -24,6 +24,7 @@
 #ifndef VK_DEBUG_UTILS_H
 #define VK_DEBUG_UTILS_H
 
+#include "vk_device.h"
 #include "vk_instance.h"
 
 #ifdef __cplusplus
@@ -59,6 +60,20 @@ vk_debug_message_instance(struct vk_instance *instance,
                           const char *pMessageIdName,
                           int32_t messageIdNumber,
                           const char *pMessage);
+
+void
+vk_address_binding_report(struct vk_instance *instance,
+                          struct vk_object_base *object,
+                          uint64_t base_address,
+                          uint64_t size,
+                          VkDeviceAddressBindingTypeEXT type);
+
+struct u_printf_ctx;
+struct u_printf_info;
+
+VkResult
+vk_check_printf_status(struct vk_device *dev, struct u_printf_ctx *ctx,
+                       struct u_printf_info *info, uint32_t count);
 
 #ifdef __cplusplus
 }

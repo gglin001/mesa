@@ -105,6 +105,7 @@ struct panfrost_compile_inputs {
    } blend;
    bool no_idvs;
    bool no_ubo_to_push;
+   uint32_t view_mask;
 
    /* Used on Valhall.
     *
@@ -288,6 +289,9 @@ struct pan_shader_info {
 
    uint32_t ubo_mask;
 
+   /* Quirk for GPUs that does not support auto32 types. */
+   bool quirk_no_auto32;
+
    union {
       struct bifrost_shader_info bifrost;
       struct midgard_shader_info midgard;
@@ -381,7 +385,6 @@ bool pan_nir_lower_zs_store(nir_shader *nir);
 bool pan_nir_lower_store_component(nir_shader *shader);
 
 bool pan_nir_lower_image_ms(nir_shader *shader);
-bool pan_nir_lower_64bit_intrin(nir_shader *shader);
 
 bool pan_lower_helper_invocation(nir_shader *shader);
 bool pan_lower_sample_pos(nir_shader *shader);

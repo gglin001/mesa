@@ -1,27 +1,7 @@
 /* -*- mesa-c++  -*-
- *
- * Copyright (c) 2019 Collabora LTD
- *
+ * Copyright 2019 Collabora LTD
  * Author: Gert Wollny <gert.wollny@collabora.com>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * on the rights to use, copy, modify, merge, publish, distribute, sub
- * license, and/or sell copies of the Software, and to permit persons to whom
- * the Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHOR(S) AND/OR THEIR SUPPLIERS BE LIABLE FOR ANY CLAIM,
- * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
- * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
- * USE OR OTHER DEALINGS IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "sfn_nir.h"
@@ -258,6 +238,7 @@ private:
          auto store = nir_store_output(b, clip_i, intr->src[1].ssa);
          nir_intrinsic_set_write_mask(store, 0xf);
          nir_intrinsic_set_base(store, clip_vertex_index);
+         nir_intrinsic_set_src_type(store, nir_type_float32);
          nir_io_semantics semantic = nir_intrinsic_io_semantics(intr);
          semantic.location = VARYING_SLOT_CLIP_DIST0 + i;
          semantic.no_varying = 1;
@@ -463,8 +444,7 @@ r600_nir_lower_atomics(nir_shader *shader)
    }
 
    return nir_shader_intrinsics_pass(shader, r600_lower_deref_instr,
-                                     nir_metadata_block_index | nir_metadata_dominance,
-                                     NULL);
+                                     nir_metadata_control_flow, NULL);
 }
 using r600::r600_lower_fs_out_to_vector;
 using r600::r600_lower_scratch_addresses;
@@ -643,6 +623,8 @@ optimize_once(nir_shader *shader)
    NIR_PASS(progress, shader, nir_copy_prop);
    NIR_PASS(progress, shader, nir_opt_dce);
    NIR_PASS(progress, shader, nir_opt_algebraic);
+   if (shader->options->has_bitfield_select)
+      NIR_PASS(progress, shader, nir_opt_generate_bfi);
    NIR_PASS(progress, shader, nir_opt_constant_folding);
    NIR_PASS(progress, shader, nir_opt_copy_prop_vars);
    NIR_PASS(progress, shader, nir_opt_remove_phis);
@@ -699,12 +681,6 @@ r600_lower_to_scalar_instr_filter(const nir_instr *instr, const void *)
    case nir_op_fdot2:
    case nir_op_fdot3:
    case nir_op_fdot4:
-   case nir_op_fddx:
-   case nir_op_fddx_coarse:
-   case nir_op_fddx_fine:
-   case nir_op_fddy:
-   case nir_op_fddy_coarse:
-   case nir_op_fddy_fine:
       return nir_src_bit_size(alu->src[0].src) == 64;
    default:
       return true;
@@ -785,7 +761,9 @@ r600_lower_and_optimize_nir(nir_shader *sh,
               nir_lower_io,
               io_modes,
               r600_glsl_type_size,
-              nir_lower_io_lower_64bit_to_32);
+              (nir_lower_io_options)
+              (nir_lower_io_lower_64bit_to_32 |
+               nir_lower_io_use_interpolated_input_intrinsics));
 
    if (sh->info.stage == MESA_SHADER_FRAGMENT)
       NIR_PASS_V(sh, r600_lower_fs_pos_input);
@@ -865,6 +843,7 @@ r600_lower_and_optimize_nir(nir_shader *sh,
               nir_lower_vars_to_scratch,
               nir_var_function_temp,
               40,
+              r600_get_natural_size_align_bytes,
               r600_get_natural_size_align_bytes);
 
    while (optimize_once(sh))

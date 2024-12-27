@@ -175,8 +175,8 @@ analyze_constant(const struct nir_alu_instr *instr, unsigned src,
 
    switch (nir_alu_type_get_base_type(use_type)) {
    case nir_type_float: {
-      double min_value = DBL_MAX;
-      double max_value = -DBL_MAX;
+      double min_value = NAN;
+      double max_value = NAN;
       bool any_zero = false;
       bool all_zero = true;
 
@@ -199,8 +199,8 @@ analyze_constant(const struct nir_alu_instr *instr, unsigned src,
 
          any_zero = any_zero || (v == 0.0);
          all_zero = all_zero && (v == 0.0);
-         min_value = MIN2(min_value, v);
-         max_value = MAX2(max_value, v);
+         min_value = fmin(min_value, v);
+         max_value = fmax(max_value, v);
       }
 
       assert(any_zero >= all_zero);
@@ -899,13 +899,13 @@ process_fp_query(struct analysis_state *state, struct analysis_query *aq, uint32
        */
       static const enum ssa_ranges table[last_range + 1][last_range + 1] = {
          /* left\right   unknown  lt_zero  le_zero  gt_zero  ge_zero  ne_zero  eq_zero */
-         /* unknown */ { _______, _______, _______, gt_zero, ge_zero, _______, _______ },
+         /* unknown */ { _______, _______, _______, gt_zero, ge_zero, _______, ge_zero },
          /* lt_zero */ { _______, lt_zero, le_zero, gt_zero, ge_zero, ne_zero, eq_zero },
          /* le_zero */ { _______, le_zero, le_zero, gt_zero, ge_zero, _______, eq_zero },
          /* gt_zero */ { gt_zero, gt_zero, gt_zero, gt_zero, gt_zero, gt_zero, gt_zero },
          /* ge_zero */ { ge_zero, ge_zero, ge_zero, gt_zero, ge_zero, ge_zero, ge_zero },
-         /* ne_zero */ { _______, ne_zero, _______, gt_zero, ge_zero, ne_zero, _______ },
-         /* eq_zero */ { _______, eq_zero, eq_zero, gt_zero, ge_zero, _______, eq_zero }
+         /* ne_zero */ { _______, ne_zero, _______, gt_zero, ge_zero, ne_zero, ge_zero },
+         /* eq_zero */ { ge_zero, eq_zero, eq_zero, gt_zero, ge_zero, ge_zero, eq_zero }
       };
 
       /* Treat fmax as commutative. */
@@ -983,13 +983,13 @@ process_fp_query(struct analysis_state *state, struct analysis_query *aq, uint32
        */
       static const enum ssa_ranges table[last_range + 1][last_range + 1] = {
          /* left\right   unknown  lt_zero  le_zero  gt_zero  ge_zero  ne_zero  eq_zero */
-         /* unknown */ { _______, lt_zero, le_zero, _______, _______, _______, _______ },
+         /* unknown */ { _______, lt_zero, le_zero, _______, _______, _______, le_zero },
          /* lt_zero */ { lt_zero, lt_zero, lt_zero, lt_zero, lt_zero, lt_zero, lt_zero },
          /* le_zero */ { le_zero, lt_zero, le_zero, le_zero, le_zero, le_zero, le_zero },
          /* gt_zero */ { _______, lt_zero, le_zero, gt_zero, ge_zero, ne_zero, eq_zero },
          /* ge_zero */ { _______, lt_zero, le_zero, ge_zero, ge_zero, _______, eq_zero },
-         /* ne_zero */ { _______, lt_zero, le_zero, ne_zero, _______, ne_zero, _______ },
-         /* eq_zero */ { _______, lt_zero, le_zero, eq_zero, eq_zero, _______, eq_zero }
+         /* ne_zero */ { _______, lt_zero, le_zero, ne_zero, _______, ne_zero, le_zero },
+         /* eq_zero */ { le_zero, lt_zero, le_zero, eq_zero, eq_zero, le_zero, eq_zero }
       };
 
       /* Treat fmin as commutative. */
@@ -1720,8 +1720,6 @@ get_alu_uub(struct analysis_state *state, struct uub_query q, uint32_t *result, 
    case nir_op_b32csel:
    case nir_op_ubfe:
    case nir_op_bfm:
-   case nir_op_fmul:
-   case nir_op_fmulz:
    case nir_op_extract_u8:
    case nir_op_extract_i8:
    case nir_op_extract_u16:
@@ -1734,9 +1732,18 @@ get_alu_uub(struct analysis_state *state, struct uub_query q, uint32_t *result, 
    case nir_op_u2u8:
    case nir_op_u2u16:
    case nir_op_u2u32:
-   case nir_op_f2u32:
       if (nir_scalar_chase_alu_src(q.scalar, 0).def->bit_size > 32) {
          /* If src is >32 bits, return max */
+         return;
+      }
+      break;
+   case nir_op_fsat:
+   case nir_op_fmul:
+   case nir_op_fmulz:
+   case nir_op_f2u32:
+   case nir_op_f2i32:
+      if (nir_scalar_chase_alu_src(q.scalar, 0).def->bit_size != 32) {
+         /* Only 32bit floats support for now, return max */
          return;
       }
       break;
@@ -1833,6 +1840,7 @@ get_alu_uub(struct analysis_state *state, struct uub_query q, uint32_t *result, 
       break;
    }
    /* limited floating-point support for f2u32(fmul(load_input(), <constant>)) */
+   case nir_op_f2i32:
    case nir_op_f2u32:
       /* infinity/NaN starts at 0x7f800000u, negative numbers at 0x80000000 */
       if (src[0] < 0x7f800000u) {
@@ -1852,6 +1860,9 @@ get_alu_uub(struct analysis_state *state, struct uub_query q, uint32_t *result, 
          float max_f = ceilf(src0_f) * ceilf(src1_f);
          memcpy(result, &max_f, 4);
       }
+      break;
+   case nir_op_fsat:
+      *result = 0x3f800000u;
       break;
    case nir_op_u2u1:
    case nir_op_u2u8:

@@ -82,14 +82,7 @@ vlVdpVideoSurfaceCreate(VdpDevice device, VdpChromaType chroma_type,
 
    mtx_lock(&dev->mutex);
    memset(&p_surf->templat, 0, sizeof(p_surf->templat));
-   /* TODO: buffer_format should be selected to match chroma_type */
-   p_surf->templat.buffer_format = pipe->screen->get_video_param
-   (
-      pipe->screen,
-      PIPE_VIDEO_PROFILE_UNKNOWN,
-      PIPE_VIDEO_ENTRYPOINT_BITSTREAM,
-      PIPE_VIDEO_CAP_PREFERED_FORMAT
-   );
+   p_surf->templat.buffer_format = ChromaToPipeFormat(chroma_type);
    p_surf->templat.width = width;
    p_surf->templat.height = height;
    p_surf->templat.interlaced = pipe->screen->get_video_param
@@ -101,9 +94,14 @@ vlVdpVideoSurfaceCreate(VdpDevice device, VdpChromaType chroma_type,
    );
    if (p_surf->templat.buffer_format != PIPE_FORMAT_NONE)
       p_surf->video_buffer = pipe->create_video_buffer(pipe, &p_surf->templat);
-
    /* do not mandate early allocation of a video buffer */
-   vlVdpVideoSurfaceClear(p_surf);
+
+   if (!pipe->screen->get_video_param(pipe->screen,
+                                      PIPE_VIDEO_PROFILE_UNKNOWN,
+                                      PIPE_VIDEO_ENTRYPOINT_UNKNOWN,
+                                      PIPE_VIDEO_CAP_SKIP_CLEAR_SURFACE))
+      vlVdpVideoSurfaceClear(p_surf);
+
    mtx_unlock(&dev->mutex);
 
    *surface = vlAddDataHTAB(p_surf);

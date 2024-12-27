@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "radv_private.h"
+#include "radv_printf.h"
+#include "radv_device.h"
+#include "radv_physical_device.h"
 
 #include "util/hash_table.h"
 #include "util/strndup.h"
@@ -18,6 +20,8 @@ static struct hash_table *device_ht = NULL;
 VkResult
 radv_printf_data_init(struct radv_device *device)
 {
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+
    util_dynarray_init(&device->printf.formats, NULL);
 
    device->printf.buffer_size = debug_get_num_option("RADV_PRINTF_BUFFER_SIZE", 0);
@@ -27,9 +31,9 @@ radv_printf_data_init(struct radv_device *device)
    VkBufferCreateInfo buffer_create_info = {
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
       .pNext =
-         &(VkBufferUsageFlags2CreateInfoKHR){
-            .sType = VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR,
-            .usage = VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT_KHR | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT_KHR,
+         &(VkBufferUsageFlags2CreateInfo){
+            .sType = VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO,
+            .usage = VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT,
          },
       .size = device->printf.buffer_size,
    };
@@ -45,9 +49,9 @@ radv_printf_data_init(struct radv_device *device)
    VkMemoryAllocateInfo alloc_info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
       .allocationSize = requirements.size,
-      .memoryTypeIndex = radv_find_memory_index(device->physical_device, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                                                                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                                                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+      .memoryTypeIndex =
+         radv_find_memory_index(pdev, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
    };
 
    result = device->vk.dispatch_table.AllocateMemory(_device, &alloc_info, NULL, &device->printf.memory);
@@ -112,6 +116,9 @@ radv_build_printf(nir_builder *b, nir_def *cond, const char *format_string, ...)
    if (cond)
       nir_push_if(b, cond);
 
+   if (b->shader->info.stage == MESA_SHADER_FRAGMENT)
+      nir_push_if(b, nir_inot(b, nir_is_helper_invocation(b, 1)));
+
    nir_def *size = nir_imm_int(b, 4);
 
    va_list arg_list;
@@ -130,6 +137,7 @@ radv_build_printf(nir_builder *b, nir_def *cond, const char *format_string, ...)
 
    for (uint32_t i = 0; i < num_args; i++) {
       nir_def *arg = va_arg(arg_list, nir_def *);
+      bool divergent = arg->divergent;
 
       if (arg->bit_size == 1)
          arg = nir_b2i32(b, arg);
@@ -139,9 +147,7 @@ radv_build_printf(nir_builder *b, nir_def *cond, const char *format_string, ...)
       uint32_t arg_size = arg->bit_size == 1 ? 32 : arg->bit_size / 8;
       format.element_sizes[i] = arg_size;
 
-      nir_update_instr_divergence(b->shader, arg->parent_instr);
-
-      if (arg->divergent) {
+      if (divergent) {
          strides[i] = nir_imul_imm(b, active_invocation_count, arg_size);
          format.divergence_mask |= BITFIELD_BIT(i);
       } else {
@@ -199,6 +205,9 @@ radv_build_printf(nir_builder *b, nir_def *cond, const char *format_string, ...)
    nir_pop_if(b, NULL);
 
    if (cond)
+      nir_pop_if(b, NULL);
+
+   if (b->shader->info.stage == MESA_SHADER_FRAGMENT)
       nir_pop_if(b, NULL);
 
    free(args);

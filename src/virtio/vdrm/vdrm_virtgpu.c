@@ -178,7 +178,7 @@ virtgpu_bo_create(struct vdrm_device *vdev, size_t size, uint32_t blob_flags,
 }
 
 static int
-map_handle(int fd, uint32_t handle, size_t size, void **map)
+map_handle(int fd, uint32_t handle, size_t size, void **map, void *placed_addr)
 {
    struct drm_virtgpu_map req = {
       .handle = handle,
@@ -191,7 +191,9 @@ map_handle(int fd, uint32_t handle, size_t size, void **map)
       return ret;
    }
 
-   *map = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, req.offset);
+   *map = mmap(placed_addr, size, PROT_READ | PROT_WRITE,
+               MAP_SHARED | (placed_addr != NULL ? MAP_FIXED : 0),
+               fd, req.offset);
    if (*map == MAP_FAILED) {
       mesa_loge("failed to map handle: %s", strerror(errno));
       return -1;
@@ -218,13 +220,13 @@ virtgpu_bo_wait(struct vdrm_device *vdev, uint32_t handle)
 }
 
 static void *
-virtgpu_bo_map(struct vdrm_device *vdev, uint32_t handle, size_t size)
+virtgpu_bo_map(struct vdrm_device *vdev, uint32_t handle, size_t size, void *placed_addr)
 {
    struct virtgpu_device *vgdev = to_virtgpu_device(vdev);
    void *map;
    int ret;
 
-   ret = map_handle(vgdev->fd, handle, size, &map);
+   ret = map_handle(vgdev->fd, handle, size, &map, placed_addr);
    if (ret)
       return NULL;
 
@@ -334,7 +336,7 @@ init_shmem(struct virtgpu_device *vgdev)
 
    vgdev->shmem_handle = args.bo_handle;
 
-   ret = map_handle(vgdev->fd, vgdev->shmem_handle, args.size, (void **)&vdev->shmem);
+   ret = map_handle(vgdev->fd, vgdev->shmem_handle, args.size, (void **)&vdev->shmem, NULL);
    if (ret) {
       gem_close(vgdev, vgdev->shmem_handle);
       vgdev->shmem_handle = 0;
@@ -346,6 +348,20 @@ init_shmem(struct virtgpu_device *vgdev)
    vdev->rsp_mem = &((uint8_t *)vdev->shmem)[offset];
 
    return 0;
+}
+
+static uint64_t
+get_param(int fd, uint64_t param)
+{
+   /* val must be zeroed because kernel only writes the lower 32 bits */
+   uint64_t val = 0;
+   struct drm_virtgpu_getparam args = {
+      .param = param,
+      .value = (uintptr_t)&val,
+   };
+
+   const int ret = virtgpu_ioctl(fd, VIRTGPU_GETPARAM, &args);
+   return ret ? 0 : val;
 }
 
 struct vdrm_device * vdrm_virtgpu_connect(int fd, uint32_t context_type);
@@ -364,10 +380,12 @@ vdrm_virtgpu_connect(int fd, uint32_t context_type)
       return NULL;
    }
 
-   if (caps.context_type != context_type) {
-      mesa_logi("wrong context_type: %u", caps.context_type);
+   /* If the context type does not match, return silently. This does not
+    * indicate anything is wrong, just that we're trying to probe the wrong
+    * driver. If we logged here, we would spam for every vdrm driver.
+    */
+   if (caps.context_type != context_type)
       return NULL;
-   }
 
    ret = set_context(fd);
    if (ret) {
@@ -390,6 +408,13 @@ vdrm_virtgpu_connect(int fd, uint32_t context_type)
    vdev = &vgdev->base;
    vdev->caps = caps;
    vdev->funcs = &funcs;
+
+   /* Cross-device feature is optional.  It enables sharing dma-bufs
+    * with other virtio devices, like virtio-wl or virtio-video used
+    * by ChromeOS VMs.  Qemu doesn't support cross-device sharing.
+    */
+   if (get_param(fd, VIRTGPU_PARAM_CROSS_DEVICE))
+      vdev->supports_cross_device = true;
 
    return vdev;
 }

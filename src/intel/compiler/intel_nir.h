@@ -3,8 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#ifndef INTEL_NIR_H
-#define INTEL_NIR_H
+#pragma once
 
 #include "nir.h"
 
@@ -40,8 +39,8 @@ bool intel_nir_opt_peephole_imul32x16(nir_shader *shader);
 
 bool intel_nir_pulls_at_sample(nir_shader *shader);
 
+bool intel_nir_lower_printf(nir_shader *nir);
+
 #ifdef __cplusplus
 }
 #endif
-
-#endif /* INTEL_NIR_H */

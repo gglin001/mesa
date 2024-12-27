@@ -23,6 +23,7 @@
 
 #include "nir/pipe_nir.h"
 #include "util/format/u_format.h"
+#include "util/perf/cpu_trace.h"
 #include "util/u_surface.h"
 #include "util/u_blitter.h"
 #include "compiler/nir/nir_builder.h"
@@ -70,7 +71,7 @@ vc4_tile_blit(struct pipe_context *pctx, struct pipe_blit_info *info)
         assert ((is_color_blit && !(is_depth_blit || is_stencil_blit)) ||
                 (!is_color_blit && (is_depth_blit || is_stencil_blit)));
 
-        if (info->scissor_enable)
+        if (info->scissor_enable || info->swizzle_enable)
                 return;
 
         if (info->dst.box.x != info->src.box.x ||
@@ -342,6 +343,8 @@ vc4_yuv_blit(struct pipe_context *pctx, struct pipe_blit_info *info)
         if (!(info->mask & PIPE_MASK_RGBA))
                 return;
 
+        if (info->swizzle_enable)
+                return;
         if (src->tiled)
                 return;
 
@@ -458,7 +461,7 @@ vc4_render_blit(struct pipe_context *ctx, struct pipe_blit_info *info)
         }
 
         vc4_blitter_save(vc4);
-        util_blitter_blit(vc4->blitter, info);
+        util_blitter_blit(vc4->blitter, info, NULL);
 
         info->mask = 0;
 }
@@ -528,7 +531,7 @@ vc4_stencil_blit(struct pipe_context *ctx, struct pipe_blit_info *info)
                                   PIPE_MASK_RGBA : PIPE_MASK_R,
                                   PIPE_TEX_FILTER_NEAREST,
                                   info->scissor_enable ? &info->scissor :  NULL,
-                                  info->alpha_blend, false, 0);
+                                  info->alpha_blend, false, 0, NULL);
 
         pipe_surface_reference(&dst_surf, NULL);
         pipe_sampler_view_reference(&src_view, NULL);
@@ -543,6 +546,8 @@ void
 vc4_blit(struct pipe_context *pctx, const struct pipe_blit_info *blit_info)
 {
         struct pipe_blit_info info = *blit_info;
+
+        MESA_TRACE_FUNC();
 
         vc4_yuv_blit(pctx, &info);
 

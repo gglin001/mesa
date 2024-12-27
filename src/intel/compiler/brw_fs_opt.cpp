@@ -17,7 +17,14 @@ brw_fs_optimize(fs_visitor &s)
    s.debug_optimizer(nir, "start", 0, 0);
 
    /* Start by validating the shader we currently have. */
-   s.validate();
+   brw_fs_validate(s);
+
+   /* Track how much non-SSA at this point. */
+   {
+      const brw::def_analysis &defs = s.def_analysis.require();
+      s.shader_stats.non_ssa_registers_after_nir =
+         defs.count() - defs.ssa_count();
+   }
 
    bool progress = false;
    int iteration = 0;
@@ -30,7 +37,7 @@ brw_fs_optimize(fs_visitor &s)
       if (this_progress)                                                \
          s.debug_optimizer(nir, #pass, iteration, pass_num);            \
                                                                         \
-      s.validate();                                                     \
+      brw_fs_validate(s);                                               \
                                                                         \
       progress = progress || this_progress;                             \
       this_progress;                                                    \
@@ -38,8 +45,6 @@ brw_fs_optimize(fs_visitor &s)
 
    s.assign_constant_locations();
    OPT(brw_fs_lower_constant_loads);
-
-   s.validate();
 
    if (s.compiler->lower_dpas)
       OPT(brw_fs_lower_dpas);
@@ -64,58 +69,71 @@ brw_fs_optimize(fs_visitor &s)
       iteration++;
 
       OPT(brw_fs_opt_algebraic);
-      OPT(brw_fs_opt_cse);
-      OPT(brw_fs_opt_copy_propagation);
-      OPT(brw_fs_opt_predicated_break);
+      OPT(brw_fs_opt_cse_defs);
+      if (!OPT(brw_fs_opt_copy_propagation_defs))
+         OPT(brw_fs_opt_copy_propagation);
       OPT(brw_fs_opt_cmod_propagation);
       OPT(brw_fs_opt_dead_code_eliminate);
-      OPT(brw_fs_opt_peephole_sel);
-      OPT(brw_fs_opt_dead_control_flow_eliminate);
       OPT(brw_fs_opt_saturate_propagation);
       OPT(brw_fs_opt_register_coalesce);
 
       OPT(brw_fs_opt_compact_virtual_grfs);
    } while (progress);
 
+   brw_shader_phase_update(s, BRW_SHADER_PHASE_AFTER_OPT_LOOP);
+
    progress = false;
    pass_num = 0;
+
+   if (OPT(brw_opt_combine_convergent_txf))
+      OPT(brw_fs_opt_copy_propagation_defs);
 
    if (OPT(brw_fs_lower_pack)) {
       OPT(brw_fs_opt_register_coalesce);
       OPT(brw_fs_opt_dead_code_eliminate);
    }
 
+   OPT(brw_fs_lower_subgroup_ops);
+   OPT(brw_fs_lower_csel);
    OPT(brw_fs_lower_simd_width);
+   OPT(brw_lower_scalar_fp64_MAD);
    OPT(brw_fs_lower_barycentrics);
    OPT(brw_fs_lower_logical_sends);
 
+   brw_shader_phase_update(s, BRW_SHADER_PHASE_AFTER_EARLY_LOWERING);
+
    /* After logical SEND lowering. */
 
-   if (OPT(brw_fs_opt_copy_propagation))
-      OPT(brw_fs_opt_algebraic);
+   if (!OPT(brw_fs_opt_copy_propagation_defs))
+      OPT(brw_fs_opt_copy_propagation);
 
    /* Identify trailing zeros LOAD_PAYLOAD of sampler messages.
     * Do this before splitting SENDs.
     */
-   if (OPT(brw_fs_opt_zero_samples) && OPT(brw_fs_opt_copy_propagation))
-      OPT(brw_fs_opt_algebraic);
+   if (OPT(brw_fs_opt_zero_samples)) {
+      if (!OPT(brw_fs_opt_copy_propagation_defs)) {
+         OPT(brw_fs_opt_copy_propagation);
+      }
+   }
 
    OPT(brw_fs_opt_split_sends);
    OPT(brw_fs_workaround_nomask_control_flow);
 
    if (progress) {
-      if (OPT(brw_fs_opt_copy_propagation))
-         OPT(brw_fs_opt_algebraic);
+      /* Do both forms of copy propagation because it is important to
+       * eliminate as many cases of load_payload-of-load_payload as possible.
+       */
+      OPT(brw_fs_opt_copy_propagation_defs);
+      OPT(brw_fs_opt_copy_propagation);
 
       /* Run after logical send lowering to give it a chance to CSE the
        * LOAD_PAYLOAD instructions created to construct the payloads of
        * e.g. texturing messages in cases where it wasn't possible to CSE the
        * whole logical instruction.
        */
-      OPT(brw_fs_opt_cse);
+      OPT(brw_fs_opt_cse_defs);
       OPT(brw_fs_opt_register_coalesce);
       OPT(brw_fs_opt_dead_code_eliminate);
-      OPT(brw_fs_opt_peephole_sel);
    }
 
    OPT(brw_fs_opt_remove_redundant_halts);
@@ -127,6 +145,8 @@ brw_fs_optimize(fs_visitor &s)
       OPT(brw_fs_lower_simd_width);
       OPT(brw_fs_opt_dead_code_eliminate);
    }
+
+   brw_shader_phase_update(s, BRW_SHADER_PHASE_AFTER_MIDDLE_LOWERING);
 
    OPT(brw_fs_lower_alu_restrictions);
 
@@ -143,22 +163,32 @@ brw_fs_optimize(fs_visitor &s)
    progress = false;
    OPT(brw_fs_lower_derivatives);
    OPT(brw_fs_lower_regioning);
-   if (progress) {
-      if (OPT(brw_fs_opt_copy_propagation)) {
-         OPT(brw_fs_opt_algebraic);
-         OPT(brw_fs_opt_combine_constants);
-      }
-      OPT(brw_fs_opt_dead_code_eliminate);
+
+   /* Try both copy propagation passes.  The defs one will likely not be
+    * able to handle everything at this point.
+    */
+   const bool cp1 = OPT(brw_fs_opt_copy_propagation_defs);
+   const bool cp2 = OPT(brw_fs_opt_copy_propagation);
+   if (cp1 || cp2)
+      OPT(brw_fs_opt_combine_constants);
+
+   OPT(brw_fs_opt_dead_code_eliminate);
+   OPT(brw_fs_opt_register_coalesce);
+
+   if (progress)
       OPT(brw_fs_lower_simd_width);
-   }
 
    OPT(brw_fs_lower_sends_overlapping_payload);
 
    OPT(brw_fs_lower_uniform_pull_constant_loads);
 
+   OPT(brw_fs_lower_indirect_mov);
+
    OPT(brw_fs_lower_find_live_channel);
 
-   s.validate();
+   OPT(brw_fs_lower_load_subgroup_invocation);
+
+   brw_shader_phase_update(s, BRW_SHADER_PHASE_AFTER_LATE_LOWERING);
 }
 
 static unsigned
@@ -170,7 +200,7 @@ load_payload_sources_read_for_size(fs_inst *lp, unsigned size_read)
    unsigned i;
    unsigned size = lp->header_size * REG_SIZE;
    for (i = lp->header_size; size < size_read && i < lp->sources; i++)
-      size += lp->exec_size * type_sz(lp->src[i].type);
+      size += lp->exec_size * brw_type_size_bytes(lp->src[i].type);
 
    /* Size read must cover exactly a subset of sources. */
    assert(size == size_read);
@@ -229,7 +259,7 @@ brw_fs_opt_zero_samples(fs_visitor &s)
       for (unsigned i = params - 1; i > first_param_idx; i--) {
          if (lp->src[i].file != BAD_FILE && !lp->src[i].is_zero())
             break;
-         zero_size += lp->exec_size * type_sz(lp->src[i].type) * lp->dst.stride;
+         zero_size += lp->exec_size * brw_type_size_bytes(lp->src[i].type) * lp->dst.stride;
       }
 
       /* Round down to ensure to only consider full registers. */
@@ -316,8 +346,8 @@ brw_fs_opt_split_sends(fs_visitor &s)
       assert(lp2->size_written % REG_SIZE == 0);
       assert((lp1->size_written + lp2->size_written) / REG_SIZE == send->mlen);
 
-      lp1->dst = fs_reg(VGRF, s.alloc.allocate(lp1->size_written / REG_SIZE), lp1->dst.type);
-      lp2->dst = fs_reg(VGRF, s.alloc.allocate(lp2->size_written / REG_SIZE), lp2->dst.type);
+      lp1->dst = brw_vgrf(s.alloc.allocate(lp1->size_written / REG_SIZE), lp1->dst.type);
+      lp2->dst = brw_vgrf(s.alloc.allocate(lp2->size_written / REG_SIZE), lp2->dst.type);
 
       send->resize_sources(4);
       send->src[2] = lp1->dst;
@@ -429,8 +459,16 @@ brw_fs_opt_eliminate_find_live_channel(fs_visitor &s)
          if (depth == 0) {
             inst->opcode = BRW_OPCODE_MOV;
             inst->src[0] = brw_imm_ud(0u);
-            inst->sources = 1;
             inst->force_writemask_all = true;
+
+            /* FIND_LIVE_CHANNEL emitted by emit_uniformize will have
+             * size_written set by hand to a smaller value. In this case,
+             * munge the exec_size to match.
+             */
+            if (inst->size_written == inst->dst.component_size(8 * reg_unit(s.devinfo)))
+               inst->exec_size = 8 * reg_unit(s.devinfo);
+
+            inst->resize_sources(1);
             progress = true;
 
             /* emit_uniformize() frequently emits FIND_LIVE_CHANNEL paired
@@ -449,8 +487,11 @@ brw_fs_opt_eliminate_find_live_channel(fs_visitor &s)
                bcast->opcode = BRW_OPCODE_MOV;
                if (!is_uniform(bcast->src[0]))
                   bcast->src[0] = component(bcast->src[0], 0);
-               bcast->sources = 1;
+
                bcast->force_writemask_all = true;
+               bcast->exec_size = 8 * reg_unit(s.devinfo);
+               assert(bcast->size_written == bcast->dst.component_size(bcast->exec_size));
+               bcast->resize_sources(1);
             }
          }
          break;
@@ -498,7 +539,7 @@ brw_fs_opt_remove_extra_rounding_modes(fs_visitor &s)
 
       foreach_inst_in_block_safe (fs_inst, inst, block) {
          if (inst->opcode == SHADER_OPCODE_RND_MODE) {
-            assert(inst->src[0].file == BRW_IMMEDIATE_VALUE);
+            assert(inst->src[0].file == IMM);
             const brw_rnd_mode mode = (brw_rnd_mode) inst->src[0].d;
             if (mode == prev_mode) {
                inst->remove(block);
@@ -515,4 +556,3 @@ brw_fs_opt_remove_extra_rounding_modes(fs_visitor &s)
 
    return progress;
 }
-

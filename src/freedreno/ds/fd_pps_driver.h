@@ -1,6 +1,5 @@
 /*
  * Copyright © 2021 Google, Inc.
- *
  * SPDX-License-Identifier: MIT
  */
 
@@ -8,11 +7,16 @@
 
 #include "pps/pps_driver.h"
 
-#include "common/freedreno_dev_info.h"
-#include "drm/freedreno_drmif.h"
-#include "drm/freedreno_ringbuffer.h"
-#include "perfcntrs/freedreno_dt.h"
-#include "perfcntrs/freedreno_perfcntr.h"
+extern "C" {
+struct fd_dev_id;
+struct fd_dev_info;
+struct fd_device;
+struct fd_pipe;
+struct fd_ringbuffer;
+struct fd_perfcntr_group;
+struct fd_perfcntr_countable;
+struct fd_perfcntr_counter;
+};
 
 namespace pps
 {
@@ -70,6 +74,7 @@ private:
 //   uint32_t cycles;  /* the number of clock cycles since last sample */
 
    void setup_a6xx_counters();
+   void setup_a7xx_counters();
 
    void configure_counters(bool reset, bool wait);
    void collect_countables();
@@ -102,7 +107,7 @@ private:
     */
    class Countable {
    public:
-      Countable(FreedrenoDriver *d, std::string name);
+      Countable(FreedrenoDriver *d, std::string group, std::string name);
 
       operator int64_t() const { return get_value(); };
 
@@ -116,10 +121,11 @@ private:
 
       uint32_t id;
       FreedrenoDriver *d;
+      std::string group;
       std::string name;
    };
 
-   Countable countable(std::string name);
+   Countable countable(std::string group, std::string name);
 
    std::vector<Countable> countables;
 

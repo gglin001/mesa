@@ -133,6 +133,7 @@ struct blitter_context
    struct pipe_vertex_buffer saved_vertex_buffers[PIPE_MAX_ATTRIBS];
 
    unsigned saved_num_so_targets;
+   enum mesa_prim saved_so_output_prim;
    struct pipe_stream_output_target *saved_so_targets[PIPE_MAX_SO_BUFFERS];
 
    struct pipe_query *saved_render_cond_query;
@@ -272,10 +273,12 @@ void util_blitter_blit_generic(struct blitter_context *blitter,
                                unsigned mask, unsigned filter,
                                const struct pipe_scissor_state *scissor,
                                bool alpha_blend, bool sample0_only,
-                               unsigned dst_sample);
+                               unsigned dst_sample,
+                               void *fs_override);
 
 void util_blitter_blit(struct blitter_context *blitter,
-		       const struct pipe_blit_info *info);
+		       const struct pipe_blit_info *info,
+                       void *fs_override);
 
 void util_blitter_generate_mipmap(struct blitter_context *blitter,
                                   struct pipe_resource *tex,
@@ -547,12 +550,15 @@ util_blitter_save_vertex_buffers(struct blitter_context *blitter,
 static inline void
 util_blitter_save_so_targets(struct blitter_context *blitter,
                              unsigned num_targets,
-                             struct pipe_stream_output_target **targets)
+                             struct pipe_stream_output_target **targets,
+                             enum mesa_prim output_prim)
 {
    unsigned i;
    assert(num_targets <= ARRAY_SIZE(blitter->saved_so_targets));
 
    blitter->saved_num_so_targets = num_targets;
+   blitter->saved_so_output_prim = output_prim;
+
    for (i = 0; i < num_targets; i++)
       pipe_so_target_reference(&blitter->saved_so_targets[i],
                                targets[i]);

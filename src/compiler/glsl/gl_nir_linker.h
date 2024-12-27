@@ -35,9 +35,12 @@ extern "C" {
 #endif
 
 struct gl_constants;
+struct gl_context;
 struct gl_extensions;
 struct gl_linked_shader;
+struct gl_shader;
 struct gl_shader_program;
+struct gl_shader;
 struct gl_program;
 struct gl_transform_feedback_info;
 struct xfb_decl;
@@ -63,10 +66,14 @@ bool gl_nir_link_spirv(const struct gl_constants *consts,
                        struct gl_shader_program *prog,
                        const struct gl_nir_linker_options *options);
 
-bool gl_nir_link_glsl(const struct gl_constants *consts,
-                      const struct gl_extensions *exts,
-                      gl_api api,
+bool gl_nir_link_glsl(struct gl_context *ctx,
                       struct gl_shader_program *prog);
+
+bool gl_nir_link_function_calls(struct gl_shader_program *prog,
+                                struct gl_shader *main,
+                                struct gl_linked_shader *linked_sh,
+                                struct gl_shader **shader_list,
+                                unsigned num_shaders);
 
 bool gl_nir_link_uniforms(const struct gl_constants *consts,
                           struct gl_shader_program *prog,
@@ -75,6 +82,16 @@ bool gl_nir_link_uniforms(const struct gl_constants *consts,
 bool gl_nir_link_varyings(const struct gl_constants *consts,
                           const struct gl_extensions *exts,
                           gl_api api, struct gl_shader_program *prog);
+
+const char * gl_nir_mode_string(const nir_variable *var);
+
+bool gl_nir_validate_intrastage_arrays(struct gl_shader_program *prog,
+                                       nir_variable *var,
+                                       nir_variable *existing,
+                                       nir_shader *existing_shader,
+                                       bool match_precision);
+
+void gl_nir_linker_size_arrays(nir_shader *shader);
 
 struct nir_xfb_info *
 gl_to_nir_xfb_info(struct gl_transform_feedback_info *info, void *mem_ctx);
@@ -116,8 +133,19 @@ void gl_nir_link_check_atomic_counter_resources(const struct gl_constants *const
 void gl_nir_link_assign_xfb_resources(const struct gl_constants *consts,
                                       struct gl_shader_program *prog);
 
+void gl_nir_validate_interstage_inout_blocks(struct gl_shader_program *prog,
+                                             const struct gl_linked_shader *producer,
+                                             const struct gl_linked_shader *consumer);
+
+void gl_nir_validate_interstage_uniform_blocks(struct gl_shader_program *prog,
+                                               struct gl_linked_shader **stages);
+
 bool gl_nir_link_uniform_blocks(const struct gl_constants *consts,
                                 struct gl_shader_program *prog);
+
+void gl_nir_validate_intrastage_interface_blocks(struct gl_shader_program *prog,
+                                                 const struct gl_shader **shader_list,
+                                                 unsigned num_shaders);
 
 bool
 gl_nir_can_add_pointsize_to_program(const struct gl_constants *consts,

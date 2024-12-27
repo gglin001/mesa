@@ -32,7 +32,6 @@
 #include "util/u_inlines.h"
 #include "pipe/p_shader_tokens.h"
 #include "util/u_draw_quad.h"
-#include "util/u_simple_shaders.h"
 #include "util/u_upload_mgr.h"
 
 #include "cso_cache/cso_context.h"
@@ -274,7 +273,7 @@ st_DrawTex(struct gl_context *ctx, GLfloat x, GLfloat y, GLfloat z,
    velems.count = numAttribs;
 
    cso_set_vertex_elements(cso, &velems);
-   cso_set_stream_outputs(cso, 0, NULL, NULL);
+   cso_set_stream_outputs(cso, 0, NULL, NULL, 0);
 
    /* viewport state: viewport matching window dims */
    {

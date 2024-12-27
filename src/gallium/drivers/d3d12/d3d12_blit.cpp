@@ -61,6 +61,7 @@ resolve_supported(const struct pipe_blit_info *info)
 
    if (info->filter != PIPE_TEX_FILTER_NEAREST ||
        info->scissor_enable ||
+       info->swizzle_enable ||
        info->num_window_rectangles > 0 ||
        info->alpha_blend)
       return false;
@@ -162,7 +163,7 @@ direct_copy_supported(struct d3d12_screen *screen,
                       const struct pipe_blit_info *info,
                       bool have_predication)
 {
-   if (info->scissor_enable || info->alpha_blend ||
+   if (info->scissor_enable || info->alpha_blend || info->swizzle_enable ||
        (have_predication && info->render_condition_enable) ||
        MAX2(info->src.resource->nr_samples, 1) != MAX2(info->dst.resource->nr_samples, 1)) {
       return false;
@@ -286,7 +287,8 @@ util_blit_save_state(struct d3d12_context *ctx)
    util_blitter_save_fragment_constant_buffer_slot(ctx->blitter, ctx->cbufs[PIPE_SHADER_FRAGMENT]);
    util_blitter_save_vertex_buffers(ctx->blitter, ctx->vbs, ctx->num_vbs);
    util_blitter_save_sample_mask(ctx->blitter, ctx->gfx_pipeline_state.sample_mask, 0);
-   util_blitter_save_so_targets(ctx->blitter, ctx->gfx_pipeline_state.num_so_targets, ctx->so_targets);
+   util_blitter_save_so_targets(ctx->blitter, ctx->gfx_pipeline_state.num_so_targets, ctx->so_targets,
+                                MESA_PRIM_UNKNOWN);
 }
 
 static void
@@ -295,7 +297,7 @@ util_blit(struct d3d12_context *ctx,
 {
    util_blit_save_state(ctx);
 
-   util_blitter_blit(ctx->blitter, info);
+   util_blitter_blit(ctx->blitter, info, NULL);
 }
 
 static bool
@@ -599,6 +601,7 @@ static void
 blit_replicate_stencil(struct d3d12_context *ctx,
                        const struct pipe_blit_info *info)
 {
+   struct pipe_context *pctx = &ctx->base;
    assert(info->mask & PIPE_MASK_S);
 
    if (D3D12_DEBUG_BLIT & d3d12_debug)
@@ -611,6 +614,15 @@ blit_replicate_stencil(struct d3d12_context *ctx,
       util_blit(ctx, &new_info);
    }
 
+   struct pipe_surface *dst_view, dst_templ;
+   util_blitter_default_dst_texture(&dst_templ, info->dst.resource,
+                           info->dst.level, info->dst.box.z);
+   dst_view = pctx->create_surface(pctx, info->dst.resource, &dst_templ);
+
+   util_blit_save_state(ctx);
+   util_blitter_clear_depth_stencil(ctx->blitter, dst_view, PIPE_CLEAR_STENCIL,
+                                    0, 0, info->dst.box.x, info->dst.box.y,
+                                    info->dst.box.width, info->dst.box.height);
    util_blit_save_state(ctx);
    util_blitter_stencil_fallback(ctx->blitter, info->dst.resource,
                                  info->dst.level,
@@ -619,6 +631,8 @@ blit_replicate_stencil(struct d3d12_context *ctx,
                                  info->src.level,
                                  &info->src.box,
                                  info->scissor_enable ? &info->scissor : NULL);
+
+   pipe_surface_release(pctx, &dst_view);
 }
 
 void

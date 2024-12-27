@@ -1,25 +1,8 @@
 /*
  * Copyright 2010 Jerome Glisse <glisse@freedesktop.org>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * on the rights to use, copy, modify, merge, publish, distribute, sub
- * license, and/or sell copies of the Software, and to permit persons to whom
- * the Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHOR(S) AND/OR THEIR SUPPLIERS BE LIABLE FOR ANY CLAIM,
- * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
- * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
- * USE OR OTHER DEALINGS IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
+
 #include "nir_serialize.h"
 #include "pipe/p_defines.h"
 #include "r600_asm.h"
@@ -348,22 +331,6 @@ void r600_pipe_shader_destroy(struct pipe_context *ctx UNUSED, struct r600_pipe_
 		free(shader->shader.arrays);
 }
 
-struct r600_shader_src {
-	unsigned				sel;
-	unsigned				swizzle[4];
-	unsigned				neg;
-	unsigned				abs;
-	unsigned				rel;
-	unsigned				kc_bank;
-	bool					kc_rel; /* true if cache bank is indexed */
-	uint32_t				value[4];
-};
-
-struct eg_interp {
-	bool					enabled;
-	unsigned				ij_index;
-};
-
 struct r600_shader_ctx {
 	unsigned				type;
 	unsigned				temp_reg;
@@ -387,9 +354,13 @@ void *r600_create_vertex_fetch_shader(struct pipe_context *ctx,
 	int i, j, r, fs_size;
 	uint32_t buffer_mask = 0;
 	struct r600_fetch_shader *shader;
-	unsigned strides[PIPE_MAX_ATTRIBS];
 
 	assert(count < 32);
+
+	/* Allocate the CSO. */
+	shader = CALLOC_STRUCT(r600_fetch_shader);
+	if (unlikely(!shader))
+		return NULL;
 
 	memset(&bc, 0, sizeof(bc));
 	r600_bytecode_init(&bc, rctx->b.gfx_level, rctx->b.family,
@@ -412,10 +383,8 @@ void *r600_create_vertex_fetch_shader(struct pipe_context *ctx,
 					alu.dst.chan = j;
 					alu.dst.write = j == 3;
 					alu.last = j == 3;
-					if ((r = r600_bytecode_add_alu(&bc, &alu))) {
-						r600_bytecode_clear(&bc);
-						return NULL;
-					}
+					if (unlikely(r = r600_bytecode_add_alu(&bc, &alu)))
+						goto fail;
 				}
 			} else {
 				struct r600_bytecode_alu alu;
@@ -429,13 +398,11 @@ void *r600_create_vertex_fetch_shader(struct pipe_context *ctx,
 				alu.dst.chan = 3;
 				alu.dst.write = 1;
 				alu.last = 1;
-				if ((r = r600_bytecode_add_alu(&bc, &alu))) {
-					r600_bytecode_clear(&bc);
-					return NULL;
-				}
+				if (unlikely(r = r600_bytecode_add_alu(&bc, &alu)))
+					goto fail;
 			}
 		}
-		strides[elements[i].vertex_buffer_index] = elements[i].src_stride;
+		shader->strides[elements[i].vertex_buffer_index] = elements[i].src_stride;
 		buffer_mask |= BITFIELD_BIT(elements[i].vertex_buffer_index);
 	}
 
@@ -445,10 +412,9 @@ void *r600_create_vertex_fetch_shader(struct pipe_context *ctx,
 
 		desc = util_format_description(elements[i].src_format);
 
-		if (elements[i].src_offset > 65535) {
-			r600_bytecode_clear(&bc);
+		if (unlikely(elements[i].src_offset > 65535)) {
 			R600_ERR("too big src_offset: %u\n", elements[i].src_offset);
-			return NULL;
+			goto fail;
 		}
 
 		memset(&vtx, 0, sizeof(vtx));
@@ -468,18 +434,25 @@ void *r600_create_vertex_fetch_shader(struct pipe_context *ctx,
 		vtx.offset = elements[i].src_offset;
 		vtx.endian = endian;
 
-		if ((r = r600_bytecode_add_vtx(&bc, &vtx))) {
-			r600_bytecode_clear(&bc);
-			return NULL;
+		if (unlikely(r = r600_bytecode_add_vtx(&bc, &vtx)))
+			goto fail;
+
+		if (unlikely(rctx->b.gfx_level >= EVERGREEN &&
+			     desc->nr_channels == 3 &&
+			     (format == FMT_8_8_8_8 ||
+			      format == FMT_16_16_16_16 ||
+			      format == FMT_16_16_16_16_FLOAT))) {
+			if (format == FMT_8_8_8_8)
+				shader->width_correction[elements[i].vertex_buffer_index] = 4 - 3;
+			else
+				shader->width_correction[elements[i].vertex_buffer_index] = 8 - 6;
 		}
 	}
 
 	r600_bytecode_add_cfinst(&bc, CF_OP_RET);
 
-	if ((r = r600_bytecode_build(&bc))) {
-		r600_bytecode_clear(&bc);
-		return NULL;
-	}
+	if (unlikely(r = r600_bytecode_build(&bc)))
+		goto fail;
 
 	if (rctx->screen->b.debug_flags & DBG_FS) {
 		fprintf(stderr, "--------------------------------------------------------------\n");
@@ -495,23 +468,13 @@ void *r600_create_vertex_fetch_shader(struct pipe_context *ctx,
 
 	fs_size = bc.ndw*4;
 
-	/* Allocate the CSO. */
-	shader = CALLOC_STRUCT(r600_fetch_shader);
-	if (!shader) {
-		r600_bytecode_clear(&bc);
-		return NULL;
-	}
-	memcpy(shader->strides, strides, sizeof(strides));
 	shader->buffer_mask = buffer_mask;
 
 	u_suballocator_alloc(&rctx->allocator_fetch_shader, fs_size, 256,
 			     &shader->offset,
 			     (struct pipe_resource**)&shader->buffer);
-	if (!shader->buffer) {
-		r600_bytecode_clear(&bc);
-		FREE(shader);
-		return NULL;
-	}
+	if (unlikely(!shader->buffer))
+		goto fail;
 
 	bytecode = r600_buffer_map_sync_with_rings
 		(&rctx->b, shader->buffer,
@@ -529,6 +492,12 @@ void *r600_create_vertex_fetch_shader(struct pipe_context *ctx,
 
 	r600_bytecode_clear(&bc);
 	return shader;
+
+ fail:
+	r600_bytecode_clear(&bc);
+	FREE(shader);
+	return NULL;
+
 }
 
 int eg_get_interpolator_index(unsigned interpolate, unsigned location)

@@ -856,9 +856,8 @@ get_embedded_xml_data_by_name(const char *filename,
       free(numstr);
       return false;
    }
-   /* convert ver numbers to verx10 */
-   if (num < 45)
-      num = num * 10;
+
+   assert(num >= 40);
 
    free(numstr);
    return get_embedded_xml_data(num, data, data_len);
@@ -1051,7 +1050,9 @@ intel_group_get_length(const struct intel_group *group, const uint32_t *p)
          else
             return -1;
       case 2: {
-         if (opcode == 0)
+         if (whole_opcode == 0x73A2 /* HCP_PAK_INSERT_OBJECT */)
+            return field_value(h, 0, 11) + 2;
+         else if (opcode == 0)
             return field_value(h, 0, 7) + 2;
          else if (opcode < 3)
             return field_value(h, 0, 15) + 2;
@@ -1073,7 +1074,7 @@ intel_group_get_length(const struct intel_group *group, const uint32_t *p)
 }
 
 static const char *
-intel_get_enum_name(struct intel_enum *e, uint64_t value)
+intel_get_enum_name(const struct intel_enum *e, uint64_t value)
 {
    for (int i = 0; i < e->nvalues; i++) {
       if (e->values[i]->value == value) {
@@ -1354,7 +1355,7 @@ iter_decode_field(struct intel_field_iterator *iter)
 
 void
 intel_field_iterator_init(struct intel_field_iterator *iter,
-                          struct intel_group *group,
+                          const struct intel_group *group,
                           const uint32_t *p, int p_bit,
                           bool print_colors)
 {
@@ -1402,14 +1403,15 @@ intel_field_iterator_next(struct intel_field_iterator *iter)
 static void
 print_dword_header(FILE *outfile,
                    struct intel_field_iterator *iter,
-                   uint64_t offset, uint32_t dword)
+                   uint64_t offset, uint32_t dword,
+                   const char *spacing)
 {
-   fprintf(outfile, "0x%08"PRIx64":  0x%08x : Dword %d\n",
-           offset + 4 * dword, iter->p[dword], dword);
+   fprintf(outfile, "%s0x%08"PRIx64":  0x%08x : Dword %d\n",
+           spacing, offset + 4 * dword, iter->p[dword], dword);
 }
 
 bool
-intel_field_is_header(struct intel_field *field)
+intel_field_is_header(const struct intel_field *field)
 {
    uint32_t bits;
 
@@ -1425,8 +1427,10 @@ intel_field_is_header(struct intel_field *field)
 }
 
 void
-intel_print_group(FILE *outfile, struct intel_group *group, uint64_t offset,
-                  const uint32_t *p, int p_bit, bool color)
+intel_print_group_custom_spacing(FILE *outfile,
+                                 const struct intel_group *group, uint64_t offset,
+                                 const uint32_t *p, int p_bit, bool color,
+                                 const char *spacing_reg, const char *spacing_dword)
 {
    struct intel_field_iterator iter;
    int last_dword = -1;
@@ -1436,11 +1440,11 @@ intel_print_group(FILE *outfile, struct intel_group *group, uint64_t offset,
       int iter_dword = iter.end_bit / 32;
       if (last_dword != iter_dword) {
          for (int i = last_dword + 1; i <= iter_dword; i++)
-            print_dword_header(outfile, &iter, offset, i);
+            print_dword_header(outfile, &iter, offset, i, spacing_dword);
          last_dword = iter_dword;
       }
       if (!intel_field_is_header(iter.field)) {
-         fprintf(outfile, "    %s: %s\n", iter.name, iter.value);
+         fprintf(outfile, "%s%s: %s\n", spacing_reg, iter.name, iter.value);
          if (iter.struct_desc) {
             int struct_dword = iter.start_bit / 32;
             uint64_t struct_offset = offset + 4 * struct_dword;
@@ -1449,4 +1453,16 @@ intel_print_group(FILE *outfile, struct intel_group *group, uint64_t offset,
          }
       }
    }
+}
+
+void
+intel_print_group(FILE *outfile,
+                  const struct intel_group *group, uint64_t offset,
+                  const uint32_t *p, int p_bit, bool color)
+{
+   const char *spacing_reg = "    ";
+   const char *spacing_dword = "";
+
+   intel_print_group_custom_spacing(outfile, group, offset, p, p_bit, color,
+                                    spacing_reg, spacing_dword);
 }

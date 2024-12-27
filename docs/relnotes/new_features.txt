@@ -1,13 +1,31 @@
-VK_EXT_map_memory_placed on RADV, ANV and NVK
-VK_KHR_shader_subgroup_rotate on RADV and ANV
-VK_KHR_load_store_op_none on RADV, ANV, NVK and Turnip
-VK_KHR_line_rasterization on RADV, ANV, NVK and Turnip
-VK_KHR_index_type_uint8 on RADV, ANV, NVK and Turnip
-VK_KHR_shader_expect_assume on all Vulkan drivers
-VK_KHR_shader_maximal_reconvergence on RADV, ANV and NVK
-VK_KHR_shader_quad_control on RADV
-OpenGL 4.6 on Asahi
-OpenGL ES 3.2 on Asahi
-Mali G610 and G310 on Panfrost
-Mali T600 on Panfrost
-VK_KHR_shader_subgroup_uniform_control_flow on NVK
+cl_khr_depth_images in rusticl
+Vulkan 1.4 on radv/gfx8+
+VK_KHR_dedicated_allocation on panvk
+VK_KHR_global_priority on panvk
+VK_KHR_index_type_uint8 on panvk
+VK_KHR_map_memory2 on panvk
+VK_KHR_multiview on panvk/v10+
+VK_KHR_shader_non_semantic_info on panvk
+VK_KHR_shader_relaxed_extended_instruction on panvk
+VK_KHR_vertex_attribute_divisor on panvk
+VK_KHR_zero_initialize_workgroup_memory on panvk
+VK_KHR_shader_float16_int8 on panvk
+VK_KHR_8bit_storage on panvk
+VK_EXT_4444_formats on panvk
+VK_EXT_global_priority on panvk
+VK_EXT_global_priority_query on panvk
+VK_EXT_host_query_reset on panvk
+VK_EXT_image_robustness on panvk
+VK_EXT_pipeline_robustness on panvk
+VK_EXT_provoking_vertex on panvk
+VK_EXT_queue_family_foreign on panvk
+VK_EXT_sampler_filter_minmax on panvk
+VK_EXT_scalar_block_layout on panvk
+VK_EXT_tooling_info on panvk
+depthClamp on panvk
+depthBiasClamp on panvk
+sampleRateShading on panvk
+occlusionQueryPrecise on panvk
+shaderInt16 on panvk
+shaderInt64 on panvk
+imageCubeArray on panvk/v10+

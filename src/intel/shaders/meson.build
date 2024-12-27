@@ -1,19 +1,23 @@
 # Copyright © 2023 Intel Corporation
 # SPDX-License-Identifier: MIT
 
-intel_float64_spv_h = custom_target(
-  'float64_spv.h',
-  input : [glsl2spirv, float64_glsl_file],
-  output : 'float64_spv.h',
-  command : [
-    prog_python, '@INPUT@', '@OUTPUT@',
-    prog_glslang,
-    '--create-entry', 'main',
-    '--vn', 'float64_spv_source',
-    '--glsl-version', '450',
-    '-Olib',
-  ]
-)
+if with_intel_vk
+  intel_float64_spv_h = custom_target(
+    'float64_spv.h',
+    input : [glsl2spirv, float64_glsl_file],
+    output : 'float64_spv.h',
+    command : [
+      prog_python, '@INPUT@', '@OUTPUT@',
+      prog_glslang,
+      '--create-entry', 'main',
+      '--vn', 'float64_spv_source',
+      '--glsl-version', '450',
+      '-Olib',
+      glslang_depfile,
+    ],
+    depfile : 'float64_spv.h.d',
+  )
+endif
 
 intel_shader_files = files(
   'libintel_shaders.h',
@@ -22,6 +26,7 @@ intel_shader_files = files(
   'generate_draws_iris.cl',
   'memcpy.cl',
   'query_copy.cl',
+  'util.cl',
 )
 
 prepended_input_args = []
@@ -46,7 +51,8 @@ intel_shaders_gens = [ [ 80,   8],
                        [110,  11],
                        [120,  12],
                        [125, 125],
-                       [200,  20] ]
+                       [200,  20],
+                       [300,  30] ]
 intel_shaders = []
 foreach gen : intel_shaders_gens
   intel_shaders += custom_target(

@@ -21,6 +21,7 @@ use rusticl_proc_macros::cl_info_entrypoint;
 
 use std::alloc;
 use std::alloc::Layout;
+use std::cmp;
 use std::cmp::Ordering;
 use std::mem::{self, MaybeUninit};
 use std::os::raw::c_void;
@@ -212,11 +213,11 @@ fn validate_matching_buffer_flags(mem: &MemBase, flags: cl_mem_flags) -> CLResul
     Ok(())
 }
 
-#[cl_info_entrypoint(cl_get_mem_object_info)]
-impl CLInfo<cl_mem_info> for cl_mem {
-    fn query(&self, q: cl_mem_info, _: &[u8]) -> CLResult<Vec<MaybeUninit<u8>>> {
+#[cl_info_entrypoint(clGetMemObjectInfo)]
+unsafe impl CLInfo<cl_mem_info> for cl_mem {
+    fn query(&self, q: cl_mem_info, v: CLInfoValue) -> CLResult<CLInfoRes> {
         let mem = MemBase::ref_from_raw(*self)?;
-        Ok(match *q {
+        match *q {
             CL_MEM_ASSOCIATED_MEMOBJECT => {
                 let ptr = match mem.parent.as_ref() {
                     // Note we use as_ptr here which doesn't increase the reference count.
@@ -224,39 +225,39 @@ impl CLInfo<cl_mem_info> for cl_mem {
                     Some(Mem::Image(image)) => cl_mem::from_ptr(Arc::as_ptr(image)),
                     None => ptr::null_mut(),
                 };
-                cl_prop::<cl_mem>(ptr.cast())
+                v.write::<cl_mem>(ptr.cast())
             }
             CL_MEM_CONTEXT => {
                 // Note we use as_ptr here which doesn't increase the reference count.
                 let ptr = Arc::as_ptr(&mem.context);
-                cl_prop::<cl_context>(cl_context::from_ptr(ptr))
+                v.write::<cl_context>(cl_context::from_ptr(ptr))
             }
-            CL_MEM_FLAGS => cl_prop::<cl_mem_flags>(mem.flags),
+            CL_MEM_FLAGS => v.write::<cl_mem_flags>(mem.flags),
             // TODO debugging feature
-            CL_MEM_MAP_COUNT => cl_prop::<cl_uint>(0),
-            CL_MEM_HOST_PTR => cl_prop::<*mut c_void>(mem.host_ptr()),
-            CL_MEM_OFFSET => cl_prop::<usize>(if mem.is_buffer() {
+            CL_MEM_MAP_COUNT => v.write::<cl_uint>(0),
+            CL_MEM_HOST_PTR => v.write::<*mut c_void>(mem.host_ptr()),
+            CL_MEM_OFFSET => v.write::<usize>(if mem.is_buffer() {
                 Buffer::ref_from_raw(*self)?.offset
             } else {
                 0
             }),
-            CL_MEM_PROPERTIES => cl_prop::<&Vec<cl_mem_properties>>(&mem.props),
-            CL_MEM_REFERENCE_COUNT => cl_prop::<cl_uint>(if mem.is_buffer() {
+            CL_MEM_PROPERTIES => v.write::<&Properties<cl_mem_properties>>(&mem.props),
+            CL_MEM_REFERENCE_COUNT => v.write::<cl_uint>(if mem.is_buffer() {
                 Buffer::refcnt(*self)?
             } else {
                 Image::refcnt(*self)?
             }),
-            CL_MEM_SIZE => cl_prop::<usize>(mem.size),
-            CL_MEM_TYPE => cl_prop::<cl_mem_object_type>(mem.mem_type),
+            CL_MEM_SIZE => v.write::<usize>(mem.size),
+            CL_MEM_TYPE => v.write::<cl_mem_object_type>(mem.mem_type),
             CL_MEM_USES_SVM_POINTER | CL_MEM_USES_SVM_POINTER_ARM => {
-                cl_prop::<cl_bool>(mem.is_svm().into())
+                v.write::<cl_bool>(mem.is_svm().into())
             }
-            _ => return Err(CL_INVALID_VALUE),
-        })
+            _ => Err(CL_INVALID_VALUE),
+        }
     }
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreateBufferWithProperties)]
 fn create_buffer_with_properties(
     context: cl_context,
     properties: *const cl_mem_properties,
@@ -274,26 +275,41 @@ fn create_buffer_with_properties(
         return Err(CL_INVALID_BUFFER_SIZE);
     }
 
-    // ... or if size is greater than CL_DEVICE_MAX_MEM_ALLOC_SIZE for all devices in context.
+    // ... or if size is greater than CL_DEVICE_MAX_MEM_ALLOC_SIZE for all devices in context,
     if checked_compare(size, Ordering::Greater, c.max_mem_alloc()) {
         return Err(CL_INVALID_BUFFER_SIZE);
     }
 
     validate_host_ptr(host_ptr, flags)?;
 
-    let props = Properties::from_ptr_raw(properties);
+    // or if CL_MEM_USE_HOST_PTR is set in flags and host_ptr is a pointer returned by clSVMAlloc
+    // and size is greater than the size passed to clSVMAlloc.
+    if let Some((svm_ptr, svm_layout)) = c.find_svm_alloc(host_ptr as usize) {
+        // SAFETY: they are part of the same allocation, and because host_ptr >= svm_ptr we can cast
+        // to usize.
+        let diff = unsafe { host_ptr.byte_offset_from(svm_ptr) } as usize;
+
+        // technically we don't have to account for the offset, but it's almost for free.
+        if size > svm_layout - diff {
+            return Err(CL_INVALID_BUFFER_SIZE);
+        }
+    }
+
+    // CL_INVALID_PROPERTY [...] if the same property name is specified more than once.
+    let props = unsafe { Properties::new(properties) }.ok_or(CL_INVALID_PROPERTY)?;
+
     // CL_INVALID_PROPERTY if a property name in properties is not a supported property name, if
     // the value specified for a supported property name is not valid, or if the same property name
     // is specified more than once.
-    if props.len() > 1 {
-        // we don't support any properties besides the 0 property
+    if !props.is_empty() {
+        // we don't support any properties
         return Err(CL_INVALID_PROPERTY);
     }
 
     Ok(MemBase::new_buffer(c, flags, size, host_ptr, props)?.into_cl())
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreateBuffer)]
 fn create_buffer(
     context: cl_context,
     flags: cl_mem_flags,
@@ -303,7 +319,7 @@ fn create_buffer(
     create_buffer_with_properties(context, ptr::null(), flags, size, host_ptr)
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreateSubBuffer)]
 fn create_sub_buffer(
     buffer: cl_mem,
     mut flags: cl_mem_flags,
@@ -339,7 +355,7 @@ fn create_sub_buffer(
 
             // CL_INVALID_VALUE if the region specified by the cl_buffer_region structure passed in
             // buffer_create_info is out of bounds in buffer.
-            if region.origin + region.size > b.size {
+            if region.origin >= b.size || region.size > b.size - region.origin {
                 return Err(CL_INVALID_VALUE);
             }
 
@@ -355,7 +371,7 @@ fn create_sub_buffer(
     // CL_MISALIGNED_SUB_BUFFER_OFFSET if there are no devices in context associated with buffer for which the origin field of the cl_buffer_region structure passed in buffer_create_info is aligned to the CL_DEVICE_MEM_BASE_ADDR_ALIGN value.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clSetMemObjectDestructorCallback)]
 fn set_mem_object_destructor_callback(
     memobj: cl_mem,
     pfn_notify: Option<FuncMemCB>,
@@ -379,6 +395,12 @@ fn validate_image_format<'a>(
     let pixel_size = format
         .pixel_size()
         .ok_or(CL_INVALID_IMAGE_FORMAT_DESCRIPTOR)?;
+
+    // Depth images with an image channel order of CL_DEPTH_STENCIL can only be created using the
+    // clCreateFromGLTexture API
+    if format.image_channel_order == CL_DEPTH_STENCIL {
+        return Err(CL_INVALID_IMAGE_FORMAT_DESCRIPTOR);
+    }
 
     // special validation
     let valid_combination = match format.image_channel_data_type {
@@ -440,9 +462,9 @@ fn validate_image_desc(
     let max_size = if dims == 3 {
         devs.iter().map(|d| d.image_3d_size()).min()
     } else if desc.image_type == CL_MEM_OBJECT_IMAGE1D_BUFFER {
-        devs.iter().map(|d| d.image_buffer_size()).min()
+        devs.iter().map(|d| d.image_buffer_max_size_pixels()).min()
     } else {
-        devs.iter().map(|d| d.image_2d_size()).min()
+        devs.iter().map(|d| d.caps.image_2d_size as usize).min()
     }
     .unwrap();
     let max_array = devs.iter().map(|d| d.image_array_size()).min().unwrap();
@@ -512,7 +534,7 @@ fn validate_image_desc(
             desc.image_row_pitch = desc.image_width * elem_size;
         }
         if desc.image_slice_pitch == 0 {
-            desc.image_slice_pitch = desc.image_row_pitch * desc.image_height;
+            desc.image_slice_pitch = desc.image_row_pitch * cmp::max(1, desc.image_height);
         }
 
         if has_buf_parent && desc.image_type != CL_MEM_OBJECT_IMAGE1D_BUFFER {
@@ -533,8 +555,7 @@ fn validate_image_desc(
         }
 
         if dims == 3 || array {
-            let valid_slice_pitch =
-                desc.image_row_pitch * if dims == 1 { 1 } else { desc.image_height };
+            let valid_slice_pitch = desc.image_row_pitch * cmp::max(1, desc.image_height);
             if desc.image_slice_pitch == 0 {
                 desc.image_slice_pitch = valid_slice_pitch;
             } else if desc.image_slice_pitch < valid_slice_pitch
@@ -622,6 +643,25 @@ fn validate_buffer(
                         if desc.image_row_pitch * desc.image_height > mem.size {
                             return Err(err);
                         }
+
+                        // If the buffer object specified by mem_object was created with
+                        // CL_MEM_USE_HOST_PTR, the host_ptr specified to clCreateBuffer or
+                        // clCreateBufferWithProperties must be aligned to the maximum of the
+                        // CL_DEVICE_IMAGE_BASE_ADDRESS_ALIGNMENT value for all devices in the
+                        // context associated with the buffer specified by mem_object that support
+                        // images.
+                        if mem.flags & CL_MEM_USE_HOST_PTR as cl_mem_flags != 0 {
+                            for dev in &mem.context.devs {
+                                // CL_DEVICE_IMAGE_BASE_ADDRESS_ALIGNMENT is only relevant for 2D
+                                // images created from a buffer object.
+                                let addr_alignment = dev.image_base_address_alignment();
+                                if addr_alignment == 0 {
+                                    return Err(CL_INVALID_OPERATION);
+                                } else if !is_alligned(host_ptr, addr_alignment as usize) {
+                                    return Err(err);
+                                }
+                            }
+                        }
                     }
                     _ => return Err(err),
                 }
@@ -681,21 +721,6 @@ fn validate_buffer(
             _ => return Err(err),
         }
 
-        // If the buffer object specified by mem_object was created with CL_MEM_USE_HOST_PTR, the
-        // host_ptr specified to clCreateBuffer or clCreateBufferWithProperties must be aligned to
-        // the maximum of the CL_DEVICE_IMAGE_BASE_ADDRESS_ALIGNMENT value for all devices in the
-        // context associated with the buffer specified by mem_object that support images.
-        if mem.flags & CL_MEM_USE_HOST_PTR as cl_mem_flags != 0 {
-            for dev in &mem.context.devs {
-                let addr_alignment = dev.image_base_address_alignment();
-                if addr_alignment == 0 {
-                    return Err(CL_INVALID_OPERATION);
-                } else if !is_alligned(host_ptr, addr_alignment as usize) {
-                    return Err(err);
-                }
-            }
-        }
-
         validate_matching_buffer_flags(mem, flags)?;
 
         flags = inherit_mem_flags(flags, mem);
@@ -707,28 +732,32 @@ fn validate_buffer(
     Ok(flags)
 }
 
-#[cl_info_entrypoint(cl_get_image_info)]
-impl CLInfo<cl_image_info> for cl_mem {
-    fn query(&self, q: cl_image_info, _: &[u8]) -> CLResult<Vec<MaybeUninit<u8>>> {
+#[cl_info_entrypoint(clGetImageInfo)]
+unsafe impl CLInfo<cl_image_info> for cl_mem {
+    fn query(&self, q: cl_image_info, v: CLInfoValue) -> CLResult<CLInfoRes> {
         let mem = Image::ref_from_raw(*self)?;
-        Ok(match *q {
-            CL_IMAGE_ARRAY_SIZE => cl_prop::<usize>(mem.image_desc.image_array_size),
-            CL_IMAGE_BUFFER => cl_prop::<cl_mem>(unsafe { mem.image_desc.anon_1.buffer }),
-            CL_IMAGE_DEPTH => cl_prop::<usize>(mem.image_desc.image_depth),
-            CL_IMAGE_ELEMENT_SIZE => cl_prop::<usize>(mem.image_elem_size.into()),
-            CL_IMAGE_FORMAT => cl_prop::<cl_image_format>(mem.image_format),
-            CL_IMAGE_HEIGHT => cl_prop::<usize>(mem.image_desc.image_height),
-            CL_IMAGE_NUM_MIP_LEVELS => cl_prop::<cl_uint>(mem.image_desc.num_mip_levels),
-            CL_IMAGE_NUM_SAMPLES => cl_prop::<cl_uint>(mem.image_desc.num_samples),
-            CL_IMAGE_ROW_PITCH => cl_prop::<usize>(mem.image_desc.image_row_pitch),
-            CL_IMAGE_SLICE_PITCH => cl_prop::<usize>(mem.image_desc.image_slice_pitch),
-            CL_IMAGE_WIDTH => cl_prop::<usize>(mem.image_desc.image_width),
-            _ => return Err(CL_INVALID_VALUE),
-        })
+        match *q {
+            CL_IMAGE_ARRAY_SIZE => v.write::<usize>(mem.image_desc.image_array_size),
+            CL_IMAGE_BUFFER => v.write::<cl_mem>(unsafe { mem.image_desc.anon_1.buffer }),
+            CL_IMAGE_DEPTH => v.write::<usize>(mem.image_desc.image_depth),
+            CL_IMAGE_ELEMENT_SIZE => v.write::<usize>(mem.image_elem_size.into()),
+            CL_IMAGE_FORMAT => v.write::<cl_image_format>(mem.image_format),
+            CL_IMAGE_HEIGHT => v.write::<usize>(mem.image_desc.image_height),
+            CL_IMAGE_NUM_MIP_LEVELS => v.write::<cl_uint>(mem.image_desc.num_mip_levels),
+            CL_IMAGE_NUM_SAMPLES => v.write::<cl_uint>(mem.image_desc.num_samples),
+            CL_IMAGE_ROW_PITCH => v.write::<usize>(mem.image_desc.image_row_pitch),
+            CL_IMAGE_SLICE_PITCH => v.write::<usize>(if mem.image_desc.dims() == 1 {
+                0
+            } else {
+                mem.image_desc.image_slice_pitch
+            }),
+            CL_IMAGE_WIDTH => v.write::<usize>(mem.image_desc.image_width),
+            _ => Err(CL_INVALID_VALUE),
+        }
     }
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreateImageWithProperties)]
 fn create_image_with_properties(
     context: cl_context,
     properties: *const cl_mem_properties,
@@ -743,7 +772,7 @@ fn create_image_with_properties(
     // CL_DEVICE_IMAGE_SUPPORT specified in the Device Queries table is CL_FALSE).
     c.devs
         .iter()
-        .find(|d| d.image_supported())
+        .find(|d| d.caps.has_images)
         .ok_or(CL_INVALID_OPERATION)?;
 
     let (format, elem_size) = validate_image_format(image_format)?;
@@ -771,12 +800,14 @@ fn create_image_with_properties(
         .find(|f| *f & filtered_flags == filtered_flags)
         .ok_or(CL_IMAGE_FORMAT_NOT_SUPPORTED)?;
 
-    let props = Properties::from_ptr_raw(properties);
+    // CL_INVALID_PROPERTY [...] if the same property name is specified more than once.
+    let props = unsafe { Properties::new(properties) }.ok_or(CL_INVALID_PROPERTY)?;
+
     // CL_INVALID_PROPERTY if a property name in properties is not a supported property name, if
     // the value specified for a supported property name is not valid, or if the same property name
     // is specified more than once.
-    if props.len() > 1 {
-        // we don't support any properties besides the 0 property
+    if !props.is_empty() {
+        // we don't support any properties
         return Err(CL_INVALID_PROPERTY);
     }
 
@@ -794,7 +825,7 @@ fn create_image_with_properties(
     .into_cl())
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreateImage)]
 fn create_image(
     context: cl_context,
     flags: cl_mem_flags,
@@ -812,7 +843,7 @@ fn create_image(
     )
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreateImage2D)]
 fn create_image_2d(
     context: cl_context,
     flags: cl_mem_flags,
@@ -833,7 +864,7 @@ fn create_image_2d(
     create_image(context, flags, image_format, &image_desc, host_ptr)
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreateImage3D)]
 fn create_image_3d(
     context: cl_context,
     flags: cl_mem_flags,
@@ -858,7 +889,7 @@ fn create_image_3d(
     create_image(context, flags, image_format, &image_desc, host_ptr)
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clGetSupportedImageFormats)]
 fn get_supported_image_formats(
     context: cl_context,
     flags: cl_mem_flags,
@@ -903,26 +934,24 @@ fn get_supported_image_formats(
     Ok(())
 }
 
-#[cl_info_entrypoint(cl_get_sampler_info)]
-impl CLInfo<cl_sampler_info> for cl_sampler {
-    fn query(&self, q: cl_sampler_info, _: &[u8]) -> CLResult<Vec<MaybeUninit<u8>>> {
+#[cl_info_entrypoint(clGetSamplerInfo)]
+unsafe impl CLInfo<cl_sampler_info> for cl_sampler {
+    fn query(&self, q: cl_sampler_info, v: CLInfoValue) -> CLResult<CLInfoRes> {
         let sampler = Sampler::ref_from_raw(*self)?;
-        Ok(match q {
-            CL_SAMPLER_ADDRESSING_MODE => cl_prop::<cl_addressing_mode>(sampler.addressing_mode),
+        match q {
+            CL_SAMPLER_ADDRESSING_MODE => v.write::<cl_addressing_mode>(sampler.addressing_mode),
             CL_SAMPLER_CONTEXT => {
                 // Note we use as_ptr here which doesn't increase the reference count.
                 let ptr = Arc::as_ptr(&sampler.context);
-                cl_prop::<cl_context>(cl_context::from_ptr(ptr))
+                v.write::<cl_context>(cl_context::from_ptr(ptr))
             }
-            CL_SAMPLER_FILTER_MODE => cl_prop::<cl_filter_mode>(sampler.filter_mode),
-            CL_SAMPLER_NORMALIZED_COORDS => cl_prop::<bool>(sampler.normalized_coords),
-            CL_SAMPLER_REFERENCE_COUNT => cl_prop::<cl_uint>(Sampler::refcnt(*self)?),
-            CL_SAMPLER_PROPERTIES => {
-                cl_prop::<&Option<Properties<cl_sampler_properties>>>(&sampler.props)
-            }
+            CL_SAMPLER_FILTER_MODE => v.write::<cl_filter_mode>(sampler.filter_mode),
+            CL_SAMPLER_NORMALIZED_COORDS => v.write::<bool>(sampler.normalized_coords),
+            CL_SAMPLER_REFERENCE_COUNT => v.write::<cl_uint>(Sampler::refcnt(*self)?),
+            CL_SAMPLER_PROPERTIES => v.write::<&Properties<cl_sampler_properties>>(&sampler.props),
             // CL_INVALID_VALUE if param_name is not one of the supported values
-            _ => return Err(CL_INVALID_VALUE),
-        })
+            _ => Err(CL_INVALID_VALUE),
+        }
     }
 }
 
@@ -931,7 +960,7 @@ fn create_sampler_impl(
     normalized_coords: cl_bool,
     addressing_mode: cl_addressing_mode,
     filter_mode: cl_filter_mode,
-    props: Option<Properties<cl_sampler_properties>>,
+    props: Properties<cl_sampler_properties>,
 ) -> CLResult<cl_sampler> {
     let c = Context::arc_from_raw(context)?;
 
@@ -939,7 +968,7 @@ fn create_sampler_impl(
     // CL_DEVICE_IMAGE_SUPPORT specified in the Device Queries table is CL_FALSE).
     c.devs
         .iter()
-        .find(|d| d.image_supported())
+        .find(|d| d.caps.has_images)
         .ok_or(CL_INVALID_OPERATION)?;
 
     // CL_INVALID_VALUE if addressing_mode, filter_mode, normalized_coords or a combination of these
@@ -957,7 +986,7 @@ fn create_sampler_impl(
     Ok(sampler.into_cl())
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreateSampler)]
 fn create_sampler(
     context: cl_context,
     normalized_coords: cl_bool,
@@ -969,11 +998,11 @@ fn create_sampler(
         normalized_coords,
         addressing_mode,
         filter_mode,
-        None,
+        Properties::default(),
     )
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreateSamplerWithProperties)]
 fn create_sampler_with_properties(
     context: cl_context,
     sampler_properties: *const cl_sampler_properties,
@@ -983,23 +1012,19 @@ fn create_sampler_with_properties(
     let mut filter_mode = CL_FILTER_NEAREST;
 
     // CL_INVALID_VALUE if the same property name is specified more than once.
-    let sampler_properties = if sampler_properties.is_null() {
-        None
-    } else {
-        let sampler_properties =
-            Properties::from_ptr(sampler_properties).ok_or(CL_INVALID_VALUE)?;
-        for p in &sampler_properties.props {
-            match p.0 as u32 {
-                CL_SAMPLER_ADDRESSING_MODE => addressing_mode = p.1 as u32,
-                CL_SAMPLER_FILTER_MODE => filter_mode = p.1 as u32,
-                CL_SAMPLER_NORMALIZED_COORDS => normalized_coords = p.1 as u32,
-                // CL_INVALID_VALUE if the property name in sampler_properties is not a supported
-                // property name
-                _ => return Err(CL_INVALID_VALUE),
-            }
+    // SAFETY: sampler_properties is a 0 terminated array by spec.
+    let sampler_properties =
+        unsafe { Properties::new(sampler_properties) }.ok_or(CL_INVALID_VALUE)?;
+    for (&key, &val) in sampler_properties.iter() {
+        match key as u32 {
+            CL_SAMPLER_ADDRESSING_MODE => addressing_mode = val as u32,
+            CL_SAMPLER_FILTER_MODE => filter_mode = val as u32,
+            CL_SAMPLER_NORMALIZED_COORDS => normalized_coords = val as u32,
+            // CL_INVALID_VALUE if the property name in sampler_properties is not a supported
+            // property name
+            _ => return Err(CL_INVALID_VALUE),
         }
-        Some(sampler_properties)
-    };
+    }
 
     create_sampler_impl(
         context,
@@ -1010,17 +1035,17 @@ fn create_sampler_with_properties(
     )
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clRetainSampler)]
 fn retain_sampler(sampler: cl_sampler) -> CLResult<()> {
     Sampler::retain(sampler)
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clReleaseSampler)]
 fn release_sampler(sampler: cl_sampler) -> CLResult<()> {
     Sampler::release(sampler)
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueReadBuffer)]
 fn enqueue_read_buffer(
     command_queue: cl_command_queue,
     buffer: cl_mem,
@@ -1048,12 +1073,6 @@ fn enqueue_read_buffer(
         return Err(CL_INVALID_CONTEXT);
     }
 
-    // CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST if the read and write operations are blocking
-    // and the execution status of any of the events in event_wait_list is a negative integer value.
-    if block && evs.iter().any(|e| e.is_error()) {
-        return Err(CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST);
-    }
-
     // CL_INVALID_OPERATION if clEnqueueReadBuffer is called on buffer which has been created with
     // CL_MEM_HOST_WRITE_ONLY or CL_MEM_HOST_NO_ACCESS.
     if bit_check(b.flags, CL_MEM_HOST_WRITE_ONLY | CL_MEM_HOST_NO_ACCESS) {
@@ -1075,7 +1094,7 @@ fn enqueue_read_buffer(
     // CL_MISALIGNED_SUB_BUFFER_OFFSET if buffer is a sub-buffer object and offset specified when the sub-buffer object is created is not aligned to CL_DEVICE_MEM_BASE_ADDR_ALIGN value for device associated with queue.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueWriteBuffer)]
 fn enqueue_write_buffer(
     command_queue: cl_command_queue,
     buffer: cl_mem,
@@ -1103,12 +1122,6 @@ fn enqueue_write_buffer(
         return Err(CL_INVALID_CONTEXT);
     }
 
-    // CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST if the read and write operations are blocking
-    // and the execution status of any of the events in event_wait_list is a negative integer value.
-    if block && evs.iter().any(|e| e.is_error()) {
-        return Err(CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST);
-    }
-
     // CL_INVALID_OPERATION if clEnqueueWriteBuffer is called on buffer which has been created with
     // CL_MEM_HOST_READ_ONLY or CL_MEM_HOST_NO_ACCESS.
     if bit_check(b.flags, CL_MEM_HOST_READ_ONLY | CL_MEM_HOST_NO_ACCESS) {
@@ -1130,7 +1143,7 @@ fn enqueue_write_buffer(
     // CL_MISALIGNED_SUB_BUFFER_OFFSET if buffer is a sub-buffer object and offset specified when the sub-buffer object is created is not aligned to CL_DEVICE_MEM_BASE_ADDR_ALIGN value for device associated with queue.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueCopyBuffer)]
 fn enqueue_copy_buffer(
     command_queue: cl_command_queue,
     src_buffer: cl_mem,
@@ -1189,7 +1202,7 @@ fn enqueue_copy_buffer(
     //• CL_MEM_OBJECT_ALLOCATION_FAILURE if there is a failure to allocate memory for data store associated with src_buffer or dst_buffer.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueReadBufferRect)]
 fn enqueue_read_buffer_rect(
     command_queue: cl_command_queue,
     buffer: cl_mem,
@@ -1215,12 +1228,6 @@ fn enqueue_read_buffer_rect(
     // with CL_MEM_HOST_WRITE_ONLY or CL_MEM_HOST_NO_ACCESS.
     if bit_check(buf.flags, CL_MEM_HOST_WRITE_ONLY | CL_MEM_HOST_NO_ACCESS) {
         return Err(CL_INVALID_OPERATION);
-    }
-
-    // CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST if the read and write operations are blocking
-    // and the execution status of any of the events in event_wait_list is a negative integer value.
-    if block && evs.iter().any(|e| e.is_error()) {
-        return Err(CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST);
     }
 
     // CL_INVALID_VALUE if buffer_origin, host_origin, or region is NULL.
@@ -1314,7 +1321,7 @@ fn enqueue_read_buffer_rect(
     // CL_MISALIGNED_SUB_BUFFER_OFFSET if buffer is a sub-buffer object and offset specified when the sub-buffer object is created is not aligned to CL_DEVICE_MEM_BASE_ADDR_ALIGN value for device associated with queue.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueWriteBufferRect)]
 fn enqueue_write_buffer_rect(
     command_queue: cl_command_queue,
     buffer: cl_mem,
@@ -1340,12 +1347,6 @@ fn enqueue_write_buffer_rect(
     // with CL_MEM_HOST_READ_ONLY or CL_MEM_HOST_NO_ACCESS.
     if bit_check(buf.flags, CL_MEM_HOST_READ_ONLY | CL_MEM_HOST_NO_ACCESS) {
         return Err(CL_INVALID_OPERATION);
-    }
-
-    // CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST if the read and write operations are blocking
-    // and the execution status of any of the events in event_wait_list is a negative integer value.
-    if block && evs.iter().any(|e| e.is_error()) {
-        return Err(CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST);
     }
 
     // CL_INVALID_VALUE if buffer_origin, host_origin, or region is NULL.
@@ -1439,7 +1440,7 @@ fn enqueue_write_buffer_rect(
     // CL_MISALIGNED_SUB_BUFFER_OFFSET if buffer is a sub-buffer object and offset specified when the sub-buffer object is created is not aligned to CL_DEVICE_MEM_BASE_ADDR_ALIGN value for device associated with queue.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueCopyBufferRect)]
 fn enqueue_copy_buffer_rect(
     command_queue: cl_command_queue,
     src_buffer: cl_mem,
@@ -1578,7 +1579,7 @@ fn enqueue_copy_buffer_rect(
     // CL_MISALIGNED_SUB_BUFFER_OFFSET if src_buffer is a sub-buffer object and offset specified when the sub-buffer object is created is not aligned to CL_DEVICE_MEM_BASE_ADDR_ALIGN value for device associated with queue.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueFillBuffer)]
 fn enqueue_fill_buffer(
     command_queue: cl_command_queue,
     buffer: cl_mem,
@@ -1632,7 +1633,7 @@ fn enqueue_fill_buffer(
     //• CL_MEM_OBJECT_ALLOCATION_FAILURE if there is a failure to allocate memory for data store associated with buffer.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueMapBuffer)]
 fn enqueue_map_buffer(
     command_queue: cl_command_queue,
     buffer: cl_mem,
@@ -1653,14 +1654,8 @@ fn enqueue_map_buffer(
 
     // CL_INVALID_VALUE if region being mapped given by (offset, size) is out of bounds or if size
     // is 0
-    if offset + size > b.size || size == 0 {
+    if offset >= b.size || size > b.size - offset || size == 0 {
         return Err(CL_INVALID_VALUE);
-    }
-
-    // CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST if the map operation is blocking and the
-    // execution status of any of the events in event_wait_list is a negative integer value.
-    if block && evs.iter().any(|e| e.is_error()) {
-        return Err(CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST);
     }
 
     // CL_INVALID_CONTEXT if context associated with command_queue and buffer are not the same
@@ -1668,14 +1663,20 @@ fn enqueue_map_buffer(
         return Err(CL_INVALID_CONTEXT);
     }
 
-    let ptr = b.map(q.device, offset)?;
+    let ptr = b.map(size, offset, map_flags != CL_MAP_READ.into())?;
     create_and_queue(
         q,
         CL_COMMAND_MAP_BUFFER,
         evs,
         event,
         block,
-        Box::new(move |q, ctx| b.sync_shadow(q, ctx, ptr)),
+        Box::new(move |q, ctx| {
+            if map_flags != CL_MAP_WRITE_INVALIDATE_REGION.into() {
+                b.sync_map(q, ctx, ptr)
+            } else {
+                Ok(())
+            }
+        }),
     )?;
 
     Ok(ptr.as_ptr())
@@ -1686,7 +1687,7 @@ fn enqueue_map_buffer(
     // CL_INVALID_OPERATION if mapping would lead to overlapping regions being mapped for writing.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueReadImage)]
 fn enqueue_read_image(
     command_queue: cl_command_queue,
     image: cl_mem,
@@ -1714,6 +1715,11 @@ fn enqueue_read_image(
     // CL_INVALID_OPERATION if clEnqueueReadImage is called on image which has been created with
     // CL_MEM_HOST_WRITE_ONLY or CL_MEM_HOST_NO_ACCESS.
     if bit_check(i.flags, CL_MEM_HOST_WRITE_ONLY | CL_MEM_HOST_NO_ACCESS) {
+        return Err(CL_INVALID_OPERATION);
+    }
+
+    // Not supported with depth stencil or msaa images.
+    if i.image_format.image_channel_order == CL_DEPTH_STENCIL || i.image_desc.num_samples > 0 {
         return Err(CL_INVALID_OPERATION);
     }
 
@@ -1763,10 +1769,9 @@ fn enqueue_read_image(
     //• CL_INVALID_IMAGE_SIZE if image dimensions (image width, height, specified or compute row and/or slice pitch) for image are not supported by device associated with queue.
     //• CL_IMAGE_FORMAT_NOT_SUPPORTED if image format (image channel order and data type) for image are not supported by device associated with queue.
     //• CL_INVALID_OPERATION if the device associated with command_queue does not support images (i.e. CL_DEVICE_IMAGE_SUPPORT specified in the Device Queries table is CL_FALSE).
-    //• CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST if the read and write operations are blocking and the execution status of any of the events in event_wait_list is a negative integer value.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueWriteImage)]
 fn enqueue_write_image(
     command_queue: cl_command_queue,
     image: cl_mem,
@@ -1794,6 +1799,11 @@ fn enqueue_write_image(
     // CL_INVALID_OPERATION if clEnqueueWriteImage is called on image which has been created with
     // CL_MEM_HOST_READ_ONLY or CL_MEM_HOST_NO_ACCESS.
     if bit_check(i.flags, CL_MEM_HOST_READ_ONLY | CL_MEM_HOST_NO_ACCESS) {
+        return Err(CL_INVALID_OPERATION);
+    }
+
+    // Not supported with depth stencil or msaa images.
+    if i.image_format.image_channel_order == CL_DEPTH_STENCIL || i.image_desc.num_samples > 0 {
         return Err(CL_INVALID_OPERATION);
     }
 
@@ -1843,10 +1853,9 @@ fn enqueue_write_image(
     //• CL_INVALID_IMAGE_SIZE if image dimensions (image width, height, specified or compute row and/or slice pitch) for image are not supported by device associated with queue.
     //• CL_IMAGE_FORMAT_NOT_SUPPORTED if image format (image channel order and data type) for image are not supported by device associated with queue.
     //• CL_INVALID_OPERATION if the device associated with command_queue does not support images (i.e. CL_DEVICE_IMAGE_SUPPORT specified in the Device Queries table is CL_FALSE).
-    //• CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST if the read and write operations are blocking and the execution status of any of the events in event_wait_list is a negative integer value.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueCopyImage)]
 fn enqueue_copy_image(
     command_queue: cl_command_queue,
     src_image: cl_mem,
@@ -1871,6 +1880,15 @@ fn enqueue_copy_image(
     // CL_IMAGE_FORMAT_MISMATCH if src_image and dst_image do not use the same image format.
     if src_image.image_format != dst_image.image_format {
         return Err(CL_IMAGE_FORMAT_MISMATCH);
+    }
+
+    // Not supported with depth stencil or msaa images.
+    if src_image.image_format.image_channel_order == CL_DEPTH_STENCIL
+        || dst_image.image_format.image_channel_order == CL_DEPTH_STENCIL
+        || src_image.image_desc.num_samples > 0
+        || dst_image.image_desc.num_samples > 0
+    {
+        return Err(CL_INVALID_OPERATION);
     }
 
     // CL_INVALID_VALUE if src_origin, dst_origin, or region is NULL.
@@ -1907,7 +1925,7 @@ fn enqueue_copy_image(
     //• CL_MEM_COPY_OVERLAP if src_image and dst_image are the same image object and the source and destination regions overlap.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueFillImage)]
 fn enqueue_fill_image(
     command_queue: cl_command_queue,
     image: cl_mem,
@@ -1927,6 +1945,11 @@ fn enqueue_fill_image(
         return Err(CL_INVALID_CONTEXT);
     }
 
+    // Not supported with depth stencil or msaa images.
+    if i.image_format.image_channel_order == CL_DEPTH_STENCIL || i.image_desc.num_samples > 0 {
+        return Err(CL_INVALID_OPERATION);
+    }
+
     // CL_INVALID_VALUE if fill_color is NULL.
     // CL_INVALID_VALUE if origin or region is NULL.
     if fill_color.is_null() || origin.is_null() || region.is_null() {
@@ -1942,16 +1965,25 @@ fn enqueue_fill_image(
     // description for origin and region.
     validate_image_bounds(&i, origin, region)?;
 
-    // we have to copy memory and it's always a 4 component int value
-    // TODO but not for CL_DEPTH
-    let fill_color = unsafe { slice::from_raw_parts(fill_color.cast(), 4).to_vec() };
+    // The fill color is a single floating-point value if the channel order is CL_DEPTH. Otherwise,
+    // the fill color is a four component RGBA floating-point color value if the image channel data
+    // type is not an unnormalized signed or unsigned integer type, is a four component signed
+    // integer value if the image channel data type is an unnormalized signed integer type and is a
+    // four component unsigned integer value if the image channel data type is an unnormalized
+    // unsigned integer type.
+    let fill_color = if i.image_format.image_channel_order == CL_DEPTH {
+        [unsafe { fill_color.cast::<u32>().read() }, 0, 0, 0]
+    } else {
+        unsafe { fill_color.cast::<[u32; 4]>().read() }
+    };
+
     create_and_queue(
         q,
         CL_COMMAND_FILL_BUFFER,
         evs,
         event,
         false,
-        Box::new(move |q, ctx| i.fill(q, ctx, &fill_color, &origin, &region)),
+        Box::new(move |q, ctx| i.fill(q, ctx, fill_color, &origin, &region)),
     )
 
     //• CL_INVALID_IMAGE_SIZE if image dimensions (image width, height, specified or compute row and/or slice pitch) for image are not supported by device associated with queue.
@@ -1959,7 +1991,7 @@ fn enqueue_fill_image(
     //image are not supported by device associated with queue.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueCopyBufferToImage)]
 fn enqueue_copy_buffer_to_image(
     command_queue: cl_command_queue,
     src_buffer: cl_mem,
@@ -1980,6 +2012,11 @@ fn enqueue_copy_buffer_to_image(
     // are not the same
     if q.context != src.context || q.context != dst.context {
         return Err(CL_INVALID_CONTEXT);
+    }
+
+    // Not supported with depth stencil or msaa images.
+    if dst.image_format.image_channel_order == CL_DEPTH_STENCIL || dst.image_desc.num_samples > 0 {
+        return Err(CL_INVALID_OPERATION);
     }
 
     // CL_INVALID_VALUE if dst_origin or region is NULL.
@@ -2014,7 +2051,7 @@ fn enqueue_copy_buffer_to_image(
     //• CL_INVALID_OPERATION if the device associated with command_queue does not support images (i.e. CL_DEVICE_IMAGE_SUPPORT specified in the Device Queries table is CL_FALSE).
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueCopyImageToBuffer)]
 fn enqueue_copy_image_to_buffer(
     command_queue: cl_command_queue,
     src_image: cl_mem,
@@ -2035,6 +2072,11 @@ fn enqueue_copy_image_to_buffer(
     // are not the same
     if q.context != src.context || q.context != dst.context {
         return Err(CL_INVALID_CONTEXT);
+    }
+
+    // Not supported with depth stencil or msaa images.
+    if src.image_format.image_channel_order == CL_DEPTH_STENCIL || src.image_desc.num_samples > 0 {
+        return Err(CL_INVALID_OPERATION);
     }
 
     // CL_INVALID_VALUE if src_origin or region is NULL.
@@ -2070,7 +2112,7 @@ fn enqueue_copy_image_to_buffer(
     //• CL_INVALID_OPERATION if the device associated with command_queue does not support images (i.e. CL_DEVICE_IMAGE_SUPPORT specified in the Device Queries table is CL_FALSE).
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueMapImage)]
 fn enqueue_map_image(
     command_queue: cl_command_queue,
     image: cl_mem,
@@ -2095,6 +2137,11 @@ fn enqueue_map_image(
     // CL_INVALID_CONTEXT if context associated with command_queue and image are not the same
     if i.context != q.context {
         return Err(CL_INVALID_CONTEXT);
+    }
+
+    // Not supported with depth stencil or msaa images.
+    if i.image_format.image_channel_order == CL_DEPTH_STENCIL || i.image_desc.num_samples > 0 {
+        return Err(CL_INVALID_OPERATION);
     }
 
     // CL_INVALID_VALUE if origin or region is NULL.
@@ -2124,34 +2171,38 @@ fn enqueue_map_image(
     };
 
     let ptr = i.map(
-        q.device,
-        &origin,
+        origin,
+        region,
         unsafe { image_row_pitch.as_mut().unwrap() },
         image_slice_pitch,
+        map_flags != CL_MAP_READ.into(),
     )?;
 
-    // SAFETY: it's required that applications do not cause data races
-    let sync_ptr = unsafe { MutMemoryPtr::from_ptr(ptr) };
     create_and_queue(
         q,
         CL_COMMAND_MAP_IMAGE,
         evs,
         event,
         block,
-        Box::new(move |q, ctx| i.sync_shadow(q, ctx, sync_ptr)),
+        Box::new(move |q, ctx| {
+            if map_flags != CL_MAP_WRITE_INVALIDATE_REGION.into() {
+                i.sync_map(q, ctx, ptr)
+            } else {
+                Ok(())
+            }
+        }),
     )?;
 
-    Ok(ptr)
+    Ok(ptr.as_ptr())
 
     //• CL_INVALID_IMAGE_SIZE if image dimensions (image width, height, specified or compute row and/or slice pitch) for image are not supported by device associated with queue.
     //• CL_IMAGE_FORMAT_NOT_SUPPORTED if image format (image channel order and data type) for image are not supported by device associated with queue.
     //• CL_MAP_FAILURE if there is a failure to map the requested region into the host address space. This error cannot occur for image objects created with CL_MEM_USE_HOST_PTR or CL_MEM_ALLOC_HOST_PTR.
-    //• CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST if the map operation is blocking and the execution status of any of the events in event_wait_list is a negative integer value.
     //• CL_INVALID_OPERATION if the device associated with command_queue does not support images (i.e. CL_DEVICE_IMAGE_SUPPORT specified in the Device Queries table is CL_FALSE).
     //• CL_INVALID_OPERATION if mapping would lead to overlapping regions being mapped for writing.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clRetainMemObject)]
 fn retain_mem_object(mem: cl_mem) -> CLResult<()> {
     let m = MemBase::ref_from_raw(mem)?;
     match m.base.get_type()? {
@@ -2161,7 +2212,7 @@ fn retain_mem_object(mem: cl_mem) -> CLResult<()> {
     }
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clReleaseMemObject)]
 fn release_mem_object(mem: cl_mem) -> CLResult<()> {
     let m = MemBase::ref_from_raw(mem)?;
     match m.base.get_type()? {
@@ -2171,7 +2222,7 @@ fn release_mem_object(mem: cl_mem) -> CLResult<()> {
     }
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueUnmapMemObject)]
 fn enqueue_unmap_mem_object(
     command_queue: cl_command_queue,
     memobj: cl_mem,
@@ -2197,17 +2248,24 @@ fn enqueue_unmap_mem_object(
 
     // SAFETY: it's required that applications do not cause data races
     let mapped_ptr = unsafe { MutMemoryPtr::from_ptr(mapped_ptr) };
+    let needs_sync = m.unmap(mapped_ptr)?;
     create_and_queue(
         q,
         CL_COMMAND_UNMAP_MEM_OBJECT,
         evs,
         event,
         false,
-        Box::new(move |q, ctx| m.unmap(q, ctx, mapped_ptr)),
+        Box::new(move |q, ctx| {
+            if needs_sync {
+                m.sync_unmap(q, ctx, mapped_ptr)
+            } else {
+                Ok(())
+            }
+        }),
     )
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueMigrateMemObjects)]
 fn enqueue_migrate_mem_objects(
     command_queue: cl_command_queue,
     num_mem_objects: cl_uint,
@@ -2255,9 +2313,9 @@ fn enqueue_migrate_mem_objects(
     //• CL_MEM_OBJECT_ALLOCATION_FAILURE if there is a failure to allocate memory for the specified set of memory objects in mem_objects.
 }
 
-#[cl_info_entrypoint(cl_get_pipe_info)]
-impl CLInfo<cl_pipe_info> for cl_mem {
-    fn query(&self, _q: cl_pipe_info, _: &[u8]) -> CLResult<Vec<MaybeUninit<u8>>> {
+#[cl_info_entrypoint(clGetPipeInfo)]
+unsafe impl CLInfo<cl_pipe_info> for cl_mem {
+    fn query(&self, _q: cl_pipe_info, _v: CLInfoValue) -> CLResult<CLInfoRes> {
         // CL_INVALID_MEM_OBJECT if pipe is a not a valid pipe object.
         Err(CL_INVALID_MEM_OBJECT)
     }
@@ -2394,7 +2452,7 @@ fn enqueue_svm_free_impl(
     )
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueSVMFree)]
 fn enqueue_svm_free(
     command_queue: cl_command_queue,
     num_svm_pointers: cl_uint,
@@ -2418,7 +2476,7 @@ fn enqueue_svm_free(
     )
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueSVMFreeARM)]
 fn enqueue_svm_free_arm(
     command_queue: cl_command_queue,
     num_svm_pointers: cl_uint,
@@ -2502,7 +2560,7 @@ fn enqueue_svm_memcpy_impl(
     )
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueSVMMemcpy)]
 fn enqueue_svm_memcpy(
     command_queue: cl_command_queue,
     blocking_copy: cl_bool,
@@ -2526,7 +2584,7 @@ fn enqueue_svm_memcpy(
     )
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueSVMMemcpyARM)]
 fn enqueue_svm_memcpy_arm(
     command_queue: cl_command_queue,
     blocking_copy: cl_bool,
@@ -2682,7 +2740,7 @@ fn enqueue_svm_mem_fill_impl(
     create_and_queue(q, cmd_type, evs, event, false, work)
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueSVMMemFill)]
 fn enqueue_svm_mem_fill(
     command_queue: cl_command_queue,
     svm_ptr: *mut ::std::os::raw::c_void,
@@ -2706,7 +2764,7 @@ fn enqueue_svm_mem_fill(
     )
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueSVMMemFillARM)]
 fn enqueue_svm_mem_fill_arm(
     command_queue: cl_command_queue,
     svm_ptr: *mut ::std::os::raw::c_void,
@@ -2766,7 +2824,7 @@ fn enqueue_svm_map_impl(
     create_and_queue(q, cmd_type, evs, event, block, Box::new(|_, _| Ok(())))
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueSVMMap)]
 fn enqueue_svm_map(
     command_queue: cl_command_queue,
     blocking_map: cl_bool,
@@ -2790,7 +2848,7 @@ fn enqueue_svm_map(
     )
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueSVMMapARM)]
 fn enqueue_svm_map_arm(
     command_queue: cl_command_queue,
     blocking_map: cl_bool,
@@ -2838,7 +2896,7 @@ fn enqueue_svm_unmap_impl(
     create_and_queue(q, cmd_type, evs, event, false, Box::new(|_, _| Ok(())))
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueSVMUnmap)]
 fn enqueue_svm_unmap(
     command_queue: cl_command_queue,
     svm_ptr: *mut ::std::os::raw::c_void,
@@ -2856,7 +2914,7 @@ fn enqueue_svm_unmap(
     )
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueSVMUnmapARM)]
 fn enqueue_svm_unmap_arm(
     command_queue: cl_command_queue,
     svm_ptr: *mut ::std::os::raw::c_void,
@@ -2874,7 +2932,7 @@ fn enqueue_svm_unmap_arm(
     )
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueSVMMigrateMem)]
 fn enqueue_svm_migrate_mem(
     command_queue: cl_command_queue,
     num_svm_pointers: cl_uint,
@@ -2912,16 +2970,16 @@ fn enqueue_svm_migrate_mem(
     // CL_INVALID_VALUE if sizes[i] is non-zero range [svm_pointers[i], svm_pointers[i]+sizes[i]) is
     // not contained within an existing clSVMAlloc allocation.
     for (ptr, size) in svm_pointers.iter_mut().zip(&mut sizes) {
-        if let Some((alloc, layout)) = q.context.find_svm_alloc(*ptr) {
+        if let Some((alloc, alloc_size)) = q.context.find_svm_alloc(*ptr) {
             let ptr_addr = *ptr;
             let alloc_addr = alloc as usize;
 
             // if the offset + size is bigger than the allocation we are out of bounds
-            if (ptr_addr - alloc_addr) + *size <= layout.size() {
+            if (ptr_addr - alloc_addr) + *size <= alloc_size {
                 // if the size is 0, the entire allocation should be migrated
                 if *size == 0 {
                     *ptr = alloc as usize;
-                    *size = layout.size();
+                    *size = alloc_size;
                 }
                 continue;
             }
@@ -2946,7 +3004,7 @@ fn enqueue_svm_migrate_mem(
     )
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreatePipe)]
 fn create_pipe(
     _context: cl_context,
     _flags: cl_mem_flags,
@@ -2957,20 +3015,20 @@ fn create_pipe(
     Err(CL_INVALID_OPERATION)
 }
 
-#[cl_info_entrypoint(cl_get_gl_texture_info)]
-impl CLInfo<cl_gl_texture_info> for cl_mem {
-    fn query(&self, q: cl_gl_texture_info, _: &[u8]) -> CLResult<Vec<MaybeUninit<u8>>> {
+#[cl_info_entrypoint(clGetGLTextureInfo)]
+unsafe impl CLInfo<cl_gl_texture_info> for cl_mem {
+    fn query(&self, q: cl_gl_texture_info, v: CLInfoValue) -> CLResult<CLInfoRes> {
         let mem = MemBase::ref_from_raw(*self)?;
-        Ok(match *q {
-            CL_GL_MIPMAP_LEVEL => cl_prop::<cl_GLint>(0),
-            CL_GL_TEXTURE_TARGET => cl_prop::<cl_GLenum>(
+        match *q {
+            CL_GL_MIPMAP_LEVEL => v.write::<cl_GLint>(0),
+            CL_GL_TEXTURE_TARGET => v.write::<cl_GLenum>(
                 mem.gl_obj
                     .as_ref()
                     .ok_or(CL_INVALID_GL_OBJECT)?
                     .gl_object_target,
             ),
-            _ => return Err(CL_INVALID_VALUE),
-        })
+            _ => Err(CL_INVALID_VALUE),
+        }
     }
 }
 
@@ -3010,7 +3068,7 @@ fn create_from_gl(
     }
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreateFromGLTexture)]
 fn create_from_gl_texture(
     context: cl_context,
     flags: cl_mem_flags,
@@ -3027,7 +3085,7 @@ fn create_from_gl_texture(
     create_from_gl(context, flags, target, miplevel, texture)
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreateFromGLTexture2D)]
 fn create_from_gl_texture_2d(
     context: cl_context,
     flags: cl_mem_flags,
@@ -3044,7 +3102,7 @@ fn create_from_gl_texture_2d(
     create_from_gl(context, flags, target, miplevel, texture)
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreateFromGLTexture3D)]
 fn create_from_gl_texture_3d(
     context: cl_context,
     flags: cl_mem_flags,
@@ -3061,7 +3119,7 @@ fn create_from_gl_texture_3d(
     create_from_gl(context, flags, target, miplevel, texture)
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreateFromGLBuffer)]
 fn create_from_gl_buffer(
     context: cl_context,
     flags: cl_mem_flags,
@@ -3070,7 +3128,7 @@ fn create_from_gl_buffer(
     create_from_gl(context, flags, GL_ARRAY_BUFFER, 0, bufobj)
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreateFromGLRenderbuffer)]
 fn create_from_gl_renderbuffer(
     context: cl_context,
     flags: cl_mem_flags,
@@ -3079,7 +3137,7 @@ fn create_from_gl_renderbuffer(
     create_from_gl(context, flags, GL_RENDERBUFFER, 0, renderbuffer)
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clGetGLObjectInfo)]
 fn get_gl_object_info(
     memobj: cl_mem,
     gl_object_type: *mut cl_gl_object_type,
@@ -3101,7 +3159,7 @@ fn get_gl_object_info(
     Ok(())
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueAcquireGLObjects)]
 fn enqueue_acquire_gl_objects(
     command_queue: cl_command_queue,
     num_objects: cl_uint,
@@ -3135,7 +3193,7 @@ fn enqueue_acquire_gl_objects(
     )
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueReleaseGLObjects)]
 fn enqueue_release_gl_objects(
     command_queue: cl_command_queue,
     num_objects: cl_uint,

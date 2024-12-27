@@ -5,7 +5,7 @@
 #
 # SPDX-License-Identifier: MIT
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from lava.exceptions import MesaCIKnownIssueException, MesaCITimeoutError
@@ -16,7 +16,13 @@ from lava.utils import (
     fix_lava_gitlab_section_log,
     hide_sensitive_data,
 )
-from lava.utils.constants import KNOWN_ISSUE_R8152_MAX_CONSECUTIVE_COUNTER
+from lava.utils.constants import (
+    KNOWN_ISSUE_R8152_MAX_CONSECUTIVE_COUNTER,
+    A6XX_GPU_RECOVERY_WATCH_PERIOD_MIN,
+    A6XX_GPU_RECOVERY_FAILURE_MESSAGE,
+    A6XX_GPU_RECOVERY_FAILURE_MAX_COUNT,
+)
+from lava.utils.lava_log_hints import LAVALogHints
 
 from ..lava.helpers import (
     create_lava_yaml_msg,
@@ -70,35 +76,35 @@ def test_gitlab_section(method, collapsed, expectation):
 def test_gl_sections():
     lines = [
         {
-            "dt": datetime.now(),
+            "dt": datetime.now(tz=UTC),
             "lvl": "debug",
             "msg": "Received signal: <STARTRUN> 0_setup-ssh-server 10145749_1.3.2.3.1",
         },
         {
-            "dt": datetime.now(),
+            "dt": datetime.now(tz=UTC),
             "lvl": "debug",
             "msg": "Received signal: <STARTRUN> 0_mesa 5971831_1.3.2.3.1",
         },
         # Redundant log message which triggers the same Gitlab Section, it
         # should be ignored, unless the id is different
         {
-            "dt": datetime.now(),
+            "dt": datetime.now(tz=UTC),
             "lvl": "target",
             "msg": "[    7.778836] <LAVA_SIGNAL_STARTRUN 0_mesa 5971831_1.3.2.3.1>",
         },
         {
-            "dt": datetime.now(),
+            "dt": datetime.now(tz=UTC),
             "lvl": "debug",
             "msg": "Received signal: <STARTTC> mesa-ci_iris-kbl-traces",
         },
         # Another redundant log message
         {
-            "dt": datetime.now(),
+            "dt": datetime.now(tz=UTC),
             "lvl": "target",
             "msg": "[   16.997829] <LAVA_SIGNAL_STARTTC mesa-ci_iris-kbl-traces>",
         },
         {
-            "dt": datetime.now(),
+            "dt": datetime.now(tz=UTC),
             "lvl": "target",
             "msg": "<LAVA_SIGNAL_ENDTC mesa-ci_iris-kbl-traces>",
         },
@@ -134,12 +140,12 @@ def test_gl_sections():
 def test_log_follower_flush():
     lines = [
         {
-            "dt": datetime.now(),
+            "dt": datetime.now(tz=UTC),
             "lvl": "debug",
             "msg": "Received signal: <STARTTC> mesa-ci_iris-kbl-traces",
         },
         {
-            "dt": datetime.now(),
+            "dt": datetime.now(tz=UTC),
             "lvl": "target",
             "msg": "<LAVA_SIGNAL_ENDTC mesa-ci_iris-kbl-traces>",
         },
@@ -286,7 +292,7 @@ WATCHDOG_SCENARIOS = {
 def test_log_follower_watchdog(frozen_time, timedelta_kwargs, exception):
     lines = [
         {
-            "dt": datetime.now(),
+            "dt": datetime.now(tz=UTC),
             "lvl": "debug",
             "msg": "Received signal: <STARTTC> mesa-ci_iris-kbl-traces",
         },
@@ -381,8 +387,8 @@ A618_NETWORK_ISSUE_SCENARIOS = {
 )
 def test_detect_failure(messages, expectation):
     boot_section = GitlabSection(
-        id="lava_boot",
-        header="LAVA boot",
+        id="dut_boot",
+        header="Booting hardware device",
         type=LogSectionType.LAVA_BOOT,
         start_collapsed=True,
     )
@@ -390,3 +396,44 @@ def test_detect_failure(messages, expectation):
     lf = LogFollower(starting_section=boot_section)
     with expectation:
         lf.feed(messages)
+
+def test_detect_a6xx_gpu_recovery_failure(frozen_time):
+    log_follower = LogFollower()
+    lava_log_hints = LAVALogHints(log_follower=log_follower)
+    failure_message = {
+        "dt": datetime.now(tz=UTC).isoformat(),
+        "msg": A6XX_GPU_RECOVERY_FAILURE_MESSAGE[0],
+        "lvl": "feedback",
+    }
+    with pytest.raises(MesaCIKnownIssueException):
+        for _ in range(A6XX_GPU_RECOVERY_FAILURE_MAX_COUNT):
+            lava_log_hints.detect_a6xx_gpu_recovery_failure(failure_message)
+            # Simulate the passage of time within the watch period
+            frozen_time.tick(1)
+            failure_message["dt"] = datetime.now(tz=UTC).isoformat()
+
+def test_detect_a6xx_gpu_recovery_success(frozen_time):
+    log_follower = LogFollower()
+    lava_log_hints = LAVALogHints(log_follower=log_follower)
+    failure_message = {
+        "dt": datetime.now(tz=UTC).isoformat(),
+        "msg": A6XX_GPU_RECOVERY_FAILURE_MESSAGE[0],
+        "lvl": "feedback",
+    }
+    # Simulate sending a tolerable number of failure messages
+    for _ in range(A6XX_GPU_RECOVERY_FAILURE_MAX_COUNT - 1):
+        lava_log_hints.detect_a6xx_gpu_recovery_failure(failure_message)
+        frozen_time.tick(1)
+        failure_message["dt"] = datetime.now(tz=UTC).isoformat()
+
+    # Simulate the passage of time outside of the watch period
+    frozen_time.tick(60 * A6XX_GPU_RECOVERY_WATCH_PERIOD_MIN + 1)
+    failure_message = {
+        "dt": datetime.now(tz=UTC).isoformat(),
+        "msg": A6XX_GPU_RECOVERY_FAILURE_MESSAGE[1],
+        "lvl": "feedback",
+    }
+    with does_not_raise():
+        lava_log_hints.detect_a6xx_gpu_recovery_failure(failure_message)
+    assert lava_log_hints.a6xx_gpu_first_fail_time is None, "a6xx_gpu_first_fail_time is not None"
+    assert lava_log_hints.a6xx_gpu_recovery_fail_counter == 0, "a6xx_gpu_recovery_fail_counter is not 0"

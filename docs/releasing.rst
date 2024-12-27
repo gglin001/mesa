@@ -262,7 +262,6 @@ Here is one solution:
    __es2gears_cmd='es2gears_x11 2>&1 | grep -v "configuration file"'
    test "x$LD_LIBRARY_PATH" != 'x' && __old_ld="$LD_LIBRARY_PATH"
    export LD_LIBRARY_PATH=`pwd`/test/usr/local/lib/:"${__old_ld}"
-   export LIBGL_DRIVERS_PATH=`pwd`/test/usr/local/lib/dri/
    export LIBGL_DEBUG=verbose
    eval $__glxinfo_cmd
    eval $__glxgears_cmd
@@ -282,13 +281,12 @@ Here is one solution:
    # Smoke test DOTA2
    unset LD_LIBRARY_PATH
    test "x$__old_ld" != 'x' && export LD_LIBRARY_PATH="$__old_ld" && unset __old_ld
-   unset LIBGL_DRIVERS_PATH
    unset LIBGL_DEBUG
    unset LIBGL_ALWAYS_SOFTWARE
    unset GALLIUM_DRIVER
-   export VK_ICD_FILENAMES=`pwd`/test/usr/local/share/vulkan/icd.d/intel_icd.x86_64.json
+   export VK_DRIVER_FILES=`pwd`/test/usr/local/share/vulkan/icd.d/intel_icd.x86_64.json
    steam steam://rungameid/570  -vconsole -vulkan
-   unset VK_ICD_FILENAMES
+   unset VK_DRIVER_FILES
 
 Create release notes for the new release
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

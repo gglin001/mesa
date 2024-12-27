@@ -1,27 +1,7 @@
 /* -*- mesa-c++  -*-
- *
- * Copyright (c) 2022 Collabora LTD
- *
+ * Copyright 2022 Collabora LTD
  * Author: Gert Wollny <gert.wollny@collabora.com>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * on the rights to use, copy, modify, merge, publish, distribute, sub
- * license, and/or sell copies of the Software, and to permit persons to whom
- * the Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHOR(S) AND/OR THEIR SUPPLIERS BE LIABLE FOR ANY CLAIM,
- * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
- * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
- * USE OR OTHER DEALINGS IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "sfn_shader.h"
@@ -39,6 +19,7 @@
 #include "sfn_instr_fetch.h"
 #include "sfn_instr_lds.h"
 #include "sfn_instr_mem.h"
+#include "sfn_instr_tex.h"
 #include "sfn_liverangeevaluator.h"
 #include "sfn_shader_cs.h"
 #include "sfn_shader_fs.h"
@@ -849,6 +830,46 @@ Shader::process_instr(nir_instr *instr)
 }
 
 bool
+Shader::emit_tex_fdd(const nir_intrinsic_instr* intr, int opcode, bool fine)
+{
+   auto& value_factory_ = value_factory();
+
+   int ncomp = intr->def.num_components;
+   RegisterVec4::Swizzle src_swz = {7, 7, 7, 7};
+   RegisterVec4::Swizzle tmp_swz = {7, 7, 7, 7};
+   for (auto i = 0; i < ncomp; ++i) {
+      src_swz[i] = i;
+      tmp_swz[i] = i;
+   }
+
+   auto src = value_factory_.src_vec4(intr->src[0], pin_none, src_swz);
+
+   auto tmp = value_factory_.temp_vec4(pin_group, tmp_swz);
+   AluInstr *mv = nullptr;
+   for (int i = 0; i < ncomp; ++i) {
+      mv = new AluInstr(op1_mov, tmp[i], src[i], AluInstr::write);
+      emit_instruction(mv);
+   }
+   if (mv)
+      mv->set_alu_flag(alu_last_instr);
+
+   auto dst = value_factory_.dest_vec4(intr->def, pin_group);
+   RegisterVec4::Swizzle dst_swz = {7, 7, 7, 7};
+   for (auto i = 0; i < ncomp; ++i) {
+      dst_swz[i] = i;
+   }
+
+   auto tex = new TexInstr((TexInstr::Opcode)opcode, dst, dst_swz, tmp, R600_MAX_CONST_BUFFERS, nullptr);
+
+   if (fine)
+      tex->set_tex_flag(TexInstr::grad_fine);
+
+   emit_instruction(tex);
+
+   return true;
+}
+
+bool
 Shader::process_intrinsic(nir_intrinsic_instr *intr)
 {
    if (process_stage_intrinsic(intr))
@@ -891,6 +912,16 @@ Shader::process_intrinsic(nir_intrinsic_instr *intr)
       return emit_atomic_local_shared(intr);
    case nir_intrinsic_shader_clock:
       return emit_shader_clock(intr);
+   case nir_intrinsic_ddx:
+   case nir_intrinsic_ddx_coarse:
+      return emit_tex_fdd(intr, TexInstr::get_gradient_h, false);
+   case nir_intrinsic_ddx_fine:
+      return emit_tex_fdd(intr, TexInstr::get_gradient_h, true);
+   case nir_intrinsic_ddy:
+   case nir_intrinsic_ddy_coarse:
+      return emit_tex_fdd(intr, TexInstr::get_gradient_v, false);
+   case nir_intrinsic_ddy_fine:
+      return emit_tex_fdd(intr, TexInstr::get_gradient_v, true);
    case nir_intrinsic_load_reg:
       return emit_load_reg(intr);
    case nir_intrinsic_load_reg_indirect:
@@ -938,13 +969,14 @@ lds_op_from_intrinsic(nir_atomic_op op, bool ret)
 }
 
 PRegister
-Shader::emit_load_to_register(PVirtualValue src)
+Shader::emit_load_to_register(PVirtualValue src, int chan)
 {
    assert(src);
    PRegister dest = src->as_register();
 
-   if (!dest) {
-      dest = value_factory().temp_register();
+   if (!dest || chan >= 0) {
+      dest = value_factory().temp_register(chan);
+      dest->set_pin(pin_free);
       emit_instruction(new AluInstr(op1_mov, dest, src, AluInstr::last_write));
    }
    return dest;
@@ -1364,6 +1396,22 @@ void Shader::InstructionChain::visit(AluInstr *instr)
          }
       }
    }
+
+   if (instr->has_lds_access()) {
+      last_lds_access = instr;
+      if (last_group_barrier)
+         instr->add_required_instr(last_group_barrier);
+   }
+
+   if (!instr->has_alu_flag(alu_is_lds) &&
+       instr->opcode() == op0_group_barrier) {
+      last_group_barrier = instr;
+      if (last_lds_access)
+         instr->add_required_instr(last_group_barrier);
+      if (last_ssbo_instr)
+         instr->add_required_instr(last_ssbo_instr);
+   }
+
 }
 
 void
@@ -1402,6 +1450,9 @@ Shader::InstructionChain::visit(RatInstr *instr)
 
    if (last_kill_instr)
       instr->add_required_instr(last_kill_instr);
+
+   if (last_group_barrier)
+      instr->add_required_instr(last_group_barrier);
 }
 
 void
@@ -1464,13 +1515,9 @@ Shader::emit_group_barrier(nir_intrinsic_instr *intr)
 {
    assert(m_control_flow_depth == 0);
    (void)intr;
-   /* Put barrier into it's own block, so that optimizers and the
-    * scheduler don't move code */
-   start_new_block(0);
    auto op = new AluInstr(op0_group_barrier, 0);
    op->set_alu_flag(alu_last_instr);
    emit_instruction(op);
-   start_new_block(0);
    return true;
 }
 

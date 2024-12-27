@@ -73,6 +73,7 @@
 #define RDECODE_CMD_BITSTREAM_BUFFER                        0x00000100
 #define RDECODE_CMD_IT_SCALING_TABLE_BUFFER                 0x00000204
 #define RDECODE_CMD_CONTEXT_BUFFER                          0x00000206
+#define RDECODE_CMD_WRITE_MEMORY                            0x00000800
 
 #define RDECODE_MSG_CREATE                                  0x00000000
 #define RDECODE_MSG_DECODE                                  0x00000001
@@ -112,6 +113,7 @@
 #define RDECODE_VC1_PROFILE_ADVANCED                        0x00000002
 
 #define RDECODE_SW_MODE_LINEAR                              0x00000000
+/* for legacy VCN generations */
 #define RDECODE_256B_S                                      0x00000001
 #define RDECODE_256B_D                                      0x00000002
 #define RDECODE_4KB_S                                       0x00000005
@@ -122,6 +124,13 @@
 #define RDECODE_4KB_D_X                                     0x00000016
 #define RDECODE_64KB_S_X                                    0x00000019
 #define RDECODE_64KB_D_X                                    0x0000001A
+/* for VCN5 */
+#define RDECODE_VCN5_256B_D                                 0x00000001
+
+#define RDECODE_TILE_LINEAR                                 0x00000000
+#define RDECODE_TILE_8X4                                    0x00000001
+#define RDECODE_TILE_8X8                                    0x00000002
+#define RDECODE_TILE_32AS8                                  0x00000003
 
 #define RDECODE_MESSAGE_NOT_SUPPORTED                       0x00000000
 #define RDECODE_MESSAGE_CREATE                              0x00000001
@@ -855,6 +864,7 @@ typedef struct rvcn_dec_message_hevc_s {
 
    unsigned char direct_reflist[2][15];
    unsigned int st_rps_bits;
+   unsigned char reserved_1[15];
 } rvcn_dec_message_hevc_t;
 
 typedef struct rvcn_dec_message_vp9_s {
@@ -896,6 +906,7 @@ typedef struct rvcn_dec_message_vp9_s {
    unsigned int vp9_frame_size;
    unsigned int compressed_header_size;
    unsigned int uncompressed_header_size;
+   unsigned char reserved[2];
 } rvcn_dec_message_vp9_t;
 
 typedef enum {
@@ -1026,6 +1037,7 @@ typedef struct rvcn_dec_message_av1_s {
    unsigned int uncompressed_header_size;
    rvcn_dec_warped_motion_params_t global_motion[8];
    rvcn_dec_av1_tile_info_t tile_info[256];
+   unsigned char reserved[3];
 } rvcn_dec_message_av1_t;
 
 typedef struct rvcn_dec_feature_index_s {
@@ -1147,13 +1159,6 @@ typedef struct rvcn_dec_vp9_probs_segment_s {
    };
 } rvcn_dec_vp9_probs_segment_t;
 
-struct rvcn_av1_prob_funcs
-{
-   void (*init_mode_probs)(void * prob);
-   void (*init_mv_probs)(void *prob);
-   void (*default_coef_probs)(void *prob, int index);
-};
-
 typedef struct rvcn_dec_av1_fg_init_buf_s {
    short luma_grain_block[64][96];
    short cb_grain_block[32][48];
@@ -1182,6 +1187,8 @@ struct jpeg_params {
    unsigned dt_luma_top_offset;
    unsigned dt_chroma_top_offset;
    unsigned dt_chromav_top_offset;
+   unsigned dt_addr_mode;
+   unsigned dt_swizzle_mode;
    uint16_t crop_x;
    uint16_t crop_y;
    uint16_t crop_width;
@@ -1193,16 +1200,22 @@ struct jpeg_params {
 #define RDECODE_VCN1_GPCOM_VCPU_DATA1 0x20714
 #define RDECODE_VCN1_ENGINE_CNTL      0x20718
 
-#define RDECODE_VCN2_GPCOM_VCPU_CMD   (0x503 << 2)
-#define RDECODE_VCN2_GPCOM_VCPU_DATA0 (0x504 << 2)
-#define RDECODE_VCN2_GPCOM_VCPU_DATA1 (0x505 << 2)
-#define RDECODE_VCN2_ENGINE_CNTL      (0x506 << 2)
+#define RDECODE_VCN2_GPCOM_VCPU_CMD       (0x503 << 2)
+#define RDECODE_VCN2_GPCOM_VCPU_DATA0     (0x504 << 2)
+#define RDECODE_VCN2_GPCOM_VCPU_DATA1     (0x505 << 2)
+#define RDECODE_VCN2_GPCOM_VCPU_DATA2     (0x54C << 2)
+#define RDECODE_VCN2_ENGINE_CNTL          (0x506 << 2)
 
-#define RDECODE_VCN2_5_GPCOM_VCPU_CMD   0x3c
-#define RDECODE_VCN2_5_GPCOM_VCPU_DATA0 0x40
-#define RDECODE_VCN2_5_GPCOM_VCPU_DATA1 0x44
-#define RDECODE_VCN2_5_ENGINE_CNTL      0x9b4
+#define RDECODE_VCN2_5_GPCOM_VCPU_CMD       0x3c
+#define RDECODE_VCN2_5_GPCOM_VCPU_DATA0     0x40
+#define RDECODE_VCN2_5_GPCOM_VCPU_DATA1     0x44
+#define RDECODE_VCN2_5_GPCOM_VCPU_DATA2     0x1A0
+#define RDECODE_VCN2_5_ENGINE_CNTL          0x9b4
 
 #define RDECODE_SESSION_CONTEXT_SIZE (128 * 1024)
+
+unsigned ac_vcn_dec_calc_ctx_size_av1(unsigned av1_version);
+void ac_vcn_av1_init_probs(unsigned av1_version, uint8_t *prob);
+void ac_vcn_av1_init_film_grain_buffer(rvcn_dec_film_grain_params_t *fg_params, rvcn_dec_av1_fg_init_buf_t *fg_buf);
 
 #endif

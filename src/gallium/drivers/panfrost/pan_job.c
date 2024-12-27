@@ -65,12 +65,12 @@ panfrost_batch_add_surface(struct panfrost_batch *batch,
 {
    if (surf) {
       struct panfrost_resource *rsrc = pan_resource(surf->texture);
-      pan_legalize_afbc_format(batch->ctx, rsrc, surf->format, true, false);
+      pan_legalize_format(batch->ctx, rsrc, surf->format, true, false);
       panfrost_batch_write_rsrc(batch, rsrc, PIPE_SHADER_FRAGMENT);
    }
 }
 
-static void
+static int
 panfrost_batch_init(struct panfrost_context *ctx,
                     const struct pipe_framebuffer_state *key,
                     struct panfrost_batch *batch)
@@ -92,21 +92,23 @@ panfrost_batch_init(struct panfrost_context *ctx,
 
    /* Preallocate the main pool, since every batch has at least one job
     * structure so it will be used */
-   panfrost_pool_init(&batch->pool, NULL, dev, 0, 65536, "Batch pool", true,
-                      true);
+   if (panfrost_pool_init(&batch->pool, NULL, dev, 0, 65536, "Batch pool",
+                          true, true))
+      return -1;
 
    /* Don't preallocate the invisible pool, since not every batch will use
     * the pre-allocation, particularly if the varyings are larger than the
     * preallocation and a reallocation is needed after anyway. */
-   panfrost_pool_init(&batch->invisible_pool, NULL, dev, PAN_BO_INVISIBLE,
-                      65536, "Varyings", false, true);
+   if (panfrost_pool_init(&batch->invisible_pool, NULL, dev,
+                          PAN_BO_INVISIBLE, 65536, "Varyings", false, true))
+      return -1;
 
    for (unsigned i = 0; i < batch->key.nr_cbufs; ++i)
       panfrost_batch_add_surface(batch, batch->key.cbufs[i]);
 
    panfrost_batch_add_surface(batch, batch->key.zsbuf);
 
-   screen->vtbl.init_batch(batch);
+   return screen->vtbl.init_batch(batch);
 }
 
 static void
@@ -180,11 +182,17 @@ panfrost_get_batch(struct panfrost_context *ctx,
 
    /* The selected slot is used, we need to flush the batch */
    if (batch->seqnum) {
-      perf_debug_ctx(ctx, "Flushing batch due to seqnum overflow");
+      perf_debug(ctx, "Flushing batch due to seqnum overflow");
       panfrost_batch_submit(ctx, batch);
    }
 
-   panfrost_batch_init(ctx, key, batch);
+   if (panfrost_batch_init(ctx, key, batch)) {
+      mesa_loge("panfrost_batch_init failed");
+      panfrost_batch_cleanup(ctx, batch);
+      /* prevent this batch from being reused without initializing */
+      batch->seqnum = 0;
+      return NULL;
+   }
 
    unsigned batch_idx = panfrost_batch_idx(batch);
    BITSET_SET(ctx->batches.active, batch_idx);
@@ -208,6 +216,8 @@ panfrost_get_batch_for_fbo(struct panfrost_context *ctx)
    /* If not, look up the job */
    struct panfrost_batch *batch =
       panfrost_get_batch(ctx, &ctx->pipe_framebuffer);
+   if (!batch)
+      return NULL;
 
    /* Set this job as the current FBO job. Will be reset when updating the
     * FB state and when submitting or releasing a job.
@@ -230,7 +240,7 @@ panfrost_get_fresh_batch_for_fbo(struct panfrost_context *ctx,
     * draw/clear queued. Otherwise we may reuse the batch. */
 
    if (batch->draw_count + batch->compute_count > 0) {
-      perf_debug_ctx(ctx, "Flushing the current FBO due to: %s", reason);
+      perf_debug(ctx, "Flushing the current FBO due to: %s", reason);
       panfrost_batch_submit(ctx, batch);
       batch = panfrost_get_batch(ctx, &ctx->pipe_framebuffer);
    }
@@ -399,6 +409,7 @@ panfrost_batch_create_bo(struct panfrost_batch *batch, size_t size,
 
    bo = panfrost_bo_create(pan_device(batch->ctx->base.screen), size,
                            create_flags, label);
+   assert(bo);
    panfrost_batch_add_bo(batch, bo, stage);
 
    /* panfrost_batch_add_bo() has retained a reference and
@@ -453,6 +464,7 @@ panfrost_batch_to_fb_info(const struct panfrost_batch *batch,
                           bool reserve)
 {
    struct panfrost_device *dev = pan_device(batch->ctx->base.screen);
+   struct panfrost_screen *screen = pan_screen(batch->ctx->base.screen);
 
    memset(fb, 0, sizeof(*fb));
    memset(rts, 0, sizeof(*rts) * 8);
@@ -467,10 +479,11 @@ panfrost_batch_to_fb_info(const struct panfrost_batch *batch,
    fb->extent.maxx = batch->maxx - 1;
    fb->extent.maxy = batch->maxy - 1;
    fb->nr_samples = util_framebuffer_get_num_samples(&batch->key);
-   fb->force_samples = pan_tristate_get(batch->line_smoothing) ? 16 : 0;
+   fb->force_samples = (batch->line_smoothing == U_TRISTATE_YES) ? 16 : 0;
    fb->rt_count = batch->key.nr_cbufs;
-   fb->sprite_coord_origin = pan_tristate_get(batch->sprite_coord_origin);
-   fb->first_provoking_vertex = pan_tristate_get(batch->first_provoking_vertex);
+   fb->sprite_coord_origin = (batch->sprite_coord_origin == U_TRISTATE_YES);
+   fb->first_provoking_vertex =
+      (batch->first_provoking_vertex == U_TRISTATE_YES);
 
    static const unsigned char id_swz[] = {
       PIPE_SWIZZLE_X,
@@ -604,6 +617,8 @@ panfrost_batch_to_fb_info(const struct panfrost_batch *batch,
       fb->zs.preload.z = !fb->zs.clear.z && valid;
       fb->zs.preload.s = !fb->zs.clear.s && valid;
    }
+
+   screen->vtbl.select_tile_size(fb);
 }
 
 static void
@@ -633,23 +648,26 @@ panfrost_batch_submit(struct panfrost_context *ctx,
    int ret;
 
    /* Nothing to do! */
-   if (!has_frag && batch->compute_count == 0)
+   if (!has_frag && batch->compute_count == 0 && !batch->has_time_query)
       goto out;
 
    if (batch->key.zsbuf && has_frag) {
       struct pipe_surface *surf = batch->key.zsbuf;
       struct panfrost_resource *z_rsrc = pan_resource(surf->texture);
 
-      /* Shared depth/stencil resources are not supported, and would
-       * break this optimisation. */
-      assert(!(z_rsrc->base.bind & PAN_BIND_SHARED_MASK));
+      /* if there are multiple levels or layers, we optimize only the first */
+      if (surf->u.tex.level == 0 && surf->u.tex.first_layer == 0) {
+         /* Shared depth/stencil resources are not supported, and would
+          * break this optimisation. */
+         assert(!(z_rsrc->base.bind & PAN_BIND_SHARED_MASK));
 
-      if (batch->clear & PIPE_CLEAR_STENCIL) {
-         z_rsrc->stencil_value = batch->clear_stencil;
-         z_rsrc->constant_stencil = true;
-      } else if (z_rsrc->constant_stencil) {
-         batch->clear_stencil = z_rsrc->stencil_value;
-         batch->clear |= PIPE_CLEAR_STENCIL;
+         if (batch->clear & PIPE_CLEAR_STENCIL) {
+            z_rsrc->stencil_value = batch->clear_stencil;
+            z_rsrc->constant_stencil = true;
+         } else if (z_rsrc->constant_stencil) {
+            batch->clear_stencil = z_rsrc->stencil_value;
+            batch->clear |= PIPE_CLEAR_STENCIL;
+         }
       }
 
       if (batch->draws & PIPE_CLEAR_STENCIL)
@@ -664,7 +682,7 @@ panfrost_batch_submit(struct panfrost_context *ctx,
 
    ret = screen->vtbl.submit_batch(batch, &fb);
    if (ret)
-      fprintf(stderr, "panfrost_batch_submit failed: %d\n", ret);
+      mesa_loge("panfrost_batch_submit failed: %d\n", ret);
 
    /* We must reset the damage info of our render targets here even
     * though a damage reset normally happens when the DRI layer swaps
@@ -693,9 +711,12 @@ void
 panfrost_flush_all_batches(struct panfrost_context *ctx, const char *reason)
 {
    if (reason)
-      perf_debug_ctx(ctx, "Flushing everything due to: %s", reason);
+      perf_debug(ctx, "Flushing everything due to: %s", reason);
 
    struct panfrost_batch *batch = panfrost_get_batch_for_fbo(ctx);
+   if (!batch)
+      return;
+
    panfrost_batch_submit(ctx, batch);
 
    for (unsigned i = 0; i < PAN_MAX_BATCHES; i++) {
@@ -711,7 +732,7 @@ panfrost_flush_writer(struct panfrost_context *ctx,
    struct hash_entry *entry = _mesa_hash_table_search(ctx->writers, rsrc);
 
    if (entry) {
-      perf_debug_ctx(ctx, "Flushing writer due to: %s", reason);
+      perf_debug(ctx, "Flushing writer due to: %s", reason);
       panfrost_batch_submit(ctx, entry->data);
    }
 }
@@ -728,7 +749,7 @@ panfrost_flush_batches_accessing_rsrc(struct panfrost_context *ctx,
       if (!panfrost_batch_uses_resource(batch, rsrc))
          continue;
 
-      perf_debug_ctx(ctx, "Flushing user due to: %s", reason);
+      perf_debug(ctx, "Flushing user due to: %s", reason);
       panfrost_batch_submit(ctx, batch);
    }
 }

@@ -11,11 +11,11 @@ using namespace brw;
 static bool
 is_mixed_float_with_fp32_dst(const fs_inst *inst)
 {
-   if (inst->dst.type != BRW_REGISTER_TYPE_F)
+   if (inst->dst.type != BRW_TYPE_F)
       return false;
 
    for (int i = 0; i < inst->sources; i++) {
-      if (inst->src[i].type == BRW_REGISTER_TYPE_HF)
+      if (inst->src[i].type == BRW_TYPE_HF)
          return true;
    }
 
@@ -25,12 +25,11 @@ is_mixed_float_with_fp32_dst(const fs_inst *inst)
 static bool
 is_mixed_float_with_packed_fp16_dst(const fs_inst *inst)
 {
-   if (inst->dst.type != BRW_REGISTER_TYPE_HF ||
-       inst->dst.stride != 1)
+   if (inst->dst.type != BRW_TYPE_HF || inst->dst.stride != 1)
       return false;
 
    for (int i = 0; i < inst->sources; i++) {
-      if (inst->src[i].type == BRW_REGISTER_TYPE_F)
+      if (inst->src[i].type == BRW_TYPE_F)
          return true;
    }
 
@@ -86,7 +85,7 @@ get_fpu_lowered_simd_width(const fs_visitor *shader,
    unsigned reg_count = DIV_ROUND_UP(inst->size_written, REG_SIZE);
 
    for (unsigned i = 0; i < inst->sources; i++)
-      reg_count = MAX3(reg_count, DIV_ROUND_UP(inst->size_read(i), REG_SIZE),
+      reg_count = MAX3(reg_count, DIV_ROUND_UP(inst->size_read(devinfo, i), REG_SIZE),
                        (inst->src[i].file == ATTR ? attr_reg_count : 0));
 
    /* Calculate the maximum execution size of the instruction based on the
@@ -180,15 +179,37 @@ get_sampler_lowered_simd_width(const struct intel_device_info *devinfo,
    /* Calculate the total number of argument components that need to be passed
     * to the sampler unit.
     */
-   const unsigned num_payload_components =
-      inst->components_read(TEX_LOGICAL_SRC_COORDINATE) +
+   assert(inst->src[TEX_LOGICAL_SRC_GRAD_COMPONENTS].file == IMM);
+   const unsigned grad_components =
+      inst->src[TEX_LOGICAL_SRC_GRAD_COMPONENTS].ud;
+   assert(inst->src[TEX_LOGICAL_SRC_COORD_COMPONENTS].file == IMM);
+   const unsigned coord_components =
+      inst->src[TEX_LOGICAL_SRC_COORD_COMPONENTS].ud;
+
+   unsigned num_payload_components =
+      coord_components +
       inst->components_read(TEX_LOGICAL_SRC_SHADOW_C) +
       (implicit_lod ? 0 : inst->components_read(TEX_LOGICAL_SRC_LOD)) +
       inst->components_read(TEX_LOGICAL_SRC_LOD2) +
       inst->components_read(TEX_LOGICAL_SRC_SAMPLE_INDEX) +
       (inst->opcode == SHADER_OPCODE_TG4_OFFSET_LOGICAL ?
        inst->components_read(TEX_LOGICAL_SRC_TG4_OFFSET) : 0) +
-      inst->components_read(TEX_LOGICAL_SRC_MCS);
+      inst->components_read(TEX_LOGICAL_SRC_MCS) +
+      inst->components_read(TEX_LOGICAL_SRC_MIN_LOD);
+
+
+   if (inst->opcode == FS_OPCODE_TXB_LOGICAL && devinfo->ver >= 20) {
+      num_payload_components += 3 - coord_components;
+   } else if (inst->opcode == SHADER_OPCODE_TXD_LOGICAL &&
+            devinfo->verx10 >= 125 && devinfo->ver < 20) {
+      num_payload_components +=
+         3 - coord_components + (2 - grad_components) * 2;
+   } else {
+      num_payload_components += 4 - coord_components;
+      if (inst->opcode == SHADER_OPCODE_TXD_LOGICAL)
+         num_payload_components += (3 - grad_components) * 2;
+   }
+
 
    const unsigned simd_limit = reg_unit(devinfo) *
       (num_payload_components > MAX_SAMPLER_MESSAGE_SIZE / 2 ? 8 : 16);
@@ -198,6 +219,20 @@ get_sampler_lowered_simd_width(const struct intel_device_info *devinfo,
     * header is provided or not.
     */
    return MIN2(inst->exec_size, simd_limit);
+}
+
+static bool
+is_half_float_src_dst(const fs_inst *inst)
+{
+   if (inst->dst.type == BRW_TYPE_HF)
+      return true;
+
+   for (int i = 0; i < inst->sources; i++) {
+      if (inst->src[i].type == BRW_TYPE_HF)
+         return true;
+   }
+
+   return false;
 }
 
 /**
@@ -241,7 +276,6 @@ brw_fs_get_lowered_simd_width(const fs_visitor *shader, const fs_inst *inst)
    case BRW_OPCODE_FBH:
    case BRW_OPCODE_FBL:
    case BRW_OPCODE_CBIT:
-   case BRW_OPCODE_SAD2:
    case BRW_OPCODE_MAD:
    case BRW_OPCODE_LRP:
    case BRW_OPCODE_ADD3:
@@ -254,10 +288,6 @@ brw_fs_get_lowered_simd_width(const fs_visitor *shader, const fs_inst *inst)
    case BRW_OPCODE_BFI2:
       return get_fpu_lowered_simd_width(shader, inst);
 
-   case BRW_OPCODE_IF:
-      assert(inst->src[0].file == BAD_FILE || inst->exec_size <= 16);
-      return inst->exec_size;
-
    case SHADER_OPCODE_RCP:
    case SHADER_OPCODE_RSQ:
    case SHADER_OPCODE_SQRT:
@@ -265,17 +295,28 @@ brw_fs_get_lowered_simd_width(const fs_visitor *shader, const fs_inst *inst)
    case SHADER_OPCODE_LOG2:
    case SHADER_OPCODE_SIN:
    case SHADER_OPCODE_COS: {
-      if (inst->dst.type == BRW_REGISTER_TYPE_HF)
-         return MIN2(8, inst->exec_size);
-      return MIN2(16, inst->exec_size);
+      /* Xe2+: BSpec 56797
+       *
+       * Math operation rules when half-floats are used on both source and
+       * destination operands and both source and destinations are packed.
+       *
+       * The execution size must be 16.
+       */
+      if (is_half_float_src_dst(inst))
+         return devinfo->ver < 20 ? MIN2(8,  inst->exec_size) :
+                                    MIN2(16, inst->exec_size);
+      if (devinfo->ver < 20)
+         return MIN2(16, inst->exec_size);
+
+      return inst->exec_size;
    }
 
    case SHADER_OPCODE_POW: {
       /* SIMD16 is only allowed on Gfx7+. Extended Math Function is limited
        * to SIMD8 with half-float
        */
-      if (inst->dst.type == BRW_REGISTER_TYPE_HF)
-         return MIN2(8, inst->exec_size);
+      if (is_half_float_src_dst(inst))
+        return MIN2(8,  inst->exec_size);
       return MIN2(16, inst->exec_size);
    }
 
@@ -288,7 +329,7 @@ brw_fs_get_lowered_simd_width(const fs_visitor *shader, const fs_inst *inst)
       /* Integer division is limited to SIMD8 on all generations. */
       return MIN2(8, inst->exec_size);
 
-   case FS_OPCODE_LINTERP:
+   case BRW_OPCODE_PLN:
    case FS_OPCODE_UNIFORM_PULL_CONSTANT_LOAD:
    case FS_OPCODE_PACK_HALF_2x16_SPLIT:
    case FS_OPCODE_INTERPOLATE_AT_SAMPLE:
@@ -339,6 +380,24 @@ brw_fs_get_lowered_simd_width(const fs_visitor *shader, const fs_inst *inst)
    case SHADER_OPCODE_TXS_LOGICAL:
       return get_sampler_lowered_simd_width(devinfo, inst);
 
+   case SHADER_OPCODE_MEMORY_LOAD_LOGICAL:
+   case SHADER_OPCODE_MEMORY_STORE_LOGICAL:
+   case SHADER_OPCODE_MEMORY_ATOMIC_LOGICAL:
+      if (devinfo->ver >= 20)
+         return inst->exec_size;
+
+      if (inst->src[MEMORY_LOGICAL_MODE].ud == MEMORY_MODE_TYPED)
+         return 8;
+
+      /* HDC A64 atomics are limited to SIMD8 */
+      if (!devinfo->has_lsc &&
+          inst->src[MEMORY_LOGICAL_BINDING_TYPE].ud == LSC_ADDR_SURFTYPE_FLAT
+          && lsc_opcode_is_atomic((enum lsc_opcode)
+                                  inst->src[MEMORY_LOGICAL_OPCODE].ud))
+         return 8;
+
+      return MIN2(16, inst->exec_size);
+
    /* On gfx12 parameters are fixed to 16-bit values and therefore they all
     * always fit regardless of the execution size.
     */
@@ -351,38 +410,6 @@ brw_fs_get_lowered_simd_width(const fs_visitor *shader, const fs_inst *inst)
        */
       return devinfo->ver < 20 ? 8 : 16;
 
-   case SHADER_OPCODE_TYPED_ATOMIC_LOGICAL:
-   case SHADER_OPCODE_TYPED_SURFACE_READ_LOGICAL:
-   case SHADER_OPCODE_TYPED_SURFACE_WRITE_LOGICAL:
-      return 8;
-
-   case SHADER_OPCODE_UNTYPED_ATOMIC_LOGICAL:
-   case SHADER_OPCODE_UNTYPED_SURFACE_READ_LOGICAL:
-   case SHADER_OPCODE_UNTYPED_SURFACE_WRITE_LOGICAL:
-   case SHADER_OPCODE_BYTE_SCATTERED_WRITE_LOGICAL:
-   case SHADER_OPCODE_BYTE_SCATTERED_READ_LOGICAL:
-   case SHADER_OPCODE_DWORD_SCATTERED_WRITE_LOGICAL:
-   case SHADER_OPCODE_DWORD_SCATTERED_READ_LOGICAL:
-   case SHADER_OPCODE_A64_UNTYPED_WRITE_LOGICAL:
-   case SHADER_OPCODE_A64_UNTYPED_READ_LOGICAL:
-   case SHADER_OPCODE_A64_BYTE_SCATTERED_WRITE_LOGICAL:
-   case SHADER_OPCODE_A64_BYTE_SCATTERED_READ_LOGICAL:
-      return devinfo->ver < 20 ?
-             MIN2(16, inst->exec_size) :
-             inst->exec_size;
-
-   case SHADER_OPCODE_A64_OWORD_BLOCK_READ_LOGICAL:
-   case SHADER_OPCODE_A64_UNALIGNED_OWORD_BLOCK_READ_LOGICAL:
-   case SHADER_OPCODE_A64_OWORD_BLOCK_WRITE_LOGICAL:
-      return devinfo->ver < 20 ?
-             MIN2(16, inst->exec_size) :
-             inst->exec_size;
-
-   case SHADER_OPCODE_A64_UNTYPED_ATOMIC_LOGICAL:
-      return devinfo->ver < 20 ?
-             devinfo->has_lsc ? MIN2(16, inst->exec_size) : 8 :
-             inst->exec_size;
-
    case SHADER_OPCODE_URB_READ_LOGICAL:
    case SHADER_OPCODE_URB_WRITE_LOGICAL:
       return MIN2(devinfo->ver < 20 ? 8 : 16, inst->exec_size);
@@ -391,7 +418,7 @@ brw_fs_get_lowered_simd_width(const fs_visitor *shader, const fs_inst *inst)
       const unsigned swiz = inst->src[1].ud;
       return (is_uniform(inst->src[0]) ?
                  get_fpu_lowered_simd_width(shader, inst) :
-              devinfo->ver < 11 && type_sz(inst->src[0].type) == 4 ? 8 :
+              devinfo->ver < 11 && brw_type_size_bytes(inst->src[0].type) == 4 ? 8 :
               swiz == BRW_SWIZZLE_XYXY || swiz == BRW_SWIZZLE_ZWZW ? 4 :
               get_fpu_lowered_simd_width(shader, inst));
    }
@@ -408,13 +435,14 @@ brw_fs_get_lowered_simd_width(const fs_visitor *shader, const fs_inst *inst)
       const unsigned max_size = 2 * REG_SIZE;
       /* Prior to Broadwell, we only have 8 address subregisters. */
       return MIN3(16,
-                  max_size / (inst->dst.stride * type_sz(inst->dst.type)),
+                  max_size / (inst->dst.stride * brw_type_size_bytes(inst->dst.type)),
                   inst->exec_size);
    }
 
    case SHADER_OPCODE_LOAD_PAYLOAD: {
       const unsigned reg_count =
-         DIV_ROUND_UP(inst->dst.component_size(inst->exec_size), REG_SIZE);
+         DIV_ROUND_UP(inst->dst.component_size(inst->exec_size),
+                      REG_SIZE * reg_unit(devinfo));
 
       if (reg_count > 2) {
          /* Only LOAD_PAYLOAD instructions with per-channel destination region
@@ -423,7 +451,7 @@ brw_fs_get_lowered_simd_width(const fs_visitor *shader, const fs_inst *inst)
           */
          assert(!inst->header_size);
          for (unsigned i = 0; i < inst->sources; i++)
-            assert(type_sz(inst->dst.type) == type_sz(inst->src[i].type) ||
+            assert(brw_type_size_bits(inst->dst.type) == brw_type_size_bits(inst->src[i].type) ||
                    inst->src[i].file == BAD_FILE);
 
          return inst->exec_size / DIV_ROUND_UP(reg_count, 2);
@@ -444,11 +472,18 @@ brw_fs_get_lowered_simd_width(const fs_visitor *shader, const fs_inst *inst)
 static inline bool
 needs_src_copy(const fs_builder &lbld, const fs_inst *inst, unsigned i)
 {
-   return !(is_periodic(inst->src[i], lbld.dispatch_width()) ||
-            (inst->components_read(i) == 1 &&
-             lbld.dispatch_width() <= inst->exec_size)) ||
-          (inst->flags_written(lbld.shader->devinfo) &
-           brw_fs_flag_mask(inst->src[i], type_sz(inst->src[i].type)));
+   /* The indirectly indexed register stays the same even if we split the
+    * instruction.
+    */
+   if (inst->opcode == SHADER_OPCODE_MOV_INDIRECT && i == 0)
+      return false;
+
+   return !inst->src[i].is_scalar &&
+          (!(is_periodic(inst->src[i], lbld.dispatch_width()) ||
+             (inst->components_read(i) == 1 &&
+              lbld.dispatch_width() <= inst->exec_size)) ||
+           (inst->flags_written(lbld.shader->devinfo) &
+            brw_fs_flag_mask(inst->src[i], brw_type_size_bytes(inst->src[i].type))));
 }
 
 /**
@@ -456,25 +491,32 @@ needs_src_copy(const fs_builder &lbld, const fs_inst *inst, unsigned i)
  * lbld.group() from the i-th source region of instruction \p inst and return
  * it as result in packed form.
  */
-static fs_reg
+static brw_reg
 emit_unzip(const fs_builder &lbld, fs_inst *inst, unsigned i)
 {
    assert(lbld.group() >= inst->group);
 
    /* Specified channel group from the source region. */
-   const fs_reg src = horiz_offset(inst->src[i], lbld.group() - inst->group);
+   const brw_reg src = horiz_offset(inst->src[i], lbld.group() - inst->group);
 
    if (needs_src_copy(lbld, inst, i)) {
-      const fs_reg tmp = lbld.vgrf(inst->src[i].type, inst->components_read(i));
+      const unsigned num_components = inst->components_read(i);
+      const brw_reg tmp = lbld.vgrf(inst->src[i].type, num_components);
 
-      for (unsigned k = 0; k < inst->components_read(i); ++k)
-         lbld.MOV(offset(tmp, lbld, k), offset(src, inst->exec_size, k));
+      brw_reg comps[num_components];
+      for (unsigned k = 0; k < num_components; ++k)
+         comps[k] = offset(src, inst->exec_size, k);
+      lbld.VEC(tmp, comps, num_components);
 
       return tmp;
-
-   } else if (is_periodic(inst->src[i], lbld.dispatch_width())) {
+   } else if (is_periodic(inst->src[i], lbld.dispatch_width()) ||
+              (inst->opcode == SHADER_OPCODE_MOV_INDIRECT && i == 0) ||
+              inst->src[i].is_scalar) {
       /* The source is invariant for all dispatch_width-wide groups of the
        * original region.
+       *
+       * The src[0] of MOV_INDIRECT is invariant regardless of the execution
+       * size.
        */
       return inst->src[i];
 
@@ -519,7 +561,7 @@ needs_dst_copy(const fs_builder &lbld, const fs_inst *inst)
        * the data read from the same source by other lowered instructions.
        */
       if (regions_overlap(inst->dst, inst->size_written,
-                          inst->src[i], inst->size_read(i)) &&
+                          inst->src[i], inst->size_read(lbld.shader->devinfo, i)) &&
           !inst->dst.equals(inst->src[i]))
         return true;
    }
@@ -535,7 +577,7 @@ needs_dst_copy(const fs_builder &lbld, const fs_inst *inst)
  * inserted using \p lbld_before and any copy instructions required for
  * zipping up the destination of \p inst will be inserted using \p lbld_after.
  */
-static fs_reg
+static brw_reg
 emit_zip(const fs_builder &lbld_before, const fs_builder &lbld_after,
          fs_inst *inst)
 {
@@ -546,7 +588,7 @@ emit_zip(const fs_builder &lbld_before, const fs_builder &lbld_after,
    const struct intel_device_info *devinfo = lbld_before.shader->devinfo;
 
    /* Specified channel group from the destination region. */
-   const fs_reg dst = horiz_offset(inst->dst, lbld_after.group() - inst->group);
+   const brw_reg dst = horiz_offset(inst->dst, lbld_after.group() - inst->group);
 
    if (!needs_dst_copy(lbld_after, inst)) {
       /* No need to allocate a temporary for the lowered instruction, just
@@ -561,7 +603,7 @@ emit_zip(const fs_builder &lbld_before, const fs_builder &lbld_after,
    const unsigned dst_size = (inst->size_written - residency_size) /
       inst->dst.component_size(inst->exec_size);
 
-   const fs_reg tmp = lbld_after.vgrf(inst->dst.type,
+   const brw_reg tmp = lbld_after.vgrf(inst->dst.type,
                                       dst_size + inst->has_sampler_residency());
 
    if (inst->predicate) {
@@ -589,14 +631,12 @@ emit_zip(const fs_builder &lbld_before, const fs_builder &lbld_after,
        * SIMD16 16 bit values.
        */
       const fs_builder rbld = lbld_after.exec_all().group(1, 0);
-      fs_reg local_res_reg = component(
-         retype(offset(tmp, lbld_before, dst_size),
-                BRW_REGISTER_TYPE_UW), 0);
-      fs_reg final_res_reg =
+      brw_reg local_res_reg = component(
+         retype(offset(tmp, lbld_before, dst_size), BRW_TYPE_UW), 0);
+      brw_reg final_res_reg =
          retype(byte_offset(inst->dst,
                             inst->size_written - residency_size +
-                            lbld_after.group() / 8),
-                BRW_REGISTER_TYPE_UW);
+                            lbld_after.group() / 8), BRW_TYPE_UW);
       rbld.MOV(final_res_reg, local_res_reg);
    }
 

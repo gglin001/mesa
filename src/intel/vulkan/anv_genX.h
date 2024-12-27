@@ -38,25 +38,13 @@
 
 struct intel_sample_positions;
 struct intel_urb_config;
+struct anv_async_submit;
 struct anv_embedded_sampler;
 struct anv_pipeline_embedded_sampler_binding;
+struct anv_trtt_bind;
 
 typedef struct nir_builder nir_builder;
 typedef struct nir_shader nir_shader;
-
-extern const uint32_t genX(vk_to_intel_cullmode)[];
-
-extern const uint32_t genX(vk_to_intel_front_face)[];
-
-extern const uint32_t genX(vk_to_intel_primitive_type)[];
-
-extern const uint32_t genX(vk_to_intel_compare_op)[];
-
-extern const uint32_t genX(vk_to_intel_stencil_op)[];
-
-extern const uint32_t genX(vk_to_intel_logic_op)[];
-
-extern const uint32_t genX(vk_to_intel_fillmode)[];
 
 void genX(init_physical_device_state)(struct anv_physical_device *device);
 
@@ -73,18 +61,23 @@ void
 genX(set_fast_clear_state)(struct anv_cmd_buffer *cmd_buffer,
                            const struct anv_image *image,
                            const enum isl_format format,
+                           const struct isl_swizzle swizzle,
                            union isl_color_value clear_color);
 
 void
-genX(load_image_clear_color)(struct anv_cmd_buffer *cmd_buffer,
-                             struct anv_state surface_state,
-                             const struct anv_image *image);
+genX(cmd_buffer_load_clear_color)(struct anv_cmd_buffer *cmd_buffer,
+                                  struct anv_state surface_state,
+                                  const struct anv_image_view *iview);
 
 void genX(cmd_buffer_emit_bt_pool_base_address)(struct anv_cmd_buffer *cmd_buffer);
 
 void genX(cmd_buffer_emit_state_base_address)(struct anv_cmd_buffer *cmd_buffer);
 
 void genX(cmd_buffer_apply_pipe_flushes)(struct anv_cmd_buffer *cmd_buffer);
+
+void
+genX(cmd_buffer_update_color_aux_op)(struct anv_cmd_buffer *cmd_buffer,
+                                     enum isl_aux_op aux_op);
 
 void genX(cmd_buffer_emit_gfx12_depth_wa)(struct anv_cmd_buffer *cmd_buffer,
                                           const struct isl_surf *surf);
@@ -111,11 +104,10 @@ void genX(emit_pipeline_select)(struct anv_batch *batch, uint32_t pipeline,
 
 void genX(apply_task_urb_workaround)(struct anv_cmd_buffer *cmd_buffer);
 
-void genX(emit_vertex_input)(struct anv_batch *batch,
-                             uint32_t *vertex_element_dws,
-                             struct anv_graphics_pipeline *pipeline,
-                             const struct vk_vertex_input_state *vi,
-                             bool emit_in_pipeline);
+void genX(batch_emit_vertex_input)(struct anv_batch *batch,
+                                   struct anv_device *device,
+                                   struct anv_graphics_pipeline *pipeline,
+                                   const struct vk_vertex_input_state *vi);
 
 enum anv_pipe_bits
 genX(emit_apply_pipe_flushes)(struct anv_batch *batch,
@@ -129,9 +121,46 @@ genX(invalidate_aux_map)(struct anv_batch *batch,
                          enum intel_engine_class engine_class,
                          enum anv_pipe_bits bits);
 
+#if INTEL_WA_14018283232_GFX_VER
+void genX(batch_emit_wa_14018283232)(struct anv_batch *batch);
+
+static inline void
+genX(cmd_buffer_ensure_wa_14018283232)(struct anv_cmd_buffer *cmd_buffer,
+                                       bool toggle)
+{
+   struct anv_gfx_dynamic_state *hw_state =
+      &cmd_buffer->state.gfx.dyn_state;
+   if (intel_needs_workaround(cmd_buffer->device->info, 14018283232) &&
+       hw_state->wa_14018283232_toggle != toggle) {
+      hw_state->wa_14018283232_toggle = toggle;
+      BITSET_SET(hw_state->dirty, ANV_GFX_STATE_WA_14018283232);
+      genX(batch_emit_wa_14018283232)(&cmd_buffer->batch);
+   }
+}
+#endif
+
+static inline bool
+genX(cmd_buffer_set_coarse_pixel_active)(struct anv_cmd_buffer *cmd_buffer,
+                                         enum anv_coarse_pixel_state state)
+{
+#if INTEL_WA_18038825448_GFX_VER
+   struct anv_cmd_graphics_state *gfx =
+      &cmd_buffer->state.gfx;
+   if (intel_needs_workaround(cmd_buffer->device->info, 18038825448) &&
+       gfx->dyn_state.coarse_state != state) {
+      gfx->dyn_state.coarse_state = state;
+      BITSET_SET(gfx->dyn_state.dirty, ANV_GFX_STATE_COARSE_STATE);
+      return true;
+   }
+   return false;
+#else
+   return false;
+#endif
+}
 
 void genX(emit_so_memcpy_init)(struct anv_memcpy_state *state,
                                struct anv_device *device,
+                               struct anv_cmd_buffer *cmd_buffer,
                                struct anv_batch *batch);
 
 void genX(emit_so_memcpy_fini)(struct anv_memcpy_state *state);
@@ -210,6 +239,7 @@ void genX(blorp_exec)(struct blorp_batch *batch,
                       const struct blorp_params *params);
 
 void genX(batch_emit_secondary_call)(struct anv_batch *batch,
+                                     struct anv_device *device,
                                      struct anv_address secondary_addr,
                                      struct anv_address secondary_return_addr);
 
@@ -221,6 +251,12 @@ void genX(cmd_emit_timestamp)(struct anv_batch *batch,
                               enum anv_timestamp_capture_type type,
                               void *data);
 
+void genX(cmd_capture_data)(struct anv_batch *batch,
+                            struct anv_device *device,
+                            struct anv_address dst_addr,
+                            struct anv_address src_addr,
+                            uint32_t size_B);
+
 void
 genX(batch_emit_post_3dprimitive_was)(struct anv_batch *batch,
                                       const struct anv_device *device,
@@ -229,11 +265,6 @@ genX(batch_emit_post_3dprimitive_was)(struct anv_batch *batch,
 
 void genX(batch_emit_fast_color_dummy_blit)(struct anv_batch *batch,
                                             struct anv_device *device);
-
-VkPolygonMode
-genX(raster_polygon_mode)(const struct anv_graphics_pipeline *pipeline,
-                          VkPolygonMode polygon_mode,
-                          VkPrimitiveTopology primitive_topology);
 
 void
 genX(graphics_pipeline_emit)(struct anv_graphics_pipeline *pipeline,
@@ -261,7 +292,7 @@ genX(ray_tracing_pipeline_emit)(struct anv_ray_tracing_pipeline *pipeline);
 
 void
 genX(batch_set_preemption)(struct anv_batch *batch,
-                           const struct intel_device_info *devinfo,
+                           struct anv_device *device,
                            uint32_t current_pipeline,
                            bool value);
 
@@ -314,6 +345,10 @@ genX(cmd_buffer_begin_companion_rcs_syncpoint)(struct anv_cmd_buffer *cmd_buffer
 void
 genX(cmd_buffer_end_companion_rcs_syncpoint)(struct anv_cmd_buffer *cmd_buffer,
                                              struct anv_state syncpoint);
+void
+genX(cmd_write_buffer_cp)(struct anv_cmd_buffer *cmd_buffer,
+                          VkDeviceAddress dstAddr,
+                          void *data, uint32_t size);
 
 void
 genX(emit_simple_shader_init)(struct anv_simple_shader *state);
@@ -333,9 +368,15 @@ genX(simple_shader_push_state_address)(struct anv_simple_shader *state,
 void
 genX(emit_simple_shader_end)(struct anv_simple_shader *state);
 
-VkResult genX(init_trtt_context_state)(struct anv_queue *queue);
+VkResult genX(init_trtt_context_state)(struct anv_async_submit *submit);
 
-VkResult genX(write_trtt_entries)(struct anv_trtt_submission *submit);
+void genX(write_trtt_entries)(struct anv_async_submit *submit,
+                              struct anv_trtt_bind *l3l2_binds,
+                              uint32_t n_l3l2_binds,
+                              struct anv_trtt_bind *l1_binds,
+                              uint32_t n_l1_binds);
+
+void genX(async_submit_end)(struct anv_async_submit *submit);
 
 void
 genX(cmd_buffer_emit_push_descriptor_buffer_surface)(struct anv_cmd_buffer *cmd_buffer,
@@ -391,3 +432,15 @@ genX(cmd_buffer_flush_push_descriptors)(struct anv_cmd_buffer *cmd_buffer,
 void genX(emit_embedded_sampler)(struct anv_device *device,
                                  struct anv_embedded_sampler *sampler,
                                  struct anv_pipeline_embedded_sampler_binding *binding);
+
+void
+genX(cmd_buffer_dispatch_indirect)(struct anv_cmd_buffer *cmd_buffer,
+                                   struct anv_address indirect_addr,
+                                   bool is_unaligned_size_x);
+
+void
+genX(cmd_dispatch_unaligned)(
+   VkCommandBuffer                             commandBuffer,
+   uint32_t                                    invocations_x,
+   uint32_t                                    invocations_y,
+   uint32_t                                    invocations_z);

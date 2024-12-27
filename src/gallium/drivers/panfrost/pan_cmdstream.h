@@ -40,7 +40,8 @@
 
 #include "util/u_prim.h"
 
-#define PAN_GPU_INDIRECTS (PAN_ARCH == 7 || PAN_ARCH >= 10)
+#define PAN_GPU_SUPPORTS_DISPATCH_INDIRECT (PAN_ARCH == 7 || PAN_ARCH >= 10)
+#define PAN_GPU_SUPPORTS_DRAW_INDIRECT     (PAN_ARCH >= 10)
 
 struct panfrost_rasterizer {
    struct pipe_rasterizer_state base;
@@ -280,6 +281,9 @@ panfrost_emit_resources(struct panfrost_batch *batch,
     */
    T = pan_pool_alloc_aligned(&batch->pool.base, nr_tables * pan_size(RESOURCE),
                               64);
+   if (!T.cpu)
+      return 0;
+
    memset(T.cpu, 0, nr_tables * pan_size(RESOURCE));
 
    panfrost_make_resource_table(T, PAN_TABLE_UBO, batch->uniform_buffers[stage],
@@ -304,6 +308,9 @@ panfrost_emit_resources(struct panfrost_batch *batch,
                                    batch->attrib_bufs[stage],
                                    util_last_bit(ctx->vb_mask));
    }
+
+   panfrost_make_resource_table(T, PAN_TABLE_SSBO, batch->ssbos[stage],
+                                util_last_bit(ctx->ssbo_mask[stage]));
 
    return T.gpu | nr_tables;
 }

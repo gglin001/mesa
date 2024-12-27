@@ -51,6 +51,7 @@
 #include "common/intel_mem.h"
 #include "c99_alloca.h"
 #include "dev/intel_debug.h"
+#include "common/intel_common.h"
 #include "common/intel_gem.h"
 #include "dev/intel_device_info.h"
 #include "drm-uapi/dma-buf.h"
@@ -185,7 +186,7 @@ struct iris_slab {
    struct iris_bo *entries;
 };
 
-#define BUCKET_ARRAY_SIZE (14 * 4)
+#define BUCKET_ARRAY_SIZE 25
 
 struct iris_bucket_cache {
    struct bo_cache_bucket bucket[BUCKET_ARRAY_SIZE];
@@ -206,7 +207,7 @@ struct iris_bufmgr {
    simple_mtx_t bo_deps_lock;
 
    /** Array of lists of cached gem objects of power-of-two sizes */
-   struct iris_bucket_cache bucket_cache[IRIS_HEAP_MAX];
+   struct iris_bucket_cache *bucket_cache;
 
    time_t time;
 
@@ -233,13 +234,15 @@ struct iris_bufmgr {
    struct intel_bind_timeline bind_timeline; /* Xe only */
    bool bo_reuse:1;
    bool use_global_vm:1;
-   bool compute_engine_supported:1;
 
    struct intel_aux_map_context *aux_map_ctx;
 
    struct pb_slabs bo_slabs[NUM_SLAB_ALLOCATORS];
 
    struct iris_border_color_pool border_color_pool;
+
+   struct iris_bo *dummy_aux_bo;
+   struct iris_bo *mem_fence_bo;
 };
 
 static simple_mtx_t global_bufmgr_list_mutex = SIMPLE_MTX_INITIALIZER;
@@ -294,33 +297,29 @@ bucket_for_size(struct iris_bufmgr *bufmgr, uint64_t size,
        (flags & (BO_ALLOC_SHARED | BO_ALLOC_SCANOUT)))
       return NULL;
 
-   /* Calculating the pages and rounding up to the page size. */
-   const unsigned pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+   const unsigned _4MB = 4 * 1024 * 1024;
+   const unsigned _6MB = 6 * 1024 * 1024;
+   const unsigned _8MB = 8 * 1024 * 1024;
+   const unsigned _64MB = 64 * 1024 * 1024;
+   unsigned index;
 
-   /* Row  Bucket sizes    clz((x-1) | 3)   Row    Column
-    *        in pages                      stride   size
-    *   0:   1  2  3  4 -> 30 30 30 30        4       1
-    *   1:   5  6  7  8 -> 29 29 29 29        4       1
-    *   2:  10 12 14 16 -> 28 28 28 28        8       2
-    *   3:  20 24 28 32 -> 27 27 27 27       16       4
-    */
-   const unsigned row = 30 - __builtin_clz((pages - 1) | 3);
-   const unsigned row_max_pages = 4 << row;
-
-   /* The '& ~2' is the special case for row 1. In row 1, max pages /
-    * 2 is 2, but the previous row maximum is zero (because there is
-    * no previous row). All row maximum sizes are power of 2, so that
-    * is the only case where that bit will be set.
-    */
-   const unsigned prev_row_max_pages = (row_max_pages / 2) & ~2;
-   int col_size_log2 = row - 1;
-   col_size_log2 += (col_size_log2 < 0);
-
-   const unsigned col = (pages - prev_row_max_pages +
-                        ((1 << col_size_log2) - 1)) >> col_size_log2;
-
-   /* Calculating the index based on the row and column. */
-   const unsigned index = (row * 4) + (col - 1);
+   if (size <= 4096) {
+      index = 0;
+   } else if (size <= _4MB) {
+      index = util_logbase2_ceil(size) - 12;
+   } else if (size <= _6MB) {
+      index = 11;
+   } else if (size <= _8MB) {
+      index = 12;
+   } else if (size <= _64MB) {
+      const unsigned power = util_logbase2(size);
+      const unsigned base_size = 1u << power;
+      const unsigned quarter_size = base_size / 4;
+      const unsigned quarter = DIV_ROUND_UP(size - base_size, quarter_size);
+      index = 12 + (power - 23) * 4 + quarter;
+   } else {
+      return NULL;
+   }
 
    return (index < cache->num_buckets) ? &cache->bucket[index] : NULL;
 }
@@ -775,15 +774,24 @@ iris_slab_alloc(void *priv,
    }
    assert(slab_size != 0);
 
-   if (heap == IRIS_HEAP_SYSTEM_MEMORY_CACHED_COHERENT ||
-       heap == IRIS_HEAP_SYSTEM_MEMORY_UNCACHED)
+   switch (heap) {
+   case IRIS_HEAP_SYSTEM_MEMORY_UNCACHED_COMPRESSED:
+   case IRIS_HEAP_DEVICE_LOCAL_COMPRESSED:
+      flags |= BO_ALLOC_COMPRESSED;
+      break;
+   case IRIS_HEAP_SYSTEM_MEMORY_CACHED_COHERENT:
+   case IRIS_HEAP_SYSTEM_MEMORY_UNCACHED:
       flags |= BO_ALLOC_SMEM;
-   else if (heap == IRIS_HEAP_DEVICE_LOCAL)
+      break;
+   case IRIS_HEAP_DEVICE_LOCAL:
       flags |= BO_ALLOC_LMEM;
-   else if (heap == IRIS_HEAP_DEVICE_LOCAL_CPU_VISIBLE_SMALL_BAR)
+      break;
+   case IRIS_HEAP_DEVICE_LOCAL_CPU_VISIBLE_SMALL_BAR:
       flags |= BO_ALLOC_LMEM | BO_ALLOC_CPU_VISIBLE;
-   else
+      break;
+   default:
       flags |= BO_ALLOC_PLAIN;
+   }
 
    slab->bo =
       iris_bo_alloc(bufmgr, "slab", slab_size, slab_size, memzone, flags);
@@ -843,6 +851,9 @@ flags_to_heap(struct iris_bufmgr *bufmgr, unsigned flags)
    const struct intel_device_info *devinfo = &bufmgr->devinfo;
 
    if (bufmgr->vram.size > 0) {
+      if (flags & BO_ALLOC_COMPRESSED)
+         return IRIS_HEAP_DEVICE_LOCAL_COMPRESSED;
+
       /* Discrete GPUs currently always snoop CPU caches. */
       if ((flags & BO_ALLOC_SMEM) || (flags & BO_ALLOC_COHERENT))
          return IRIS_HEAP_SYSTEM_MEMORY_CACHED_COHERENT;
@@ -867,6 +878,9 @@ flags_to_heap(struct iris_bufmgr *bufmgr, unsigned flags)
    } else {
       assert(!devinfo->has_llc);
       assert(!(flags & BO_ALLOC_LMEM));
+
+      if (flags & BO_ALLOC_COMPRESSED)
+         return IRIS_HEAP_SYSTEM_MEMORY_UNCACHED_COMPRESSED;
 
       if (flags & BO_ALLOC_COHERENT)
          return IRIS_HEAP_SYSTEM_MEMORY_CACHED_COHERENT;
@@ -1112,11 +1126,16 @@ alloc_fresh_bo(struct iris_bufmgr *bufmgr, uint64_t bo_size, unsigned flags)
          break;
       case IRIS_HEAP_DEVICE_LOCAL:
       case IRIS_HEAP_DEVICE_LOCAL_CPU_VISIBLE_SMALL_BAR:
+      case IRIS_HEAP_DEVICE_LOCAL_COMPRESSED:
          regions[num_regions++] = bufmgr->vram.region;
          break;
       case IRIS_HEAP_SYSTEM_MEMORY_CACHED_COHERENT:
          regions[num_regions++] = bufmgr->sys.region;
          break;
+      case IRIS_HEAP_SYSTEM_MEMORY_UNCACHED_COMPRESSED:
+         /* not valid, compressed in discrete is always created with
+          * IRIS_HEAP_DEVICE_LOCAL_PREFERRED_COMPRESSED
+          */
       case IRIS_HEAP_SYSTEM_MEMORY_UNCACHED:
          /* not valid; discrete cards always enable snooping */
       case IRIS_HEAP_MAX:
@@ -1146,9 +1165,11 @@ const char *
 iris_heap_to_string[IRIS_HEAP_MAX] = {
    [IRIS_HEAP_SYSTEM_MEMORY_CACHED_COHERENT] = "system-cached-coherent",
    [IRIS_HEAP_SYSTEM_MEMORY_UNCACHED] = "system-uncached",
+   [IRIS_HEAP_SYSTEM_MEMORY_UNCACHED_COMPRESSED] = "system-uncached-compressed",
    [IRIS_HEAP_DEVICE_LOCAL] = "local",
-   [IRIS_HEAP_DEVICE_LOCAL_CPU_VISIBLE_SMALL_BAR] = "local-cpu-visible-small-bar",
+   [IRIS_HEAP_DEVICE_LOCAL_COMPRESSED] = "local-compressed",
    [IRIS_HEAP_DEVICE_LOCAL_PREFERRED] = "local-preferred",
+   [IRIS_HEAP_DEVICE_LOCAL_CPU_VISIBLE_SMALL_BAR] = "local-cpu-visible-small-bar",
 };
 
 static enum iris_mmap_mode
@@ -1166,6 +1187,10 @@ heap_to_mmap_mode(struct iris_bufmgr *bufmgr, enum iris_heap heap)
       return IRIS_MMAP_WB;
    case IRIS_HEAP_SYSTEM_MEMORY_UNCACHED:
       return IRIS_MMAP_WC;
+   case IRIS_HEAP_SYSTEM_MEMORY_UNCACHED_COMPRESSED:
+   case IRIS_HEAP_DEVICE_LOCAL_COMPRESSED:
+      /* compressed bos are not mmaped */
+      return IRIS_MMAP_NONE;
    default:
       unreachable("invalid heap");
    }
@@ -1536,6 +1561,18 @@ bo_free(struct iris_bo *bo)
    }
 }
 
+static enum iris_heap
+iris_get_heap_max(struct iris_bufmgr *bufmgr)
+{
+   if (bufmgr->vram.size) {
+      return intel_vram_all_mappable(&bufmgr->devinfo) ?
+             IRIS_HEAP_MAX_LARGE_BAR : IRIS_HEAP_MAX;
+   }
+
+   return bufmgr->devinfo.ver >= 20 ? IRIS_HEAP_MAX_NO_VRAM :
+                                      IRIS_HEAP_SYSTEM_MEMORY_UNCACHED_COMPRESSED;
+}
+
 /** Frees all cached buffers significantly older than @time. */
 static void
 cleanup_bo_cache(struct iris_bufmgr *bufmgr, time_t time)
@@ -1545,7 +1582,7 @@ cleanup_bo_cache(struct iris_bufmgr *bufmgr, time_t time)
    if (bufmgr->time == time)
       return;
 
-   for (int h = 0; h < IRIS_HEAP_MAX; h++) {
+   for (int h = 0; h < iris_get_heap_max(bufmgr); h++) {
       struct iris_bucket_cache *cache = &bufmgr->bucket_cache[h];
 
       for (int i = 0; i < cache->num_buckets; i++) {
@@ -1792,6 +1829,9 @@ iris_bufmgr_destroy_global_vm(struct iris_bufmgr *bufmgr)
 static void
 iris_bufmgr_destroy(struct iris_bufmgr *bufmgr)
 {
+   iris_bo_unreference(bufmgr->dummy_aux_bo);
+   iris_bo_unreference(bufmgr->mem_fence_bo);
+
    iris_destroy_border_color_pool(&bufmgr->border_color_pool);
 
    /* Free aux-map buffers */
@@ -1808,7 +1848,7 @@ iris_bufmgr_destroy(struct iris_bufmgr *bufmgr)
    simple_mtx_lock(&bufmgr->lock);
 
    /* Free any cached buffer objects we were going to reuse */
-   for (int h = 0; h < IRIS_HEAP_MAX; h++) {
+   for (int h = 0; h < iris_get_heap_max(bufmgr); h++) {
       struct iris_bucket_cache *cache = &bufmgr->bucket_cache[h];
 
       for (int i = 0; i < cache->num_buckets; i++) {
@@ -1821,6 +1861,7 @@ iris_bufmgr_destroy(struct iris_bufmgr *bufmgr)
          }
       }
    }
+   free(bufmgr->bucket_cache);
 
    /* Close any buffer objects on the dead list. */
    list_for_each_entry_safe(struct iris_bo, bo, &bufmgr->zombie_list, head) {
@@ -2129,6 +2170,8 @@ add_bucket(struct iris_bufmgr *bufmgr, int size, enum iris_heap heap)
    struct iris_bucket_cache *cache = &bufmgr->bucket_cache[heap];
    unsigned int i = cache->num_buckets++;
 
+   assert(i < BUCKET_ARRAY_SIZE);
+
    list_inithead(&cache->bucket[i].head);
    cache->bucket[i].size = size;
 
@@ -2140,28 +2183,27 @@ add_bucket(struct iris_bufmgr *bufmgr, int size, enum iris_heap heap)
 static void
 init_cache_buckets(struct iris_bufmgr *bufmgr, enum iris_heap heap)
 {
-   uint64_t size, cache_max_size = 64 * 1024 * 1024;
+   const unsigned _6MB = 6 * 1024 * 1024;
+   const unsigned _8MB = 8 * 1024 * 1024;
+   const unsigned _64MB = 64 * 1024 * 1024;
 
-   /* OK, so power of two buckets was too wasteful of memory.
-    * Give 3 other sizes between each power of two, to hopefully
-    * cover things accurately enough.  (The alternative is
-    * probably to just go for exact matching of sizes, and assume
-    * that for things like composited window resize the tiled
-    * width/height alignment and rounding of sizes to pages will
-    * get us useful cache hit rates anyway)
-    */
-   add_bucket(bufmgr, PAGE_SIZE,     heap);
-   add_bucket(bufmgr, PAGE_SIZE * 2, heap);
-   add_bucket(bufmgr, PAGE_SIZE * 3, heap);
-
-   /* Initialize the linked lists for BO reuse cache. */
-   for (size = 4 * PAGE_SIZE; size <= cache_max_size; size *= 2) {
+   /* power-of-two buckets from 4K to 4MB */
+   for (uint64_t size = 4096; size < _8MB; size *= 2)
       add_bucket(bufmgr, size, heap);
 
+   /* 6MB */
+   add_bucket(bufmgr, _6MB, heap);
+
+   /* 8MB+: three sizes between each power of two to reduce waste */
+   for (uint64_t size = _8MB; size < _64MB; size *= 2) {
+      add_bucket(bufmgr, size, heap);
       add_bucket(bufmgr, size + size * 1 / 4, heap);
       add_bucket(bufmgr, size + size * 2 / 4, heap);
       add_bucket(bufmgr, size + size * 3 / 4, heap);
    }
+
+   /* 64MB */
+   add_bucket(bufmgr, _64MB, heap);
 }
 
 static struct intel_buffer *
@@ -2308,17 +2350,7 @@ iris_bufmgr_create(struct intel_device_info *devinfo, int fd, bool bo_reuse)
    iris_bufmgr_get_meminfo(bufmgr, devinfo);
    bufmgr->kmd_backend = iris_kmd_backend_get(devinfo->kmd_type);
 
-   struct intel_query_engine_info *engine_info;
-   engine_info = intel_engine_get_info(bufmgr->fd, bufmgr->devinfo.kmd_type);
-   bufmgr->devinfo.has_compute_engine = engine_info &&
-                                        intel_engines_count(engine_info,
-                                                            INTEL_ENGINE_CLASS_COMPUTE);
-   bufmgr->compute_engine_supported = bufmgr->devinfo.has_compute_engine &&
-                                      intel_engines_supported_count(bufmgr->fd,
-                                                                    &bufmgr->devinfo,
-                                                                    engine_info,
-                                                                    INTEL_ENGINE_CLASS_COMPUTE);
-   free(engine_info);
+   intel_common_update_device_info(bufmgr->fd, devinfo);
 
    if (!iris_bufmgr_init_global_vm(bufmgr))
       goto error_init_vm;
@@ -2388,7 +2420,11 @@ iris_bufmgr_create(struct intel_device_info *devinfo, int fd, bool bo_reuse)
       }
    }
 
-   for (int h = 0; h < IRIS_HEAP_MAX; h++)
+   bufmgr->bucket_cache = calloc(iris_get_heap_max(bufmgr),
+                                 sizeof(*bufmgr->bucket_cache));
+   if (!bufmgr->bucket_cache)
+      goto error_bucket_cache;
+   for (int h = 0; h < iris_get_heap_max(bufmgr); h++)
       init_cache_buckets(bufmgr, h);
 
    unsigned min_slab_order = 8;  /* 256 bytes */
@@ -2403,7 +2439,7 @@ iris_bufmgr_create(struct intel_device_info *devinfo, int fd, bool bo_reuse)
          MIN2(min_order + num_slab_orders_per_allocator, max_slab_order);
 
       if (!pb_slabs_init(&bufmgr->bo_slabs[i], min_order, max_order,
-                         IRIS_HEAP_MAX, true, bufmgr,
+                         iris_get_heap_max(bufmgr), true, bufmgr,
                          iris_can_reclaim_slab,
                          iris_slab_alloc,
                          (void *) iris_slab_free)) {
@@ -2425,8 +2461,36 @@ iris_bufmgr_create(struct intel_device_info *devinfo, int fd, bool bo_reuse)
 
    iris_init_border_color_pool(bufmgr, &bufmgr->border_color_pool);
 
+   if (intel_needs_workaround(devinfo, 14019708328)) {
+      bufmgr->dummy_aux_bo = iris_bo_alloc(bufmgr, "dummy_aux", 4096, 4096,
+                                           IRIS_MEMZONE_OTHER, BO_ALLOC_PLAIN);
+         if (!bufmgr->dummy_aux_bo)
+            goto error_alloc_bo;
+   }
+
+   /* Programming note from MI_MEM_FENCE specification:
+    *
+    *    Software must ensure STATE_SYSTEM_MEM_FENCE_ADDRESS command is
+    *    programmed prior to programming this command.
+    *
+    * HAS 1607240579 then provides the size information: 4K
+    */
+   if (devinfo->verx10 >= 200) {
+      bufmgr->mem_fence_bo = iris_bo_alloc(bufmgr, "mem_fence", 4096, 4096,
+                                           IRIS_MEMZONE_OTHER, BO_ALLOC_SMEM);
+      if (!bufmgr->mem_fence_bo)
+         goto error_alloc_bo;
+   }
+
    return bufmgr;
 
+error_alloc_bo:
+   iris_bo_unreference(bufmgr->dummy_aux_bo);
+   iris_bo_unreference(bufmgr->mem_fence_bo);
+   iris_destroy_border_color_pool(&bufmgr->border_color_pool);
+   intel_aux_map_finish(bufmgr->aux_map_ctx);
+   _mesa_hash_table_destroy(bufmgr->handle_table, NULL);
+   _mesa_hash_table_destroy(bufmgr->name_table, NULL);
 error_slabs_init:
    for (unsigned i = 0; i < NUM_SLAB_ALLOCATORS; i++) {
       if (!bufmgr->bo_slabs[i].groups)
@@ -2434,6 +2498,10 @@ error_slabs_init:
 
       pb_slabs_deinit(&bufmgr->bo_slabs[i]);
    }
+   free(bufmgr->bucket_cache);
+error_bucket_cache:
+   for (unsigned i = 0; i < IRIS_MEMZONE_COUNT; i++)
+      util_vma_heap_finish(&bufmgr->vma_allocator[i]);
    iris_bufmgr_destroy_global_vm(bufmgr);
 error_init_vm:
    close(bufmgr->fd);
@@ -2575,7 +2643,7 @@ iris_bufmgr_use_global_vm_id(struct iris_bufmgr *bufmgr)
 bool
 iris_bufmgr_compute_engine_supported(struct iris_bufmgr *bufmgr)
 {
-   return bufmgr->compute_engine_supported;
+   return bufmgr->devinfo.engine_class_supported_count[INTEL_ENGINE_CLASS_COMPUTE];
 }
 
 /**
@@ -2594,6 +2662,9 @@ iris_heap_to_pat_entry(const struct intel_device_info *devinfo,
    case IRIS_HEAP_DEVICE_LOCAL_CPU_VISIBLE_SMALL_BAR:
    case IRIS_HEAP_DEVICE_LOCAL_PREFERRED:
       return &devinfo->pat.writecombining;
+   case IRIS_HEAP_SYSTEM_MEMORY_UNCACHED_COMPRESSED:
+   case IRIS_HEAP_DEVICE_LOCAL_COMPRESSED:
+      return &devinfo->pat.compressed;
    default:
       unreachable("invalid heap for platforms using PAT entries");
    }
@@ -2603,4 +2674,16 @@ struct intel_bind_timeline *
 iris_bufmgr_get_bind_timeline(struct iris_bufmgr *bufmgr)
 {
    return &bufmgr->bind_timeline;
+}
+
+uint64_t
+iris_bufmgr_get_dummy_aux_address(struct iris_bufmgr *bufmgr)
+{
+   return bufmgr->dummy_aux_bo ? bufmgr->dummy_aux_bo->address : 0;
+}
+
+struct iris_bo *
+iris_bufmgr_get_mem_fence_bo(struct iris_bufmgr *bufmgr)
+{
+   return bufmgr->mem_fence_bo;
 }

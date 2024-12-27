@@ -889,7 +889,7 @@ get_iteration(nir_op cond_op, nir_const_value initial, nir_const_value step,
    }
 
    uint64_t iter_u64 = nir_const_value_as_uint(iter, iter_bit_size);
-   return iter_u64 > INT_MAX ? -1 : (int)iter_u64;
+   return iter_u64 > u_intN_max(iter_bit_size) ? -1 : (int)iter_u64;
 }
 
 static int32_t
@@ -1135,17 +1135,11 @@ get_induction_and_limit_vars(nir_scalar cond,
    nir_loop_variable *src1_lv = get_loop_var(rhs.def, state);
 
    if (src0_lv->type == basic_induction) {
-      if (!nir_src_is_const(*src0_lv->init_src))
-         return false;
-
       *ind = lhs;
       *limit = rhs;
       *limit_rhs = true;
       return true;
    } else if (src1_lv->type == basic_induction) {
-      if (!nir_src_is_const(*src1_lv->init_src))
-         return false;
-
       *ind = rhs;
       *limit = lhs;
       *limit_rhs = false;
@@ -1156,25 +1150,25 @@ get_induction_and_limit_vars(nir_scalar cond,
 }
 
 static bool
-try_find_trip_count_vars_in_iand(nir_scalar *cond,
-                                 nir_scalar *ind,
-                                 nir_scalar *limit,
-                                 bool *limit_rhs,
-                                 loop_info_state *state)
+try_find_trip_count_vars_in_logical_op(nir_scalar *cond,
+                                       nir_scalar *ind,
+                                       nir_scalar *limit,
+                                       bool *limit_rhs,
+                                       loop_info_state *state)
 {
    const nir_op alu_op = nir_scalar_alu_op(*cond);
-   assert(alu_op == nir_op_ieq || alu_op == nir_op_inot);
-
-   nir_scalar iand = nir_scalar_chase_alu_src(*cond, 0);
+   bool exit_loop_on_false = alu_op == nir_op_ieq || alu_op == nir_op_inot;
+   nir_scalar logical_op = exit_loop_on_false ?
+      nir_scalar_chase_alu_src(*cond, 0) : *cond;
 
    if (alu_op == nir_op_ieq) {
       nir_scalar zero = nir_scalar_chase_alu_src(*cond, 1);
 
-      if (!nir_scalar_is_alu(iand) || !nir_scalar_is_const(zero)) {
+      if (!nir_scalar_is_alu(logical_op) || !nir_scalar_is_const(zero)) {
          /* Maybe we had it the wrong way, flip things around */
          nir_scalar tmp = zero;
-         zero = iand;
-         iand = tmp;
+         zero = logical_op;
+         logical_op = tmp;
 
          /* If we still didn't find what we need then return */
          if (!nir_scalar_is_const(zero))
@@ -1186,10 +1180,11 @@ try_find_trip_count_vars_in_iand(nir_scalar *cond,
          return false;
    }
 
-   if (!nir_scalar_is_alu(iand))
+   if (!nir_scalar_is_alu(logical_op))
       return false;
 
-   if (nir_scalar_alu_op(iand) != nir_op_iand)
+   if ((exit_loop_on_false && (nir_scalar_alu_op(logical_op) != nir_op_iand)) ||
+       (!exit_loop_on_false && (nir_scalar_alu_op(logical_op) != nir_op_ior)))
       return false;
 
    /* Check if iand src is a terminator condition and try get induction var
@@ -1197,7 +1192,7 @@ try_find_trip_count_vars_in_iand(nir_scalar *cond,
     */
    bool found_induction_var = false;
    for (unsigned i = 0; i < 2; i++) {
-      nir_scalar src = nir_scalar_chase_alu_src(iand, i);
+      nir_scalar src = nir_scalar_chase_alu_src(logical_op, i);
       if (nir_is_terminator_condition_with_two_inputs(src) &&
           get_induction_and_limit_vars(src, ind, limit, limit_rhs, state)) {
          *cond = src;
@@ -1248,17 +1243,21 @@ find_trip_count(loop_info_state *state, unsigned execution_mode,
       bool limit_rhs;
       nir_scalar basic_ind = { NULL, 0 };
       nir_scalar limit;
-      if ((alu_op == nir_op_inot || alu_op == nir_op_ieq) &&
-          try_find_trip_count_vars_in_iand(&cond, &basic_ind, &limit,
-                                           &limit_rhs, state)) {
+
+      if ((alu_op == nir_op_inot || alu_op == nir_op_ieq || alu_op == nir_op_ior) &&
+          try_find_trip_count_vars_in_logical_op(&cond, &basic_ind, &limit,
+                                                 &limit_rhs, state)) {
 
          /* The loop is exiting on (x && y) == 0 so we need to get the
           * inverse of x or y (i.e. which ever contained the induction var) in
           * order to compute the trip count.
           */
+         if (alu_op == nir_op_inot || alu_op == nir_op_ieq)
+            invert_cond = !invert_cond;
+
          alu_op = nir_scalar_alu_op(cond);
-         invert_cond = !invert_cond;
          trip_count_known = false;
+         terminator->conditional_instr = cond.def->parent_instr;
          terminator->exact_trip_count_unknown = true;
       }
 
@@ -1326,20 +1325,56 @@ find_trip_count(loop_info_state *state, unsigned execution_mode,
          lv->update_src->swizzle[basic_ind.comp]
       };
 
+      nir_alu_instr *step_alu =
+         nir_instr_as_alu(nir_src_parent_instr(&lv->update_src->src));
+
+      /* If the comparision is of unsigned type we don't necessarily need to
+       * know the initial value to be able to calculate the max number of
+       * iterations
+       */
+      bool can_find_max_trip_count = step_alu->op == nir_op_iadd &&
+         ((alu_op == nir_op_uge && !invert_cond && limit_rhs) ||
+          (alu_op == nir_op_ult && !invert_cond && !limit_rhs));
+
+      /* nir_op_isub should have been lowered away by this point */
+      assert(step_alu->op != nir_op_isub);
+
+      /* For nir_op_uge as alu_op, the induction variable is [0,limit). For
+       * nir_op_ult, it's [0,limit]. It must always be step_val larger in the
+       * next iteration to use the can_find_max_trip_count=true path. This
+       * check ensures that no unsigned overflow happens.
+       * TODO: support for overflow could be added if a non-zero initial_val
+       * is chosen.
+       */
+      if (can_find_max_trip_count && nir_scalar_is_const(alu_s)) {
+         uint64_t uint_max = u_uintN_max(alu_s.def->bit_size);
+         uint64_t max_step_val =
+            uint_max - nir_const_value_as_uint(limit_val, alu_s.def->bit_size) +
+            (alu_op == nir_op_uge ? 1 : 0);
+         can_find_max_trip_count &= nir_scalar_as_uint(alu_s) <= max_step_val;
+      }
+
       /* We are not guaranteed by that at one of these sources is a constant.
        * Try to find one.
        */
-      if (!nir_scalar_is_const(initial_s) ||
+      if ((!nir_scalar_is_const(initial_s) && !can_find_max_trip_count) ||
           !nir_scalar_is_const(alu_s))
          continue;
 
-      nir_const_value initial_val = nir_scalar_as_const_value(initial_s);
+      nir_const_value initial_val;
+      if (nir_scalar_is_const(initial_s))
+         initial_val = nir_scalar_as_const_value(initial_s);
+      else {
+         trip_count_known = false;
+         terminator->exact_trip_count_unknown = true;
+         initial_val = nir_const_value_for_uint(0, 32);
+         assert(can_find_max_trip_count);
+      }
       nir_const_value step_val = nir_scalar_as_const_value(alu_s);
 
       int iterations = calculate_iterations(nir_get_scalar(lv->basis, basic_ind.comp), limit,
                                             initial_val, step_val, limit_val,
-                                            nir_instr_as_alu(nir_src_parent_instr(&lv->update_src->src)),
-                                            cond,
+                                            step_alu, cond,
                                             alu_op, limit_rhs,
                                             invert_cond,
                                             execution_mode,

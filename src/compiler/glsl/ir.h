@@ -201,17 +201,6 @@ public:
    #undef AS_CHILD
    /*@}*/
 
-   /**
-    * IR equality method: Return true if the referenced instruction would
-    * return the same value as this one.
-    *
-    * This intended to be used for CSE and algebraic optimizations, on rvalues
-    * in particular.  No support for other instruction types (assignments,
-    * jumps, calls, etc.) is planned.
-    */
-   virtual bool equals(const ir_instruction *ir,
-                       enum ir_node_type ignore = ir_type_unset) const;
-
 protected:
    ir_instruction(enum ir_node_type t)
       : ir_type(t)
@@ -1126,12 +1115,68 @@ enum ir_intrinsic_id {
    ir_intrinsic_vote_any,
    ir_intrinsic_vote_eq,
    ir_intrinsic_ballot,
+   ir_intrinsic_inverse_ballot,
+   ir_intrinsic_ballot_bit_extract,
+   ir_intrinsic_ballot_bit_count,
+   ir_intrinsic_ballot_inclusive_bit_count,
+   ir_intrinsic_ballot_exclusive_bit_count,
+   ir_intrinsic_ballot_find_lsb,
+   ir_intrinsic_ballot_find_msb,
    ir_intrinsic_read_invocation,
    ir_intrinsic_read_first_invocation,
 
    ir_intrinsic_helper_invocation,
 
    ir_intrinsic_is_sparse_texels_resident,
+
+   ir_intrinsic_subgroup_barrier,
+   ir_intrinsic_subgroup_memory_barrier,
+   ir_intrinsic_subgroup_memory_barrier_buffer,
+   ir_intrinsic_subgroup_memory_barrier_shared,
+   ir_intrinsic_subgroup_memory_barrier_image,
+   ir_intrinsic_elect,
+
+   ir_intrinsic_shuffle,
+   ir_intrinsic_shuffle_xor,
+   ir_intrinsic_shuffle_up,
+   ir_intrinsic_shuffle_down,
+
+   ir_intrinsic_reduce_add,
+   ir_intrinsic_reduce_mul,
+   ir_intrinsic_reduce_min,
+   ir_intrinsic_reduce_max,
+   ir_intrinsic_reduce_and,
+   ir_intrinsic_reduce_or,
+   ir_intrinsic_reduce_xor,
+
+   ir_intrinsic_inclusive_add,
+   ir_intrinsic_inclusive_mul,
+   ir_intrinsic_inclusive_min,
+   ir_intrinsic_inclusive_max,
+   ir_intrinsic_inclusive_and,
+   ir_intrinsic_inclusive_or,
+   ir_intrinsic_inclusive_xor,
+
+   ir_intrinsic_exclusive_add,
+   ir_intrinsic_exclusive_mul,
+   ir_intrinsic_exclusive_min,
+   ir_intrinsic_exclusive_max,
+   ir_intrinsic_exclusive_and,
+   ir_intrinsic_exclusive_or,
+   ir_intrinsic_exclusive_xor,
+
+   ir_intrinsic_clustered_add,
+   ir_intrinsic_clustered_mul,
+   ir_intrinsic_clustered_min,
+   ir_intrinsic_clustered_max,
+   ir_intrinsic_clustered_and,
+   ir_intrinsic_clustered_or,
+   ir_intrinsic_clustered_xor,
+
+   ir_intrinsic_quad_broadcast,
+   ir_intrinsic_quad_swap_horizontal,
+   ir_intrinsic_quad_swap_vertical,
+   ir_intrinsic_quad_swap_diagonal,
 };
 
 /*@{*/
@@ -1313,6 +1358,8 @@ public:
     */
    ir_function_signature *matching_signature(_mesa_glsl_parse_state *state,
                                              const exec_list *actual_param,
+                                             bool has_implicit_conversions,
+                                             bool has_implicit_int_to_uint_conversion,
                                              bool allow_builtins,
 					     bool *match_is_exact);
 
@@ -1322,6 +1369,8 @@ public:
     */
    ir_function_signature *matching_signature(_mesa_glsl_parse_state *state,
                                              const exec_list *actual_param,
+                                             bool has_implicit_conversions,
+                                             bool has_implicit_int_to_uint_conversion,
                                              bool allow_builtins);
 
    /**
@@ -1517,9 +1566,6 @@ public:
     * Constructor for ternary operation expressions
     */
    ir_expression(int op, ir_rvalue *op0, ir_rvalue *op1, ir_rvalue *op2);
-
-   virtual bool equals(const ir_instruction *ir,
-                       enum ir_node_type ignore = ir_type_unset) const;
 
    virtual ir_expression *clone(void *mem_ctx, struct hash_table *ht) const;
 
@@ -1871,9 +1917,6 @@ public:
 
    virtual ir_visitor_status accept(ir_hierarchical_visitor *);
 
-   virtual bool equals(const ir_instruction *ir,
-                       enum ir_node_type ignore = ir_type_unset) const;
-
    /**
     * Return a string representing the ir_texture_opcode.
     */
@@ -1980,9 +2023,6 @@ public:
 
    virtual ir_visitor_status accept(ir_hierarchical_visitor *);
 
-   virtual bool equals(const ir_instruction *ir,
-                       enum ir_node_type ignore = ir_type_unset) const;
-
    bool is_lvalue(const struct _mesa_glsl_parse_state *state) const
    {
       return val->is_lvalue(state) && !mask.has_duplicates;
@@ -2041,9 +2081,6 @@ public:
    virtual ir_constant *constant_expression_value(void *mem_ctx,
                                                   struct hash_table *variable_context = NULL);
 
-   virtual bool equals(const ir_instruction *ir,
-                       enum ir_node_type ignore = ir_type_unset) const;
-
    /**
     * Get the variable that is ultimately referenced by an r-value
     */
@@ -2093,10 +2130,6 @@ public:
 
    virtual ir_constant *constant_expression_value(void *mem_ctx,
                                                   struct hash_table *variable_context = NULL);
-
-   virtual bool equals(const ir_instruction *ir,
-                       enum ir_node_type ignore = ir_type_unset) const;
-
    /**
     * Get the variable that is ultimately referenced by an r-value
     */
@@ -2233,9 +2266,6 @@ public:
    }
 
    virtual ir_visitor_status accept(ir_hierarchical_visitor *);
-
-   virtual bool equals(const ir_instruction *ir,
-                       enum ir_node_type ignore = ir_type_unset) const;
 
    /**
     * Get a particular component of a constant as a specific type
@@ -2445,18 +2475,6 @@ void validate_ir_tree(exec_list *instructions);
 void
 detect_recursion_unlinked(struct _mesa_glsl_parse_state *state,
 			  exec_list *instructions);
-
-/**
- * Detect whether a linked shader contains static recursion
- *
- * If the list of instructions is determined to contain static recursion,
- * \c link_error_printf will be called to emit error messages for each function
- * that is in the recursion cycle.  In addition,
- * \c gl_shader_program::LinkStatus will be set to false.
- */
-void
-detect_recursion_linked(struct gl_shader_program *prog,
-			exec_list *instructions);
 
 /**
  * Make a clone of each IR instruction in a list

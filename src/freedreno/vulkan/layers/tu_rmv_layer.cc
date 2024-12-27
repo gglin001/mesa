@@ -5,6 +5,7 @@
 
 #include "tu_device.h"
 #include "tu_entrypoints.h"
+#include "tu_queue.h"
 #include "tu_rmv.h"
 #include "vk_common_entrypoints.h"
 #include "wsi_common_entrypoints.h"
@@ -12,7 +13,7 @@
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_rmv_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
 {
-   TU_FROM_HANDLE(tu_queue, queue, _queue);
+   VK_FROM_HANDLE(tu_queue, queue, _queue);
    struct tu_device *device = queue->device;
 
    VkResult result = wsi_QueuePresentKHR(_queue, pPresentInfo);
@@ -28,7 +29,7 @@ VKAPI_ATTR VkResult VKAPI_CALL
 tu_rmv_FlushMappedMemoryRanges(VkDevice _device, uint32_t memoryRangeCount,
                                const VkMappedMemoryRange *pMemoryRanges)
 {
-   TU_FROM_HANDLE(tu_device, device, _device);
+   VK_FROM_HANDLE(tu_device, device, _device);
 
    VkResult result = tu_FlushMappedMemoryRanges(_device, memoryRangeCount,
                                                 pMemoryRanges);
@@ -43,7 +44,7 @@ VKAPI_ATTR VkResult VKAPI_CALL
 tu_rmv_InvalidateMappedMemoryRanges(VkDevice _device, uint32_t memoryRangeCount,
                                     const VkMappedMemoryRange *pMemoryRanges)
 {
-   TU_FROM_HANDLE(tu_device, device, _device);
+   VK_FROM_HANDLE(tu_device, device, _device);
 
    VkResult result = tu_InvalidateMappedMemoryRanges(_device, memoryRangeCount,
                                                      pMemoryRanges);
@@ -58,7 +59,7 @@ VkResult tu_rmv_SetDebugUtilsObjectNameEXT(VkDevice _device,
                                            const VkDebugUtilsObjectNameInfoEXT* pNameInfo)
 {
    assert(pNameInfo->sType == VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT);
-   TU_FROM_HANDLE(tu_device, device, _device);
+   VK_FROM_HANDLE(tu_device, device, _device);
 
    VkResult result = vk_common_SetDebugUtilsObjectNameEXT(_device, pNameInfo);
    if (result != VK_SUCCESS || !device->vk.memory_trace_data.is_enabled)

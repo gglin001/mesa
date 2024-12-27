@@ -6,24 +6,7 @@
  * Copyright 2008 Corbin Simpson <MostAwesomeDude@gmail.com>
  * Copyright 2010 Marek Olšák <maraeo@gmail.com>
  *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #ifndef RADV_RADEON_WINSYS_H
@@ -40,8 +23,6 @@
 #include "amd_family.h"
 
 struct radeon_info;
-struct ac_surf_info;
-struct radeon_surf;
 struct vk_sync_type;
 struct vk_sync_wait;
 struct vk_sync_signal;
@@ -237,7 +218,7 @@ enum radv_cs_dump_type {
 struct radeon_winsys {
    void (*destroy)(struct radeon_winsys *ws);
 
-   void (*query_info)(struct radeon_winsys *ws, struct radeon_info *info);
+   void (*query_info)(struct radeon_winsys *ws, struct radeon_info *gpu_info);
 
    uint64_t (*query_value)(struct radeon_winsys *ws, enum radeon_value_id value);
 
@@ -306,23 +287,24 @@ struct radeon_winsys {
 
    void (*cs_execute_secondary)(struct radeon_cmdbuf *parent, struct radeon_cmdbuf *child, bool allow_ib2);
 
-   void (*cs_execute_ib)(struct radeon_cmdbuf *cs, struct radeon_winsys_bo *bo, const uint64_t offset,
-                         const uint32_t cdw, const bool predicate);
+   void (*cs_execute_ib)(struct radeon_cmdbuf *cs, struct radeon_winsys_bo *bo, const uint64_t va, const uint32_t cdw,
+                         const bool predicate);
+
+   void (*cs_chain_dgc_ib)(struct radeon_cmdbuf *cs, uint64_t va, uint32_t cdw, uint64_t trailer_va,
+                           const bool predicate);
 
    void (*cs_dump)(struct radeon_cmdbuf *cs, FILE *file, const int *trace_ids, int trace_id_count,
                    enum radv_cs_dump_type type);
 
    void (*cs_annotate)(struct radeon_cmdbuf *cs, const char *marker);
 
+   void (*cs_pad)(struct radeon_cmdbuf *cs, unsigned leave_dw_space);
+
    void (*dump_bo_ranges)(struct radeon_winsys *ws, FILE *file);
 
    void (*dump_bo_log)(struct radeon_winsys *ws, FILE *file);
 
-   int (*surface_init)(struct radeon_winsys *ws, const struct ac_surf_info *surf_info, struct radeon_surf *surf);
-
    int (*get_fd)(struct radeon_winsys *ws);
-
-   struct ac_addrlib *(*get_addrlib)(struct radeon_winsys *ws);
 
    const struct vk_sync_type *const *(*get_sync_types)(struct radeon_winsys *ws);
 };
@@ -332,6 +314,13 @@ radeon_emit(struct radeon_cmdbuf *cs, uint32_t value)
 {
    assert(cs->cdw < cs->reserved_dw);
    cs->buf[cs->cdw++] = value;
+}
+
+static inline void
+radeon_emit_direct(struct radeon_cmdbuf *cs, uint32_t offset, uint32_t value)
+{
+   assert(offset < cs->reserved_dw);
+   cs->buf[offset] = value;
 }
 
 static inline void

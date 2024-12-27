@@ -311,6 +311,9 @@ enum quniform_contents {
          */
         QUNIFORM_WORK_GROUP_BASE,
 
+        /* Workgroup size for variable workgroup support */
+        QUNIFORM_WORK_GROUP_SIZE,
+
         /**
          * Returns the the offset of the scratch buffer for register spilling.
          */
@@ -324,6 +327,13 @@ enum quniform_contents {
          * L2T cache will effectively be the shared memory area.
          */
         QUNIFORM_SHARED_OFFSET,
+
+        /**
+         * OpenCL variable shared memory
+         *
+         * This will only be used when the shader declares variable_shared_memory.
+         */
+        QUNIFORM_SHARED_SIZE,
 
         /**
          * Returns the number of layers in the framebuffer.
@@ -416,6 +426,7 @@ struct v3d_fs_key {
         bool msaa;
         bool sample_alpha_to_coverage;
         bool sample_alpha_to_one;
+        bool can_earlyz_with_discard;
         /* Mask of which color render targets are present. */
         uint8_t cbufs;
         uint8_t swap_color_rb;
@@ -603,8 +614,13 @@ struct v3d_ra_node_info {
                 bool is_program_end;
                 bool unused;
 
+                /* If this node may have an allocation conflict with a
+                 * payload register.
+                 */
+                bool payload_conflict;
+
                 /* V3D 7.x */
-                bool is_ldunif_dst;
+                bool try_rf0;
         } *info;
         uint32_t alloc_count;
 };
@@ -981,6 +997,8 @@ struct v3d_vs_prog_data {
         /* Value to be programmed in VCM_CACHE_SIZE. */
         uint8_t vcm_cache_size;
 
+        bool writes_psiz;
+
         /* Maps the nir->data.location to its
          * nir->data.driver_location. In general we are using the
          * driver location as index (like vattr_sizes above), so this
@@ -1190,7 +1208,9 @@ bool v3d_nir_lower_logic_ops(nir_shader *s, struct v3d_compile *c);
 bool v3d_nir_lower_scratch(nir_shader *s);
 bool v3d_nir_lower_txf_ms(nir_shader *s);
 bool v3d_nir_lower_image_load_store(nir_shader *s, struct v3d_compile *c);
+bool v3d_nir_lower_global_2x32(nir_shader *s);
 bool v3d_nir_lower_load_store_bitsize(nir_shader *s);
+bool v3d_nir_lower_algebraic(struct nir_shader *shader, const struct v3d_compile *c);
 
 void v3d_vir_emit_tex(struct v3d_compile *c, nir_tex_instr *instr);
 void v3d_vir_emit_image_load_store(struct v3d_compile *c,
@@ -1525,6 +1545,36 @@ vir_BRANCH(struct v3d_compile *c, enum v3d_qpu_branch_cond cond)
 {
         /* The actual uniform_data value will be set at scheduling time */
         return vir_emit_nondef(c, vir_branch_inst(c, cond));
+}
+
+struct v3d_double_buffer_score {
+        uint32_t geom;
+        uint32_t render;
+};
+
+void
+v3d_update_double_buffer_score(uint32_t vertex_count,
+                               uint32_t vs_qpu_size,
+                               uint32_t fs_qpu_size,
+                               struct v3d_prog_data *vs,
+                               struct v3d_prog_data *fs,
+                               struct v3d_double_buffer_score *score);
+
+static inline bool
+v3d_double_buffer_score_ok(struct v3d_double_buffer_score *score)
+{
+        /* Double buffer decreases tile size, which increases
+         * VS invocations so too much geometry is not good.
+         */
+        if (score->geom > 200000)
+                return false;
+
+        /* We want enough rendering work to be able to hide
+         * latency from tile stores.
+         */
+        if (score->render < 200)
+                return false;
+        return true;
 }
 
 #define vir_for_each_block(block, c)                                    \

@@ -141,7 +141,8 @@ st_make_bitmap_texture(struct gl_context *ctx, GLsizei width, GLsizei height,
     */
    pt = st_texture_create(st, st->internal_target, st->bitmap.tex_format,
                           0, width, height, 1, 1, 0,
-                          PIPE_BIND_SAMPLER_VIEW, false);
+                          PIPE_BIND_SAMPLER_VIEW, false,
+                          PIPE_COMPRESSION_FIXED_RATE_NONE);
    if (!pt) {
       _mesa_unmap_pbo_source(ctx, unpack);
       return NULL;
@@ -261,7 +262,7 @@ setup_render_state(struct gl_context *ctx,
    st->util_velems.count = 3;
    cso_set_vertex_elements(cso, &st->util_velems);
 
-   cso_set_stream_outputs(st->cso_context, 0, NULL, NULL);
+   cso_set_stream_outputs(st->cso_context, 0, NULL, NULL, 0);
 }
 
 
@@ -369,7 +370,8 @@ reset_cache(struct st_context *st)
                                       BITMAP_CACHE_WIDTH, BITMAP_CACHE_HEIGHT,
                                       1, 1, 0,
                                       PIPE_BIND_SAMPLER_VIEW,
-                                      false);
+                                      false,
+                                      PIPE_COMPRESSION_FIXED_RATE_NONE);
 }
 
 

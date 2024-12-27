@@ -4,24 +4,8 @@
  *
  * Based on u_format.h which is:
  * Copyright 2009-2010 VMware, Inc.
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
  *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #ifndef RADV_FORMATS_H
@@ -31,7 +15,24 @@
 #include <util/macros.h>
 #include <vulkan/vulkan.h>
 
+#include "amd_family.h"
+
 #include "vk_format.h"
+
+static inline enum pipe_format
+radv_format_to_pipe_format(VkFormat vkformat)
+{
+   switch (vkformat) {
+   case VK_FORMAT_R10X6_UNORM_PACK16:
+   case VK_FORMAT_R12X4_UNORM_PACK16:
+      return PIPE_FORMAT_R16_UNORM;
+   case VK_FORMAT_R10X6G10X6_UNORM_2PACK16:
+   case VK_FORMAT_R12X4G12X4_UNORM_2PACK16:
+      return PIPE_FORMAT_R16G16_UNORM;
+   default:
+      return vk_format_to_pipe_format(vkformat);
+   }
+}
 
 /**
  * Return the index of the first non-void channel
@@ -40,7 +41,7 @@
 static inline int
 vk_format_get_first_non_void_channel(VkFormat format)
 {
-   return util_format_get_first_non_void_channel(vk_format_to_pipe_format(format));
+   return util_format_get_first_non_void_channel(radv_format_to_pipe_format(format));
 }
 
 static inline enum pipe_swizzle
@@ -75,7 +76,7 @@ vk_format_compose_swizzles(const VkComponentMapping *mapping, const unsigned cha
 static inline bool
 vk_format_is_subsampled(VkFormat format)
 {
-   return util_format_is_subsampled_422(vk_format_to_pipe_format(format));
+   return util_format_is_subsampled_422(radv_format_to_pipe_format(format));
 }
 
 static inline VkFormat
@@ -118,39 +119,28 @@ vk_format_no_srgb(VkFormat format)
    }
 }
 
-static inline VkFormat
-vk_to_non_srgb_format(VkFormat format)
-{
-   switch (format) {
-   case VK_FORMAT_R8_SRGB:
-      return VK_FORMAT_R8_UNORM;
-   case VK_FORMAT_R8G8_SRGB:
-      return VK_FORMAT_R8G8_UNORM;
-   case VK_FORMAT_R8G8B8_SRGB:
-      return VK_FORMAT_R8G8B8_UNORM;
-   case VK_FORMAT_B8G8R8_SRGB:
-      return VK_FORMAT_B8G8R8_UNORM;
-   case VK_FORMAT_R8G8B8A8_SRGB:
-      return VK_FORMAT_R8G8B8A8_UNORM;
-   case VK_FORMAT_B8G8R8A8_SRGB:
-      return VK_FORMAT_B8G8R8A8_UNORM;
-   case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
-      return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
-   default:
-      return format;
-   }
-}
+struct radv_physical_device;
 
-static inline unsigned
-vk_format_get_plane_width(VkFormat format, unsigned plane, unsigned width)
-{
-   return util_format_get_plane_width(vk_format_to_pipe_format(format), plane, width);
-}
+uint32_t radv_translate_buffer_numformat(const struct util_format_description *desc, int first_non_void);
 
-static inline unsigned
-vk_format_get_plane_height(VkFormat format, unsigned plane, unsigned height)
-{
-   return util_format_get_plane_height(vk_format_to_pipe_format(format), plane, height);
-}
+uint32_t radv_translate_tex_dataformat(const struct radv_physical_device *pdev,
+                                       const struct util_format_description *desc, int first_non_void);
+
+uint32_t radv_translate_tex_numformat(const struct util_format_description *desc, int first_non_void);
+
+bool radv_is_atomic_format_supported(VkFormat format);
+
+bool radv_is_storage_image_format_supported(const struct radv_physical_device *dev, VkFormat format);
+
+bool radv_is_buffer_format_supported(VkFormat format, bool *scaled);
+
+bool radv_is_colorbuffer_format_supported(const struct radv_physical_device *pdev, VkFormat format);
+
+bool radv_is_format_emulated(const struct radv_physical_device *pdev, VkFormat format);
+
+bool radv_format_pack_clear_color(VkFormat format, uint32_t clear_vals[2], VkClearColorValue *value);
+
+bool radv_dcc_formats_compatible(enum amd_gfx_level gfx_level, VkFormat format1, VkFormat format2,
+                                 bool *sign_reinterpret);
 
 #endif /* RADV_FORMATS_H */

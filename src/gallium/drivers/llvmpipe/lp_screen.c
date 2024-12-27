@@ -43,6 +43,7 @@
 #include "util/os_misc.h"
 #include "util/os_time.h"
 #include "util/u_helpers.h"
+#include "util/anon_file.h"
 #include "lp_texture.h"
 #include "lp_fence.h"
 #include "lp_jit.h"
@@ -59,6 +60,10 @@
 
 #include "nir.h"
 
+#ifdef HAVE_LIBDRM
+#include <xf86drm.h>
+#include <fcntl.h>
+#endif
 
 int LP_DEBUG = 0;
 
@@ -118,7 +123,26 @@ llvmpipe_get_name(struct pipe_screen *screen)
 static int
 llvmpipe_get_param(struct pipe_screen *screen, enum pipe_cap param)
 {
+#ifdef HAVE_LIBDRM
+   struct llvmpipe_screen *lscreen = llvmpipe_screen(screen);
+#endif
    switch (param) {
+   case PIPE_CAP_DMABUF:
+#ifdef HAVE_LIBDRM
+      if (lscreen->winsys->get_fd)
+         return DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
+#ifdef HAVE_LINUX_UDMABUF_H
+      if (lscreen->udmabuf_fd != -1)
+         return DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
+      else
+         return DRM_PRIME_CAP_IMPORT;
+#endif
+#endif
+      return 0;
+#if defined(HAVE_LIBDRM) && defined(HAVE_LINUX_UDMABUF_H)
+   case PIPE_CAP_NATIVE_FENCE_FD:
+      return lscreen->dummy_sync_fd != -1;
+#endif
    case PIPE_CAP_NPOT_TEXTURES:
    case PIPE_CAP_MIXED_FRAMEBUFFER_SIZES:
    case PIPE_CAP_MIXED_COLOR_DEPTH_BITS:
@@ -127,6 +151,8 @@ llvmpipe_get_param(struct pipe_screen *screen, enum pipe_cap param)
    case PIPE_CAP_FRAGMENT_SHADER_TEXTURE_LOD:
    case PIPE_CAP_FRAGMENT_SHADER_DERIVATIVES:
       return 1;
+   case PIPE_CAP_MULTIVIEW:
+      return 2;
    case PIPE_CAP_MAX_DUAL_SOURCE_RENDER_TARGETS:
       return 1;
    case PIPE_CAP_MAX_STREAM_OUTPUT_BUFFERS:
@@ -364,6 +390,8 @@ llvmpipe_get_param(struct pipe_screen *screen, enum pipe_cap param)
       return LLVM_VERSION_MAJOR >= 15;
    case PIPE_CAP_NIR_IMAGES_AS_DEREF:
       return 0;
+   case PIPE_CAP_ALPHA_TO_COVERAGE_DITHER_CONTROL:
+      return 1;
    default:
       return u_pipe_screen_get_param_defaults(screen, param);
    }
@@ -380,8 +408,7 @@ llvmpipe_get_shader_param(struct pipe_screen *screen,
    case PIPE_SHADER_COMPUTE:
       if ((lscreen->allow_cl) && param == PIPE_SHADER_CAP_SUPPORTED_IRS)
          return ((1 << PIPE_SHADER_IR_TGSI) |
-                 (1 << PIPE_SHADER_IR_NIR) |
-                 (1 << PIPE_SHADER_IR_NIR_SERIALIZED));
+                 (1 << PIPE_SHADER_IR_NIR));
       FALLTHROUGH;
    case PIPE_SHADER_MESH:
    case PIPE_SHADER_TASK:
@@ -410,6 +437,11 @@ llvmpipe_get_shader_param(struct pipe_screen *screen,
             return PIPE_MAX_SHADER_SAMPLER_VIEWS;
          else
             return 0;
+      case PIPE_SHADER_CAP_MAX_CONST_BUFFERS:
+         if (debug_get_bool_option("DRAW_USE_LLVM", false))
+            return LP_MAX_TGSI_CONST_BUFFERS;
+         else
+            return draw_get_shader_param(shader, param);
       default:
          return draw_get_shader_param(shader, param);
       }
@@ -578,7 +610,15 @@ static void
 llvmpipe_get_device_uuid(struct pipe_screen *pscreen, char *uuid)
 {
    memset(uuid, 0, PIPE_UUID_SIZE);
+#if defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunknown-warning-option"
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif /* __clang__ */
    snprintf(uuid, PIPE_UUID_SIZE, "mesa" PACKAGE_VERSION);
+#if defined(__clang__)
+#pragma GCC diagnostic pop
+#endif /* __clang__ */
 }
 
 
@@ -623,7 +663,6 @@ static const struct nir_shader_compiler_options gallivm_nir_options = {
    .lower_int64_options = nir_lower_imul_2x32_64,
    .lower_doubles_options = nir_lower_dround_even,
    .max_unroll_iterations = 32,
-   .use_interpolated_input_intrinsics = true,
    .lower_to_scalar = true,
    .lower_uniforms_to_ubo = true,
    .lower_vector_cmp = true,
@@ -631,15 +670,18 @@ static const struct nir_shader_compiler_options gallivm_nir_options = {
    .support_16bit_alu = true,
    .lower_fisnormal = true,
    .lower_fquantize2f16 = true,
+   .lower_fminmax_signed_zero = true,
    .driver_functions = true,
+   .scalarize_ddx = true,
+   .support_indirect_inputs = (uint8_t)BITFIELD_MASK(PIPE_SHADER_TYPES),
+   .support_indirect_outputs = (uint8_t)BITFIELD_MASK(PIPE_SHADER_TYPES),
 };
 
 
 static char *
 llvmpipe_finalize_nir(struct pipe_screen *screen,
-                      void *nirptr)
+                      struct nir_shader *nir)
 {
-   struct nir_shader *nir = (struct nir_shader *)nirptr;
    lp_build_opt_nir(nir);
    return NULL;
 }
@@ -831,11 +873,20 @@ llvmpipe_is_format_supported(struct pipe_screen *_screen,
        format != PIPE_FORMAT_ETC1_RGB8)
       return false;
 
+   /* planar not supported natively */
    if ((format_desc->layout == UTIL_FORMAT_LAYOUT_SUBSAMPLED ||
         format_desc->layout == UTIL_FORMAT_LAYOUT_PLANAR2 ||
         format_desc->layout == UTIL_FORMAT_LAYOUT_PLANAR3) &&
        target == PIPE_BUFFER)
       return false;
+
+   if (format_desc->colorspace == UTIL_FORMAT_COLORSPACE_YUV) {
+      if (format == PIPE_FORMAT_UYVY ||
+          format == PIPE_FORMAT_YUYV ||
+          format == PIPE_FORMAT_NV12)
+         return true;
+      return false;
+   }
 
    /*
     * Everything can be supported by u_format
@@ -888,6 +939,17 @@ llvmpipe_destroy_screen(struct pipe_screen *_screen)
 
    glsl_type_singleton_decref();
 
+#if defined(HAVE_LIBDRM) && defined(HAVE_LINUX_UDMABUF_H)
+   if (screen->udmabuf_fd != -1)
+      close(screen->udmabuf_fd);
+#endif
+
+#if DETECT_OS_LINUX
+   util_vma_heap_finish(&screen->mem_heap);
+
+   close(screen->fd_mem_alloc);
+   mtx_destroy(&screen->mem_mutex);
+#endif
    mtx_destroy(&screen->rast_mutex);
    mtx_destroy(&screen->cs_mutex);
    FREE(screen);
@@ -1125,6 +1187,22 @@ llvmpipe_create_screen(struct sw_winsys *winsys)
                                               screen->num_threads);
    screen->num_threads = MIN2(screen->num_threads, LP_MAX_THREADS);
 
+#if defined(HAVE_LIBDRM) && defined(HAVE_LINUX_UDMABUF_H)
+   screen->udmabuf_fd = open("/dev/udmabuf", O_RDWR);
+   llvmpipe_init_screen_fence_funcs(&screen->base);
+#endif
+
+   uint64_t alignment;
+   if (!os_get_page_size(&alignment))
+      alignment = 256;
+
+#if DETECT_OS_LINUX
+   (void) mtx_init(&screen->mem_mutex, mtx_plain);
+
+   util_vma_heap_init(&screen->mem_heap, alignment, UINT64_MAX - alignment);
+   screen->mem_heap.alloc_high = false;
+   screen->fd_mem_alloc = os_create_anonymous_file(0, "allocation fd");
+#endif
 
    snprintf(screen->renderer_string, sizeof(screen->renderer_string),
             "llvmpipe (LLVM " MESA_LLVM_VERSION_STRING ", %u bits)",

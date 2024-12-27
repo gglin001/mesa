@@ -77,7 +77,7 @@ draw_create_context(struct pipe_context *pipe, void *context,
 
 #if DRAW_LLVM_AVAILABLE
    if (try_llvm && draw_get_option_use_llvm()) {
-      draw->llvm = draw_llvm_create(draw, (LLVMContextRef)context);
+      draw->llvm = draw_llvm_create(draw, (lp_context_ref *)context);
    }
 #endif
 
@@ -370,6 +370,12 @@ draw_set_clip_state(struct draw_context *draw,
    draw_do_flush(draw, DRAW_FLUSH_PARAMETER_CHANGE);
 
    memcpy(&draw->plane[6], clip->ucp, sizeof(clip->ucp));
+}
+
+void
+draw_set_viewmask(struct draw_context *draw, uint8_t viewmask)
+{
+   draw->viewmask = viewmask;
 }
 
 
@@ -1265,7 +1271,10 @@ draw_stats_clipper_primitives(struct draw_context *draw,
 bool
 draw_will_inject_frontface(const struct draw_context *draw)
 {
-   unsigned reduced_prim = u_reduced_prim(draw->pt.prim);
+   /* The geometry shader can change the primitive type. */
+   enum mesa_prim prim = draw->gs.geometry_shader ?
+      draw->gs.geometry_shader->output_primitive : draw->pt.prim;
+   enum mesa_prim reduced_prim = u_reduced_prim(prim);
    const struct pipe_rasterizer_state *rast = draw->rasterizer;
 
    if (reduced_prim != MESA_PRIM_TRIANGLES) {

@@ -397,6 +397,9 @@ generate_compute(struct llvmpipe_context *lp,
    lp_build_coro_add_presplit(coro);
 
    variant->function = function;
+   variant->function_name = MALLOC(strlen(func_name)+1);
+   strcpy(variant->function_name, func_name);
+
 
    for (i = 0; i < CS_ARG_MAX - !is_mesh; ++i) {
       if (LLVMGetTypeKind(arg_types[i]) == LLVMPointerTypeKind) {
@@ -406,8 +409,11 @@ generate_compute(struct llvmpipe_context *lp,
       }
    }
 
-   if (variant->gallivm->cache->data_size)
+   if (variant->gallivm->cache->data_size) {
+      gallivm_stub_func(gallivm, function);
+      gallivm_stub_func(gallivm, coro);
       return;
+   }
 
    context_ptr  = LLVMGetParam(function, CS_ARG_CONTEXT);
    resources_ptr  = LLVMGetParam(function, CS_ARG_RESOURCES);
@@ -443,6 +449,11 @@ generate_compute(struct llvmpipe_context *lp,
 
    lp_build_nir_prepasses(nir);
    struct hash_table *fns = _mesa_pointer_hash_table_create(NULL);
+
+   sampler = lp_llvm_sampler_soa_create(lp_cs_variant_key_samplers(key),
+                                        MAX2(key->nr_samplers,
+                                             key->nr_sampler_views));
+   image = lp_bld_llvm_image_soa_create(lp_cs_variant_key_images(key), key->nr_images);
 
    if (exec_list_length(&nir->functions) > 1) {
       LLVMTypeRef call_context_type = lp_build_cs_func_call_context(gallivm, cs_type.length,
@@ -531,9 +542,15 @@ generate_compute(struct llvmpipe_context *lp,
          params.consts_ptr = lp_jit_resources_constants(gallivm,
                                                         variant->jit_resources_type,
                                                         params.resources_ptr);
+         params.sampler = sampler;
          params.ssbo_ptr = lp_jit_resources_ssbos(gallivm,
                                                   variant->jit_resources_type,
                                                   params.resources_ptr);
+         params.image = image;
+         params.aniso_filter_table = lp_jit_resources_aniso_filter_table(gallivm,
+                                                                         variant->jit_resources_type,
+                                                                         params.resources_ptr);
+
          lp_build_nir_soa_func(gallivm, shader->base.ir.nir,
                                func->impl,
                                &params,
@@ -550,10 +567,6 @@ generate_compute(struct llvmpipe_context *lp,
    builder = gallivm->builder;
    assert(builder);
    LLVMPositionBuilderAtEnd(builder, block);
-   sampler = lp_llvm_sampler_soa_create(lp_cs_variant_key_samplers(key),
-                                        MAX2(key->nr_samplers,
-                                             key->nr_sampler_views));
-   image = lp_bld_llvm_image_soa_create(lp_cs_variant_key_images(key), key->nr_images);
 
    if (is_mesh) {
       LLVMTypeRef output_type = create_mesh_jit_output_type_deref(gallivm);
@@ -728,9 +741,25 @@ generate_compute(struct llvmpipe_context *lp,
       LLVMValueRef block_x_size_vec = lp_build_broadcast_scalar(&bld, block_x_size_arg);
       LLVMValueRef block_y_size_vec = lp_build_broadcast_scalar(&bld, block_y_size_arg);
 
-      system_values.thread_id[0] = LLVMBuildURem(gallivm->builder, invocation_index, block_x_size_vec, "");
-      system_values.thread_id[1] = LLVMBuildUDiv(gallivm->builder, invocation_index, block_x_size_vec, "");
-      system_values.thread_id[1] = LLVMBuildURem(gallivm->builder, system_values.thread_id[1], block_y_size_vec, "");
+      if (nir->info.derivative_group == DERIVATIVE_GROUP_QUADS) {
+         /* x = (invocation_index / 4 * 2 + invocation_index % 2) % block_width */
+         LLVMValueRef quad_x = LLVMBuildAnd(builder, invocation_index, lp_build_const_int_vec(gallivm, bld.type, ~3u), "");
+         quad_x = LLVMBuildUDiv(builder, quad_x, lp_build_const_int_vec(gallivm, bld.type, 2), "");
+         LLVMValueRef quad_sub_x = LLVMBuildURem(builder, invocation_index, lp_build_const_int_vec(gallivm, bld.type, 2), "");
+         system_values.thread_id[0] = LLVMBuildAdd(builder, quad_x, quad_sub_x, "");
+         system_values.thread_id[0] = LLVMBuildURem(builder, system_values.thread_id[0], block_x_size_vec, "");
+         /* y = (invocation_index / block_width / 2 * 2 + (invocation_index / 2) % 2) % block_height */
+         LLVMValueRef quad_y = LLVMBuildUDiv(builder, invocation_index, block_x_size_vec, "");
+         quad_y = LLVMBuildAnd(builder, quad_y, lp_build_const_int_vec(gallivm, bld.type, ~1u), "");
+         LLVMValueRef quad_sub_y = LLVMBuildUDiv(builder, invocation_index, lp_build_const_int_vec(gallivm, bld.type, 2), "");
+         quad_sub_y = LLVMBuildURem(builder, quad_sub_y, lp_build_const_int_vec(gallivm, bld.type, 2), "");
+         system_values.thread_id[1] = LLVMBuildAdd(builder, quad_y, quad_sub_y, "");
+         system_values.thread_id[1] = LLVMBuildURem(builder, system_values.thread_id[1], block_y_size_vec, "");
+      } else {
+         system_values.thread_id[0] = LLVMBuildURem(gallivm->builder, invocation_index, block_x_size_vec, "");
+         system_values.thread_id[1] = LLVMBuildUDiv(gallivm->builder, invocation_index, block_x_size_vec, "");
+         system_values.thread_id[1] = LLVMBuildURem(gallivm->builder, system_values.thread_id[1], block_y_size_vec, "");
+      }
       system_values.thread_id[2] = LLVMBuildUDiv(gallivm->builder, invocation_index, block_x_size_vec, "");
       system_values.thread_id[2] = LLVMBuildUDiv(gallivm->builder, system_values.thread_id[2], block_y_size_vec, "");
 
@@ -921,14 +950,6 @@ llvmpipe_create_compute_state(struct pipe_context *pipe,
 
    if (templ->ir_type == PIPE_SHADER_IR_TGSI) {
       shader->base.ir.nir = tgsi_to_nir(templ->prog, pipe->screen, false);
-   } else if (templ->ir_type == PIPE_SHADER_IR_NIR_SERIALIZED) {
-      struct blob_reader reader;
-      const struct pipe_binary_program_header *hdr = templ->prog;
-
-      blob_reader_init(&reader, hdr->blob, hdr->num_bytes);
-      shader->base.ir.nir = nir_deserialize(NULL, pipe->screen->get_compiler_options(pipe->screen, PIPE_SHADER_IR_NIR, PIPE_SHADER_COMPUTE), &reader);
-
-      pipe->screen->finalize_nir(pipe->screen, shader->base.ir.nir);
    } else if (templ->ir_type == PIPE_SHADER_IR_NIR) {
       shader->base.ir.nir = (struct nir_shader *)templ->prog;
    }
@@ -1006,6 +1027,8 @@ llvmpipe_remove_cs_shader_variant(struct llvmpipe_context *lp,
    lp->nr_cs_variants--;
    lp->nr_cs_instrs -= variant->nr_instrs;
 
+   if(variant->function_name)
+      FREE(variant->function_name);
    FREE(variant);
 }
 
@@ -1234,7 +1257,7 @@ generate_variant(struct llvmpipe_context *lp,
    if (!cached.data_size)
       needs_caching = true;
 
-   variant->gallivm = gallivm_create(module_name, lp->context, &cached);
+   variant->gallivm = gallivm_create(module_name, &lp->context, &cached);
    if (!variant->gallivm) {
       FREE(variant);
       return NULL;
@@ -1262,12 +1285,19 @@ generate_variant(struct llvmpipe_context *lp,
 
    generate_compute(lp, shader, variant);
 
+#if GALLIVM_USE_ORCJIT
+/* module has been moved into ORCJIT after gallivm_compile_module */
+   variant->nr_instrs += lp_build_count_ir_module(variant->gallivm->module);
+
+   gallivm_compile_module(variant->gallivm);
+#else
    gallivm_compile_module(variant->gallivm);
 
    variant->nr_instrs += lp_build_count_ir_module(variant->gallivm->module);
+#endif
 
    variant->jit_function = (lp_jit_cs_func)
-      gallivm_jit_function(variant->gallivm, variant->function);
+      gallivm_jit_function(variant->gallivm, variant->function, variant->function_name);
 
    if (needs_caching) {
       lp_disk_cache_insert_shader(screen, &cached, ir_sha1_cache_key);
@@ -2052,6 +2082,7 @@ lp_mesh_call_draw(struct llvmpipe_context *lp,
 
 static void
 llvmpipe_draw_mesh_tasks(struct pipe_context *pipe,
+                         unsigned drawid_offset,
                          const struct pipe_grid_info *info)
 {
    struct llvmpipe_context *lp = llvmpipe_context(pipe);
@@ -2135,7 +2166,7 @@ llvmpipe_draw_mesh_tasks(struct pipe_context *pipe,
          job_info.payload = payload;
          job_info.payload_stride = payload_stride;
          job_info.work_dim = info->work_dim;
-         job_info.draw_id = dr;
+         job_info.draw_id = dr + drawid_offset;
          job_info.req_local_mem = lp->tss->req_local_mem + info->variable_shared_mem;
          job_info.current = &lp->task_ctx->cs.current;
 
@@ -2169,7 +2200,7 @@ llvmpipe_draw_mesh_tasks(struct pipe_context *pipe,
          job_info.req_local_mem = lp->mhs->req_local_mem + info->variable_shared_mem;
          job_info.current = &lp->mesh_ctx->cs.current;
          job_info.payload_stride = 0;
-         job_info.draw_id = dr;
+         job_info.draw_id = dr + drawid_offset;
          job_info.io_stride = task_out_size;
 
          uint32_t job_strides[3] = { job_info.grid_size[0], job_info.grid_size[1], job_info.grid_size[2] };

@@ -6,6 +6,9 @@
 # FEDORA_X86_64_BUILD_TAG
 
 set -e
+
+. .gitlab-ci/setup-test-env.sh
+
 set -o xtrace
 
 
@@ -27,6 +30,7 @@ EPHEMERAL=(
 DEPS=(
     bindgen
     bison
+    cbindgen
     ccache
     clang-devel
     flex
@@ -47,8 +51,6 @@ DEPS=(
     "pkgconfig(libclc)"
     "pkgconfig(libelf)"
     "pkgconfig(libglvnd)"
-    "pkgconfig(libomxil-bellagio)"
-    "pkgconfig(libselinux)"
     "pkgconfig(libva)"
     "pkgconfig(pciaccess)"
     "pkgconfig(vdpau)"
@@ -75,7 +77,10 @@ DEPS=(
     python-unversioned-command
     python3-devel
     python3-mako
+    python3-packaging
     python3-ply
+    python3-pycparser
+    python3-yaml
     rust-packaging
     vulkan-headers
     spirv-tools-devel
@@ -99,8 +104,7 @@ tar -xvf $XORGMACROS_VERSION.tar.bz2 && rm $XORGMACROS_VERSION.tar.bz2
 cd $XORGMACROS_VERSION; ./configure; make install; cd ..
 rm -rf $XORGMACROS_VERSION
 
-# We need at least 1.3.1 for rusticl
-pip install meson==1.3.1
+. .gitlab-ci/container/install-meson.sh
 
 . .gitlab-ci/container/build-mold.sh
 

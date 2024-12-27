@@ -15,38 +15,39 @@ use rusticl_proc_macros::cl_entrypoint;
 use rusticl_proc_macros::cl_info_entrypoint;
 
 use std::cmp;
-use std::mem::{self, MaybeUninit};
+use std::ffi::CStr;
+use std::mem;
 use std::os::raw::c_void;
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
 
-#[cl_info_entrypoint(cl_get_kernel_info)]
-impl CLInfo<cl_kernel_info> for cl_kernel {
-    fn query(&self, q: cl_kernel_info, _: &[u8]) -> CLResult<Vec<MaybeUninit<u8>>> {
+#[cl_info_entrypoint(clGetKernelInfo)]
+unsafe impl CLInfo<cl_kernel_info> for cl_kernel {
+    fn query(&self, q: cl_kernel_info, v: CLInfoValue) -> CLResult<CLInfoRes> {
         let kernel = Kernel::ref_from_raw(*self)?;
-        Ok(match q {
-            CL_KERNEL_ATTRIBUTES => cl_prop::<&str>(&kernel.kernel_info.attributes_string),
+        match q {
+            CL_KERNEL_ATTRIBUTES => v.write::<&str>(&kernel.kernel_info.attributes_string),
             CL_KERNEL_CONTEXT => {
                 let ptr = Arc::as_ptr(&kernel.prog.context);
-                cl_prop::<cl_context>(cl_context::from_ptr(ptr))
+                v.write::<cl_context>(cl_context::from_ptr(ptr))
             }
-            CL_KERNEL_FUNCTION_NAME => cl_prop::<&str>(&kernel.name),
-            CL_KERNEL_NUM_ARGS => cl_prop::<cl_uint>(kernel.kernel_info.args.len() as cl_uint),
+            CL_KERNEL_FUNCTION_NAME => v.write::<&str>(&kernel.name),
+            CL_KERNEL_NUM_ARGS => v.write::<cl_uint>(kernel.kernel_info.args.len() as cl_uint),
             CL_KERNEL_PROGRAM => {
                 let ptr = Arc::as_ptr(&kernel.prog);
-                cl_prop::<cl_program>(cl_program::from_ptr(ptr))
+                v.write::<cl_program>(cl_program::from_ptr(ptr))
             }
-            CL_KERNEL_REFERENCE_COUNT => cl_prop::<cl_uint>(Kernel::refcnt(*self)?),
+            CL_KERNEL_REFERENCE_COUNT => v.write::<cl_uint>(Kernel::refcnt(*self)?),
             // CL_INVALID_VALUE if param_name is not one of the supported values
-            _ => return Err(CL_INVALID_VALUE),
-        })
+            _ => Err(CL_INVALID_VALUE),
+        }
     }
 }
 
-#[cl_info_entrypoint(cl_get_kernel_arg_info)]
-impl CLInfoObj<cl_kernel_arg_info, cl_uint> for cl_kernel {
-    fn query(&self, idx: cl_uint, q: cl_kernel_arg_info) -> CLResult<Vec<MaybeUninit<u8>>> {
+#[cl_info_entrypoint(clGetKernelArgInfo)]
+unsafe impl CLInfoObj<cl_kernel_arg_info, cl_uint> for cl_kernel {
+    fn query(&self, idx: cl_uint, q: cl_kernel_arg_info, v: CLInfoValue) -> CLResult<CLInfoRes> {
         let kernel = Kernel::ref_from_raw(*self)?;
 
         // CL_INVALID_ARG_INDEX if arg_index is not a valid argument index.
@@ -54,31 +55,40 @@ impl CLInfoObj<cl_kernel_arg_info, cl_uint> for cl_kernel {
             return Err(CL_INVALID_ARG_INDEX);
         }
 
-        Ok(match *q {
+        match *q {
             CL_KERNEL_ARG_ACCESS_QUALIFIER => {
-                cl_prop::<cl_kernel_arg_access_qualifier>(kernel.access_qualifier(idx))
+                v.write::<cl_kernel_arg_access_qualifier>(kernel.access_qualifier(idx))
             }
             CL_KERNEL_ARG_ADDRESS_QUALIFIER => {
-                cl_prop::<cl_kernel_arg_address_qualifier>(kernel.address_qualifier(idx))
+                v.write::<cl_kernel_arg_address_qualifier>(kernel.address_qualifier(idx))
             }
-            CL_KERNEL_ARG_NAME => cl_prop::<&str>(kernel.arg_name(idx)),
-            CL_KERNEL_ARG_TYPE_NAME => cl_prop::<&str>(kernel.arg_type_name(idx)),
+            CL_KERNEL_ARG_NAME => v.write::<&CStr>(
+                kernel
+                    .arg_name(idx)
+                    .ok_or(CL_KERNEL_ARG_INFO_NOT_AVAILABLE)?,
+            ),
+            CL_KERNEL_ARG_TYPE_NAME => v.write::<&CStr>(
+                kernel
+                    .arg_type_name(idx)
+                    .ok_or(CL_KERNEL_ARG_INFO_NOT_AVAILABLE)?,
+            ),
             CL_KERNEL_ARG_TYPE_QUALIFIER => {
-                cl_prop::<cl_kernel_arg_type_qualifier>(kernel.type_qualifier(idx))
+                v.write::<cl_kernel_arg_type_qualifier>(kernel.type_qualifier(idx))
             }
             // CL_INVALID_VALUE if param_name is not one of the supported values
-            _ => return Err(CL_INVALID_VALUE),
-        })
+            _ => Err(CL_INVALID_VALUE),
+        }
     }
 }
 
-#[cl_info_entrypoint(cl_get_kernel_work_group_info)]
-impl CLInfoObj<cl_kernel_work_group_info, cl_device_id> for cl_kernel {
+#[cl_info_entrypoint(clGetKernelWorkGroupInfo)]
+unsafe impl CLInfoObj<cl_kernel_work_group_info, cl_device_id> for cl_kernel {
     fn query(
         &self,
         dev: cl_device_id,
         q: cl_kernel_work_group_info,
-    ) -> CLResult<Vec<MaybeUninit<u8>>> {
+        v: CLInfoValue,
+    ) -> CLResult<CLInfoRes> {
         let kernel = Kernel::ref_from_raw(*self)?;
 
         // CL_INVALID_DEVICE [..] if device is NULL but there is more than one device associated with kernel.
@@ -97,21 +107,21 @@ impl CLInfoObj<cl_kernel_work_group_info, cl_device_id> for cl_kernel {
             return Err(CL_INVALID_DEVICE);
         }
 
-        Ok(match *q {
-            CL_KERNEL_COMPILE_WORK_GROUP_SIZE => cl_prop::<[usize; 3]>(kernel.work_group_size()),
-            CL_KERNEL_LOCAL_MEM_SIZE => cl_prop::<cl_ulong>(kernel.local_mem_size(dev)),
+        match *q {
+            CL_KERNEL_COMPILE_WORK_GROUP_SIZE => v.write::<[usize; 3]>(kernel.work_group_size()),
+            CL_KERNEL_LOCAL_MEM_SIZE => v.write::<cl_ulong>(kernel.local_mem_size(dev)),
             CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE => {
-                cl_prop::<usize>(kernel.preferred_simd_size(dev))
+                v.write::<usize>(kernel.preferred_simd_size(dev))
             }
-            CL_KERNEL_PRIVATE_MEM_SIZE => cl_prop::<cl_ulong>(kernel.priv_mem_size(dev)),
-            CL_KERNEL_WORK_GROUP_SIZE => cl_prop::<usize>(kernel.max_threads_per_block(dev)),
+            CL_KERNEL_PRIVATE_MEM_SIZE => v.write::<cl_ulong>(kernel.priv_mem_size(dev)),
+            CL_KERNEL_WORK_GROUP_SIZE => v.write::<usize>(kernel.max_threads_per_block(dev)),
             // CL_INVALID_VALUE if param_name is not one of the supported values
-            _ => return Err(CL_INVALID_VALUE),
-        })
+            _ => Err(CL_INVALID_VALUE),
+        }
     }
 }
 
-impl CLInfoObj<cl_kernel_sub_group_info, (cl_device_id, usize, *const c_void, usize)>
+unsafe impl CLInfoObj<cl_kernel_sub_group_info, (cl_device_id, usize, *const c_void, usize)>
     for cl_kernel
 {
     fn query(
@@ -123,7 +133,8 @@ impl CLInfoObj<cl_kernel_sub_group_info, (cl_device_id, usize, *const c_void, us
             usize,
         ),
         q: cl_program_build_info,
-    ) -> CLResult<Vec<MaybeUninit<u8>>> {
+        v: CLInfoValue,
+    ) -> CLResult<CLInfoRes> {
         let kernel = Kernel::ref_from_raw(*self)?;
 
         // CL_INVALID_DEVICE [..] if device is NULL but there is more than one device associated
@@ -174,12 +185,12 @@ impl CLInfoObj<cl_kernel_sub_group_info, (cl_device_id, usize, *const c_void, us
             _ => &[],
         };
 
-        Ok(match q {
+        match q {
             CL_KERNEL_SUB_GROUP_COUNT_FOR_NDRANGE => {
-                cl_prop::<usize>(kernel.subgroups_for_block(dev, input))
+                v.write::<usize>(kernel.subgroups_for_block(dev, input))
             }
             CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE => {
-                cl_prop::<usize>(kernel.subgroup_size_for_block(dev, input))
+                v.write::<usize>(kernel.subgroup_size_for_block(dev, input))
             }
             CL_KERNEL_LOCAL_SIZE_FOR_SUB_GROUP_COUNT => {
                 let subgroups = input[0];
@@ -202,7 +213,7 @@ impl CLInfoObj<cl_kernel_sub_group_info, (cl_device_id, usize, *const c_void, us
                 }
 
                 res.truncate(output_value_size / usize_byte);
-                cl_prop::<Vec<usize>>(res)
+                v.write::<Vec<usize>>(res)
             }
             CL_KERNEL_MAX_NUM_SUB_GROUPS => {
                 let threads = kernel.max_threads_per_block(dev);
@@ -213,13 +224,13 @@ impl CLInfoObj<cl_kernel_sub_group_info, (cl_device_id, usize, *const c_void, us
                     result = cmp::max(result, threads / sgs);
                     result = cmp::min(result, max_groups as usize);
                 }
-                cl_prop::<usize>(result)
+                v.write::<usize>(result)
             }
-            CL_KERNEL_COMPILE_NUM_SUB_GROUPS => cl_prop::<usize>(kernel.num_subgroups()),
-            CL_KERNEL_COMPILE_SUB_GROUP_SIZE_INTEL => cl_prop::<usize>(kernel.subgroup_size()),
+            CL_KERNEL_COMPILE_NUM_SUB_GROUPS => v.write::<usize>(kernel.num_subgroups()),
+            CL_KERNEL_COMPILE_SUB_GROUP_SIZE_INTEL => v.write::<usize>(kernel.subgroup_size()),
             // CL_INVALID_VALUE if param_name is not one of the supported values
-            _ => return Err(CL_INVALID_VALUE),
-        })
+            _ => Err(CL_INVALID_VALUE),
+        }
     }
 }
 
@@ -247,7 +258,7 @@ unsafe fn kernel_work_arr_mut<'a>(arr: *mut usize, work_dim: cl_uint) -> Option<
     }
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreateKernel)]
 fn create_kernel(
     program: cl_program,
     kernel_name: *const ::std::os::raw::c_char,
@@ -260,37 +271,38 @@ fn create_kernel(
         return Err(CL_INVALID_VALUE);
     }
 
+    let build = p.build_info();
     // CL_INVALID_PROGRAM_EXECUTABLE if there is no successfully built executable for program.
-    if p.kernels().is_empty() {
+    if build.kernels().is_empty() {
         return Err(CL_INVALID_PROGRAM_EXECUTABLE);
     }
 
     // CL_INVALID_KERNEL_NAME if kernel_name is not found in program.
-    if !p.kernels().contains(&name) {
+    if !build.kernels().contains(&name) {
         return Err(CL_INVALID_KERNEL_NAME);
     }
 
     // CL_INVALID_KERNEL_DEFINITION if the function definition for __kernel function given by
     // kernel_name such as the number of arguments, the argument types are not the same for all
     // devices for which the program executable has been built.
-    if p.kernel_signatures(&name).len() != 1 {
+    if !p.has_unique_kernel_signatures(&name) {
         return Err(CL_INVALID_KERNEL_DEFINITION);
     }
 
-    Ok(Kernel::new(name, p).into_cl())
+    Ok(Kernel::new(name, Arc::clone(&p), &build).into_cl())
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clRetainKernel)]
 fn retain_kernel(kernel: cl_kernel) -> CLResult<()> {
     Kernel::retain(kernel)
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clReleaseKernel)]
 fn release_kernel(kernel: cl_kernel) -> CLResult<()> {
     Kernel::release(kernel)
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCreateKernelsInProgram)]
 fn create_kernels_in_program(
     program: cl_program,
     num_kernels: cl_uint,
@@ -298,25 +310,26 @@ fn create_kernels_in_program(
     num_kernels_ret: *mut cl_uint,
 ) -> CLResult<()> {
     let p = Program::arc_from_raw(program)?;
+    let build = p.build_info();
 
     // CL_INVALID_PROGRAM_EXECUTABLE if there is no successfully built executable for any device in
     // program.
-    if p.kernels().is_empty() {
+    if build.kernels().is_empty() {
         return Err(CL_INVALID_PROGRAM_EXECUTABLE);
     }
 
     // CL_INVALID_VALUE if kernels is not NULL and num_kernels is less than the number of kernels
     // in program.
-    if !kernels.is_null() && p.kernels().len() > num_kernels as usize {
+    if !kernels.is_null() && build.kernels().len() > num_kernels as usize {
         return Err(CL_INVALID_VALUE);
     }
 
     let mut num_kernels = 0;
-    for name in p.kernels() {
+    for name in build.kernels() {
         // Kernel objects are not created for any __kernel functions in program that do not have the
         // same function definition across all devices for which a program executable has been
         // successfully built.
-        if p.kernel_signatures(&name).len() != 1 {
+        if !p.has_unique_kernel_signatures(name) {
             continue;
         }
 
@@ -325,7 +338,7 @@ fn create_kernels_in_program(
             unsafe {
                 kernels
                     .add(num_kernels as usize)
-                    .write(Kernel::new(name, p.clone()).into_cl());
+                    .write(Kernel::new(name.clone(), p.clone(), &build).into_cl());
             }
         }
         num_kernels += 1;
@@ -334,7 +347,7 @@ fn create_kernels_in_program(
     Ok(())
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clSetKernelArg)]
 fn set_kernel_arg(
     kernel: cl_kernel,
     arg_index: cl_uint,
@@ -365,8 +378,15 @@ fn set_kernel_arg(
                     return Err(CL_INVALID_ARG_SIZE);
                 }
             }
-            _ => {
-                if arg.size != arg_size {
+
+            KernelArgType::Sampler => {
+                if arg_size != std::mem::size_of::<cl_sampler>() {
+                    return Err(CL_INVALID_ARG_SIZE);
+                }
+            }
+
+            KernelArgType::Constant(size) => {
+                if size as usize != arg_size {
                     return Err(CL_INVALID_ARG_SIZE);
                 }
             }
@@ -383,7 +403,7 @@ fn set_kernel_arg(
             }
             // If the argument is of type sampler_t, the arg_value entry must be a pointer to the
             // sampler object.
-            KernelArgType::Constant | KernelArgType::Sampler => {
+            KernelArgType::Constant(_) | KernelArgType::Sampler => {
                 if arg_value.is_null() {
                     return Err(CL_INVALID_ARG_VALUE);
                 }
@@ -397,7 +417,7 @@ fn set_kernel_arg(
                 KernelArgValue::None
             } else {
                 match arg.kind {
-                    KernelArgType::Constant => KernelArgValue::Constant(
+                    KernelArgType::Constant(_) => KernelArgValue::Constant(
                         slice::from_raw_parts(arg_value.cast(), arg_size).to_vec(),
                     ),
                     KernelArgType::MemConstant | KernelArgType::MemGlobal => {
@@ -430,7 +450,7 @@ fn set_kernel_arg(
     //• CL_MAX_SIZE_RESTRICTION_EXCEEDED if the size in bytes of the memory object (if the argument is a memory object) or arg_size (if the argument is declared with local qualifier) exceeds a language- specified maximum size restriction for this argument, such as the MaxByteOffset SPIR-V decoration. This error code is missing before version 2.2.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clSetKernelArgSVMPointer)]
 fn set_kernel_arg_svm_pointer(
     kernel: cl_kernel,
     arg_index: cl_uint,
@@ -461,7 +481,7 @@ fn set_kernel_arg_svm_pointer(
     // CL_INVALID_ARG_VALUE if arg_value specified is not a valid value.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clSetKernelExecInfo)]
 fn set_kernel_exec_info(
     kernel: cl_kernel,
     param_name: cl_kernel_exec_info,
@@ -503,7 +523,7 @@ fn set_kernel_exec_info(
     // CL_INVALID_OPERATION if param_name is CL_KERNEL_EXEC_INFO_SVM_FINE_GRAIN_SYSTEM and param_value is CL_TRUE but no devices in context associated with kernel support fine-grain system SVM allocations.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueNDRangeKernel)]
 fn enqueue_ndrange_kernel(
     command_queue: cl_command_queue,
     kernel: cl_kernel,
@@ -631,7 +651,7 @@ fn enqueue_ndrange_kernel(
     //• CL_INVALID_OPERATION if SVM pointers are passed as arguments to a kernel and the device does not support SVM or if system pointers are passed as arguments to a kernel and/or stored inside SVM allocations passed as kernel arguments and the device does not support fine grain system SVM allocations.
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clEnqueueTask)]
 fn enqueue_task(
     command_queue: cl_command_queue,
     kernel: cl_kernel,
@@ -655,13 +675,13 @@ fn enqueue_task(
     )
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clCloneKernel)]
 fn clone_kernel(source_kernel: cl_kernel) -> CLResult<cl_kernel> {
     let k = Kernel::ref_from_raw(source_kernel)?;
     Ok(Arc::new(k.clone()).into_cl())
 }
 
-#[cl_entrypoint]
+#[cl_entrypoint(clGetKernelSuggestedLocalWorkSizeKHR)]
 fn get_kernel_suggested_local_work_size_khr(
     command_queue: cl_command_queue,
     kernel: cl_kernel,

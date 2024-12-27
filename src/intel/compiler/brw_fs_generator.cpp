@@ -21,7 +21,7 @@
  * IN THE SOFTWARE.
  */
 
-/** @file brw_fs_generator.cpp
+/** @file
  *
  * This file supports generating code from the FS LIR to the actual
  * native instructions.
@@ -64,90 +64,23 @@ brw_math_function(enum opcode op)
    }
 }
 
-
-static enum brw_reg_file
-brw_file_from_reg(fs_reg *reg)
-{
-   switch (reg->file) {
-   case ARF:
-      return BRW_ARCHITECTURE_REGISTER_FILE;
-   case FIXED_GRF:
-   case VGRF:
-      return BRW_GENERAL_REGISTER_FILE;
-   case IMM:
-      return BRW_IMMEDIATE_VALUE;
-   case BAD_FILE:
-   case ATTR:
-   case UNIFORM:
-      unreachable("not reached");
-   }
-   return BRW_ARCHITECTURE_REGISTER_FILE;
-}
-
 static struct brw_reg
-brw_reg_from_fs_reg(const struct intel_device_info *devinfo, fs_inst *inst,
-                    fs_reg *reg, bool compressed)
+normalize_brw_reg_for_encoding(brw_reg *reg)
 {
    struct brw_reg brw_reg;
 
    switch (reg->file) {
-   case VGRF:
-      if (reg->stride == 0) {
-         brw_reg = brw_vec1_reg(brw_file_from_reg(reg), reg->nr, 0);
-      } else {
-         /* From the Haswell PRM:
-          *
-          *  "VertStride must be used to cross GRF register boundaries. This
-          *   rule implies that elements within a 'Width' cannot cross GRF
-          *   boundaries."
-          *
-          * The maximum width value that could satisfy this restriction is:
-          */
-         const unsigned reg_width = REG_SIZE / (reg->stride * type_sz(reg->type));
-
-         /* Because the hardware can only split source regions at a whole
-          * multiple of width during decompression (i.e. vertically), clamp
-          * the value obtained above to the physical execution size of a
-          * single decompressed chunk of the instruction:
-          */
-         const unsigned phys_width = compressed ? inst->exec_size / 2 :
-                                     inst->exec_size;
-
-         const unsigned max_hw_width = 16;
-
-         /* XXX - The equation above is strictly speaking not correct on
-          *       hardware that supports unbalanced GRF writes -- On Gfx9+
-          *       each decompressed chunk of the instruction may have a
-          *       different execution size when the number of components
-          *       written to each destination GRF is not the same.
-          */
-         if (reg->stride > 4) {
-            assert(reg != &inst->dst);
-            assert(reg->stride * type_sz(reg->type) <= REG_SIZE);
-            brw_reg = brw_vecn_reg(1, brw_file_from_reg(reg), reg->nr, 0);
-            brw_reg = stride(brw_reg, reg->stride, 1, 0);
-         } else {
-            const unsigned width = MIN3(reg_width, phys_width, max_hw_width);
-            brw_reg = brw_vecn_reg(width, brw_file_from_reg(reg), reg->nr, 0);
-            brw_reg = stride(brw_reg, width * reg->stride, width, reg->stride);
-         }
-      }
-
-      brw_reg = retype(brw_reg, reg->type);
-      brw_reg = byte_offset(brw_reg, reg->offset);
-      brw_reg.abs = reg->abs;
-      brw_reg.negate = reg->negate;
-      break;
    case ARF:
    case FIXED_GRF:
    case IMM:
       assert(reg->offset == 0);
-      brw_reg = reg->as_brw_reg();
+      brw_reg = *reg;
       break;
    case BAD_FILE:
       /* Probably unused. */
       brw_reg = brw_null_reg();
       break;
+   case VGRF:
    case ATTR:
    case UNIFORM:
       unreachable("not reached");
@@ -241,7 +174,7 @@ fs_generator::generate_send(fs_inst *inst,
    uint32_t ex_desc_imm = inst->ex_desc |
       brw_message_ex_desc(devinfo, inst->ex_mlen);
 
-   if (ex_desc.file != BRW_IMMEDIATE_VALUE || ex_desc.ud || ex_desc_imm ||
+   if (ex_desc.file != IMM || ex_desc.ud || ex_desc_imm ||
        inst->send_ex_desc_scratch) {
       /* If we have any sort of extended descriptor, then we need SENDS.  This
        * also covers the dual-payload case because ex_mlen goes in ex_desc.
@@ -262,27 +195,13 @@ fs_generator::generate_send(fs_inst *inst,
 }
 
 void
-fs_generator::generate_fb_read(fs_inst *inst, struct brw_reg dst,
-                               struct brw_reg payload)
-{
-   assert(inst->size_written % REG_SIZE == 0);
-   struct brw_wm_prog_data *prog_data = brw_wm_prog_data(this->prog_data);
-   /* We assume that render targets start at binding table index 0. */
-   const unsigned surf_index = inst->target;
-
-   gfx9_fb_READ(p, dst, payload, surf_index,
-                inst->header_size, inst->size_written / REG_SIZE,
-                prog_data->persample_dispatch);
-}
-
-void
 fs_generator::generate_mov_indirect(fs_inst *inst,
                                     struct brw_reg dst,
                                     struct brw_reg reg,
                                     struct brw_reg indirect_byte_offset)
 {
-   assert(indirect_byte_offset.type == BRW_REGISTER_TYPE_UD);
-   assert(indirect_byte_offset.file == BRW_GENERAL_REGISTER_FILE);
+   assert(indirect_byte_offset.type == BRW_TYPE_UD);
+   assert(indirect_byte_offset.file == FIXED_GRF);
    assert(!reg.abs && !reg.negate);
 
    /* Gen12.5 adds the following region restriction:
@@ -294,22 +213,22 @@ fs_generator::generate_mov_indirect(fs_inst *inst,
     * unsigned integer type.
     */
    assert(reg.type == dst.type);
-   reg.type = dst.type = brw_reg_type_from_bit_size(type_sz(reg.type) * 8,
-                                                    BRW_REGISTER_TYPE_UD);
+   reg.type = dst.type =
+      brw_type_with_size(BRW_TYPE_UD, brw_type_size_bits(reg.type));
 
    unsigned imm_byte_offset = reg.nr * REG_SIZE + reg.subnr;
 
-   if (indirect_byte_offset.file == BRW_IMMEDIATE_VALUE) {
+   if (indirect_byte_offset.file == IMM) {
       imm_byte_offset += indirect_byte_offset.ud;
 
       reg.nr = imm_byte_offset / REG_SIZE;
       reg.subnr = imm_byte_offset % REG_SIZE;
-      if (type_sz(reg.type) > 4 && !devinfo->has_64bit_float) {
-         brw_MOV(p, subscript(dst, BRW_REGISTER_TYPE_D, 0),
-                    subscript(reg, BRW_REGISTER_TYPE_D, 0));
+      if (brw_type_size_bytes(reg.type) > 4 && !devinfo->has_64bit_int) {
+         brw_MOV(p, subscript(dst, BRW_TYPE_D, 0),
+                    subscript(reg, BRW_TYPE_D, 0));
          brw_set_default_swsb(p, tgl_swsb_null());
-         brw_MOV(p, subscript(dst, BRW_REGISTER_TYPE_D, 1),
-                    subscript(reg, BRW_REGISTER_TYPE_D, 1));
+         brw_MOV(p, subscript(dst, BRW_TYPE_D, 1),
+                    subscript(reg, BRW_TYPE_D, 1));
       } else {
          brw_MOV(p, dst, reg);
       }
@@ -330,7 +249,7 @@ fs_generator::generate_mov_indirect(fs_inst *inst,
        * In order to get around this, re retype to UW and use a stride.
        */
       indirect_byte_offset =
-         retype(spread(indirect_byte_offset, 2), BRW_REGISTER_TYPE_UW);
+         retype(spread(indirect_byte_offset, 2), BRW_TYPE_UW);
 
       /* There are a number of reasons why we don't use the base offset here.
        * One reason is that the field is only 9 bits which means we can only
@@ -378,29 +297,26 @@ fs_generator::generate_mov_indirect(fs_inst *inst,
       else
          brw_inst_set_no_dd_check(devinfo, insn, use_dep_ctrl);
 
-      if (type_sz(reg.type) > 4 &&
-          (intel_device_info_is_9lp(devinfo) ||
-           !devinfo->has_64bit_float || devinfo->verx10 >= 125)) {
-         /* IVB has an issue (which we found empirically) where it reads two
-          * address register components per channel for indirectly addressed
-          * 64-bit sources.
+      if (brw_type_size_bytes(reg.type) > 4 &&
+          (intel_device_info_is_9lp(devinfo) || !devinfo->has_64bit_int)) {
+         /* From the Cherryview PRM Vol 7. "Register Region Restrictions":
           *
-          * From the Cherryview PRM Vol 7. "Register Region Restrictions":
-          *
-          *    "When source or destination datatype is 64b or operation is
+          *   "When source or destination datatype is 64b or operation is
           *    integer DWord multiply, indirect addressing must not be used."
           *
-          * To work around both of these, we do two integer MOVs insead of one
-          * 64-bit MOV.  Because no double value should ever cross a register
-          * boundary, it's safe to use the immediate offset in the indirect
-          * here to handle adding 4 bytes to the offset and avoid the extra
-          * ADD to the register file.
+          * We may also not support Q/UQ types.
+          *
+          * To work around both of these, we do two integer MOVs instead
+          * of one 64-bit MOV.  Because no double value should ever cross
+          * a register boundary, it's safe to use the immediate offset in
+          * the indirect here to handle adding 4 bytes to the offset and
+          * avoid the extra ADD to the register file.
           */
-         brw_MOV(p, subscript(dst, BRW_REGISTER_TYPE_D, 0),
-                    retype(brw_VxH_indirect(0, 0), BRW_REGISTER_TYPE_D));
+         brw_MOV(p, subscript(dst, BRW_TYPE_D, 0),
+                    retype(brw_VxH_indirect(0, 0), BRW_TYPE_D));
          brw_set_default_swsb(p, tgl_swsb_null());
-         brw_MOV(p, subscript(dst, BRW_REGISTER_TYPE_D, 1),
-                    retype(brw_VxH_indirect(0, 4), BRW_REGISTER_TYPE_D));
+         brw_MOV(p, subscript(dst, BRW_TYPE_D, 1),
+                    retype(brw_VxH_indirect(0, 4), BRW_TYPE_D));
       } else {
          struct brw_reg ind_src = brw_VxH_indirect(0, 0);
 
@@ -415,13 +331,13 @@ fs_generator::generate_shuffle(fs_inst *inst,
                                struct brw_reg src,
                                struct brw_reg idx)
 {
-   assert(src.file == BRW_GENERAL_REGISTER_FILE);
+   assert(src.file == FIXED_GRF);
    assert(!src.abs && !src.negate);
 
    /* Ivy bridge has some strange behavior that makes this a real pain to
     * implement for 64-bit values so we just don't bother.
     */
-   assert(devinfo->has_64bit_float || type_sz(src.type) <= 4);
+   assert(devinfo->has_64bit_float || brw_type_size_bytes(src.type) <= 4);
 
    /* Gen12.5 adds the following region restriction:
     *
@@ -432,31 +348,31 @@ fs_generator::generate_shuffle(fs_inst *inst,
     * unsigned integer type.
     */
    assert(src.type == dst.type);
-   src.type = dst.type = brw_reg_type_from_bit_size(type_sz(src.type) * 8,
-                                                    BRW_REGISTER_TYPE_UD);
+   src.type = dst.type =
+      brw_type_with_size(BRW_TYPE_UD, brw_type_size_bits(src.type));
 
-   /* Because we're using the address register, we're limited to 8-wide
-    * execution on gfx7.  On gfx8, we're limited to 16-wide by the address
-    * register file and 8-wide for 64-bit types.  We could try and make this
-    * instruction splittable higher up in the compiler but that gets weird
-    * because it reads all of the channels regardless of execution size.  It's
-    * easier just to split it here.
+   /* Because we're using the address register, we're limited to 16-wide
+    * by the address register file and 8-wide for 64-bit types.  We could try
+    * and make this instruction splittable higher up in the compiler but that
+    * gets weird because it reads all of the channels regardless of execution
+    * size.  It's easier just to split it here.
     */
-   const unsigned lower_width =
-      element_sz(src) > 4 || element_sz(dst) > 4 ? 8 :
-      MIN2(16, inst->exec_size);
+   unsigned lower_width = MIN2(16, inst->exec_size);
+   if (devinfo->ver < 20 && (element_sz(src) > 4 || element_sz(dst) > 4)) {
+      lower_width = 8;
+   }
 
    brw_set_default_exec_size(p, cvt(lower_width) - 1);
    for (unsigned group = 0; group < inst->exec_size; group += lower_width) {
       brw_set_default_group(p, group);
 
       if ((src.vstride == 0 && src.hstride == 0) ||
-          idx.file == BRW_IMMEDIATE_VALUE) {
+          idx.file == IMM) {
          /* Trivial, the source is already uniform or the index is a constant.
           * We will typically not get here if the optimizer is doing its job,
           * but asserting would be mean.
           */
-         const unsigned i = idx.file == BRW_IMMEDIATE_VALUE ? idx.ud : 0;
+         const unsigned i = idx.file == IMM ? idx.ud : 0;
          struct brw_reg group_src = stride(suboffset(src, i), 0, 1, 0);
          struct brw_reg group_dst = suboffset(dst, group << (dst.hstride - 1));
          brw_MOV(p, group_dst, group_src);
@@ -472,15 +388,15 @@ fs_generator::generate_shuffle(fs_inst *inst,
             group_idx.vstride--;
          }
 
-         assert(type_sz(group_idx.type) <= 4);
-         if (type_sz(group_idx.type) == 4) {
+         assert(brw_type_size_bytes(group_idx.type) <= 4);
+         if (brw_type_size_bytes(group_idx.type) == 4) {
             /* The destination stride of an instruction (in bytes) must be
              * greater than or equal to the size of the rest of the
              * instruction.  Since the address register is of type UW, we
              * can't use a D-type instruction.  In order to get around this,
              * re retype to UW and use a stride.
              */
-            group_idx = retype(spread(group_idx, 2), BRW_REGISTER_TYPE_W);
+            group_idx = retype(spread(group_idx, 2), BRW_TYPE_W);
          }
 
          uint32_t src_start_offset = src.nr * REG_SIZE + src.subnr;
@@ -522,7 +438,7 @@ fs_generator::generate_shuffle(fs_inst *inst,
          /* Take into account the component size and horizontal stride. */
          assert(src.vstride == src.hstride + src.width);
          insn = brw_SHL(p, addr, group_idx,
-                        brw_imm_uw(util_logbase2(type_sz(src.type)) +
+                        brw_imm_uw(util_logbase2(brw_type_size_bytes(src.type)) +
                                    src.hstride - 1));
          if (devinfo->ver >= 12)
             brw_set_default_swsb(p, tgl_swsb_regdist(1));
@@ -547,12 +463,12 @@ fs_generator::generate_quad_swizzle(const fs_inst *inst,
    /* Requires a quad. */
    assert(inst->exec_size >= 4);
 
-   if (src.file == BRW_IMMEDIATE_VALUE ||
+   if (src.file == IMM ||
        has_scalar_region(src)) {
       /* The value is uniform across all channels */
       brw_MOV(p, dst, src);
 
-   } else if (devinfo->ver < 11 && type_sz(src.type) == 4) {
+   } else if (devinfo->ver < 11 && brw_type_size_bytes(src.type) == 4) {
       /* This only works on 8-wide 32-bit values */
       assert(inst->exec_size == 8);
       assert(src.hstride == BRW_HORIZONTAL_STRIDE_1);
@@ -621,31 +537,6 @@ fs_generator::generate_barrier(fs_inst *, struct brw_reg src)
    }
 }
 
-bool
-fs_generator::generate_linterp(fs_inst *inst,
-                               struct brw_reg dst, struct brw_reg *src)
-{
-   /* PLN reads:
-    *                      /   in SIMD16   \
-    *    -----------------------------------
-    *   | src1+0 | src1+1 | src1+2 | src1+3 |
-    *   |-----------------------------------|
-    *   |(x0, x1)|(y0, y1)|(x2, x3)|(y2, y3)|
-    *    -----------------------------------
-    */
-   struct brw_reg delta_x = src[0];
-   struct brw_reg interp = src[1];
-
-   /* nir_lower_interpolation() will do the lowering to MAD instructions for
-    * us on gfx11+
-    */
-   assert(devinfo->ver < 11);
-   assert(devinfo->has_pln);
-
-   brw_PLN(p, dst, interp, delta_x);
-   return false;
-}
-
 /* For OPCODE_DDX and OPCODE_DDY, per channel of output we've got input
  * looking like:
  *
@@ -690,7 +581,7 @@ fs_generator::generate_ddx(const fs_inst *inst,
       width = BRW_WIDTH_4;
    }
 
-   struct brw_reg src0 = byte_offset(src, type_sz(src.type));;
+   struct brw_reg src0 = byte_offset(src, brw_type_size_bytes(src.type));;
    struct brw_reg src1 = src;
 
    src0.vstride = vstride;
@@ -711,7 +602,7 @@ void
 fs_generator::generate_ddy(const fs_inst *inst,
                            struct brw_reg dst, struct brw_reg src)
 {
-   const uint32_t type_size = type_sz(src.type);
+   const uint32_t type_size = brw_type_size_bytes(src.type);
 
    if (inst->opcode == FS_OPCODE_DDY_FINE) {
       /* produce accurate derivatives.
@@ -810,12 +701,16 @@ fs_generator::generate_halt(fs_inst *)
  * information required by either set of opcodes.
  */
 void
-fs_generator::generate_scratch_header(fs_inst *inst, struct brw_reg dst)
+fs_generator::generate_scratch_header(fs_inst *inst,
+                                      struct brw_reg dst,
+                                      struct brw_reg src)
 {
    assert(inst->exec_size == 8 && inst->force_writemask_all);
-   assert(dst.file == BRW_GENERAL_REGISTER_FILE);
+   assert(dst.file == FIXED_GRF);
+   assert(src.file == FIXED_GRF);
+   assert(src.type == BRW_TYPE_UD);
 
-   dst.type = BRW_REGISTER_TYPE_UD;
+   dst.type = BRW_TYPE_UD;
 
    brw_inst *insn = brw_MOV(p, dst, brw_imm_ud(0));
    if (devinfo->ver >= 12)
@@ -825,8 +720,7 @@ fs_generator::generate_scratch_header(fs_inst *inst, struct brw_reg dst)
 
    /* Copy the per-thread scratch space size from g0.3[3:0] */
    brw_set_default_exec_size(p, BRW_EXECUTE_1);
-   insn = brw_AND(p, suboffset(dst, 3),
-                     retype(brw_vec1_grf(0, 3), BRW_REGISTER_TYPE_UD),
+   insn = brw_AND(p, suboffset(dst, 3), component(src, 3),
                      brw_imm_ud(INTEL_MASK(3, 0)));
    if (devinfo->ver < 12) {
       brw_inst_set_no_dd_clear(p->devinfo, insn, true);
@@ -834,8 +728,7 @@ fs_generator::generate_scratch_header(fs_inst *inst, struct brw_reg dst)
    }
 
    /* Copy the scratch base address from g0.5[31:10] */
-   insn = brw_AND(p, suboffset(dst, 5),
-                     retype(brw_vec1_grf(0, 5), BRW_REGISTER_TYPE_UD),
+   insn = brw_AND(p, suboffset(dst, 5), component(src, 5),
                      brw_imm_ud(INTEL_MASK(31, 10)));
    if (devinfo->ver < 12)
       brw_inst_set_no_dd_check(p->devinfo, insn, true);
@@ -863,7 +756,7 @@ translate_systolic_depth(unsigned d)
 
 int
 fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
-                            struct shader_stats shader_stats,
+                            struct brw_shader_stats shader_stats,
                             const brw::performance &perf,
                             struct brw_compile_stats *stats,
                             unsigned max_polygons)
@@ -880,6 +773,7 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
 
    struct disasm_info *disasm_info = disasm_initialize(p->isa, cfg);
 
+   enum opcode prev_opcode = BRW_OPCODE_ILLEGAL;
    foreach_block_and_inst (block, fs_inst, inst, cfg) {
       if (inst->opcode == SHADER_OPCODE_UNDEF)
          continue;
@@ -956,22 +850,6 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
       if (unlikely(debug_flag))
          disasm_annotate(disasm_info, inst, p->next_insn_offset);
 
-      /* If the instruction writes to more than one register, it needs to be
-       * explicitly marked as compressed on Gen <= 5.  On Gen >= 6 the
-       * hardware figures out by itself what the right compression mode is,
-       * but we still need to know whether the instruction is compressed to
-       * set up the source register regions appropriately.
-       *
-       * XXX - This is wrong for instructions that write a single register but
-       *       read more than one which should strictly speaking be treated as
-       *       compressed.  For instructions that don't write any registers it
-       *       relies on the destination being a null register of the correct
-       *       type and regioning so the instruction is considered compressed
-       *       or not accordingly.
-       */
-      const bool compressed =
-           inst->dst.component_size(inst->exec_size) > REG_SIZE;
-
       if (devinfo->ver >= 20 && inst->group % 8 != 0) {
          assert(inst->force_writemask_all);
          assert(!inst->predicate && !inst->conditional_mod);
@@ -984,8 +862,7 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
       }
 
       for (unsigned int i = 0; i < inst->sources; i++) {
-         src[i] = brw_reg_from_fs_reg(devinfo, inst,
-                                      &inst->src[i], compressed);
+         src[i] = normalize_brw_reg_for_encoding(&inst->src[i]);
 	 /* The accumulator result appears to get used for the
 	  * conditional modifier generation.  When negating a UD
 	  * value, there is a 33rd bit generated for the sign in the
@@ -993,11 +870,10 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
 	  * equality with a 32-bit value.  See piglit fs-op-neg-uvec4.
 	  */
 	 assert(!inst->conditional_mod ||
-		inst->src[i].type != BRW_REGISTER_TYPE_UD ||
+		inst->src[i].type != BRW_TYPE_UD ||
 		!inst->src[i].negate);
       }
-      dst = brw_reg_from_fs_reg(devinfo, inst,
-                                &inst->dst, compressed);
+      dst = normalize_brw_reg_for_encoding(&inst->dst);
 
       brw_set_default_access_mode(p, BRW_ALIGN_1);
       brw_set_default_predicate_control(p, inst->predicate);
@@ -1028,8 +904,11 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
       assert(inst->mlen <= BRW_MAX_MSG_LENGTH * reg_unit(devinfo));
 
       switch (inst->opcode) {
+      case BRW_OPCODE_NOP:
+         brw_NOP(p);
+         break;
       case BRW_OPCODE_SYNC:
-         assert(src[0].file == BRW_IMMEDIATE_VALUE);
+         assert(src[0].file == IMM);
          brw_SYNC(p, tgl_sync_function(src[0].ud));
 
          if (tgl_sync_function(src[0].ud) == TGL_SYNC_NOP)
@@ -1144,22 +1023,19 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
          brw_CSEL(p, dst, src[0], src[1], src[2]);
          break;
       case BRW_OPCODE_BFREV:
-         brw_BFREV(p, retype(dst, BRW_REGISTER_TYPE_UD),
-                   retype(src[0], BRW_REGISTER_TYPE_UD));
+         brw_BFREV(p, retype(dst, BRW_TYPE_UD), retype(src[0], BRW_TYPE_UD));
          break;
       case BRW_OPCODE_FBH:
          brw_FBH(p, retype(dst, src[0].type), src[0]);
          break;
       case BRW_OPCODE_FBL:
-         brw_FBL(p, retype(dst, BRW_REGISTER_TYPE_UD),
-                 retype(src[0], BRW_REGISTER_TYPE_UD));
+         brw_FBL(p, retype(dst, BRW_TYPE_UD), retype(src[0], BRW_TYPE_UD));
          break;
       case BRW_OPCODE_LZD:
          brw_LZD(p, dst, src[0]);
          break;
       case BRW_OPCODE_CBIT:
-         brw_CBIT(p, retype(dst, BRW_REGISTER_TYPE_UD),
-                  retype(src[0], BRW_REGISTER_TYPE_UD));
+         brw_CBIT(p, retype(dst, BRW_TYPE_UD), retype(src[0], BRW_TYPE_UD));
          break;
       case BRW_OPCODE_ADDC:
          brw_ADDC(p, dst, src[0], src[1]);
@@ -1187,8 +1063,6 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
          break;
 
       case BRW_OPCODE_IF:
-         /* Can't have embedded compare (was only allowed on Gfx6). */
-         assert(inst->src[0].file == BAD_FILE);
          brw_IF(p, brw_get_default_exec_size(p));
 	 break;
 
@@ -1211,9 +1085,16 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
 	 break;
 
       case BRW_OPCODE_WHILE:
-	 brw_WHILE(p);
+         /* On LNL and newer, if we don't put a NOP in between two consecutive
+          * WHILE instructions we may end up with misrendering or GPU hangs.
+          * See HSD 22020521218.
+          */
+         if (devinfo->ver >= 20 && unlikely(prev_opcode == BRW_OPCODE_WHILE))
+            brw_NOP(p);
+
+         brw_WHILE(p);
          loop_count++;
-	 break;
+         break;
 
       case SHADER_OPCODE_RCP:
       case SHADER_OPCODE_RSQ:
@@ -1225,7 +1106,7 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
          assert(inst->conditional_mod == BRW_CONDITIONAL_NONE);
          assert(inst->mlen == 0);
          gfx6_math(p, dst, brw_math_function(inst->opcode),
-                   src[0], brw_null_reg());
+                   src[0], retype(brw_null_reg(), src[0].type));
 	 break;
       case SHADER_OPCODE_INT_QUOTIENT:
       case SHADER_OPCODE_INT_REMAINDER:
@@ -1236,14 +1117,22 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
          assert(inst->opcode == SHADER_OPCODE_POW || inst->exec_size == 8);
          gfx6_math(p, dst, brw_math_function(inst->opcode), src[0], src[1]);
 	 break;
-      case FS_OPCODE_LINTERP:
-	 multiple_instructions_emitted = generate_linterp(inst, dst, src);
+      case BRW_OPCODE_PLN:
+         /* PLN reads:
+          *                      /   in SIMD16   \
+          *    -----------------------------------
+          *   | src1+0 | src1+1 | src1+2 | src1+3 |
+          *   |-----------------------------------|
+          *   |(x0, x1)|(y0, y1)|(x2, x3)|(y2, y3)|
+          *    -----------------------------------
+          */
+         brw_PLN(p, dst, src[0], src[1]);
 	 break;
       case FS_OPCODE_PIXEL_X:
-         assert(src[0].type == BRW_REGISTER_TYPE_UW);
-         assert(src[1].type == BRW_REGISTER_TYPE_UW);
-         src[0].subnr = 0 * type_sz(src[0].type);
-         if (src[1].file == BRW_IMMEDIATE_VALUE) {
+         assert(src[0].type == BRW_TYPE_UW);
+         assert(src[1].type == BRW_TYPE_UW);
+         src[0].subnr = 0 * brw_type_size_bytes(src[0].type);
+         if (src[1].file == IMM) {
             assert(src[1].ud == 0);
             brw_MOV(p, dst, stride(src[0], 8, 4, 1));
          } else {
@@ -1252,10 +1141,10 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
          }
          break;
       case FS_OPCODE_PIXEL_Y:
-         assert(src[0].type == BRW_REGISTER_TYPE_UW);
-         assert(src[1].type == BRW_REGISTER_TYPE_UW);
-         src[0].subnr = 4 * type_sz(src[0].type);
-         if (src[1].file == BRW_IMMEDIATE_VALUE) {
+         assert(src[0].type == BRW_TYPE_UW);
+         assert(src[1].type == BRW_TYPE_UW);
+         src[0].subnr = 4 * brw_type_size_bytes(src[0].type);
+         if (src[1].file == IMM) {
             assert(src[1].ud == 0);
             brw_MOV(p, dst, stride(src[0], 8, 4, 1));
          } else {
@@ -1280,7 +1169,7 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
 	 break;
 
       case SHADER_OPCODE_SCRATCH_HEADER:
-         generate_scratch_header(inst, dst);
+         generate_scratch_header(inst, dst, src[0]);
          break;
 
       case SHADER_OPCODE_MOV_INDIRECT:
@@ -1288,13 +1177,9 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
          break;
 
       case SHADER_OPCODE_MOV_RELOC_IMM:
-         assert(src[0].file == BRW_IMMEDIATE_VALUE);
-         brw_MOV_reloc_imm(p, dst, dst.type, src[0].ud);
-         break;
-
-      case FS_OPCODE_FB_READ:
-         generate_fb_read(inst, dst, src[0]);
-         send_count++;
+         assert(src[0].file == IMM);
+         assert(src[1].file == IMM);
+         brw_MOV_reloc_imm(p, dst, dst.type, src[0].ud, src[1].ud);
          break;
 
       case BRW_OPCODE_HALT:
@@ -1303,8 +1188,8 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
 
       case SHADER_OPCODE_INTERLOCK:
       case SHADER_OPCODE_MEMORY_FENCE: {
-         assert(src[1].file == BRW_IMMEDIATE_VALUE);
-         assert(src[2].file == BRW_IMMEDIATE_VALUE);
+         assert(src[1].file == IMM);
+         assert(src[2].file == IMM);
 
          const enum opcode send_op = inst->opcode == SHADER_OPCODE_INTERLOCK ?
             BRW_OPCODE_SENDC : BRW_OPCODE_SEND;
@@ -1338,8 +1223,8 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
                /* Emit a MOV to force a stall until the instruction producing the
                 * registers finishes.
                 */
-               brw_MOV(p, retype(brw_null_reg(), BRW_REGISTER_TYPE_UW),
-                       retype(src[i], BRW_REGISTER_TYPE_UW));
+               brw_MOV(p, retype(brw_null_reg(), BRW_TYPE_UW),
+                       retype(src[i], BRW_TYPE_UW));
             }
 
             if (inst->sources > 1)
@@ -1358,9 +1243,8 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
          assert(inst->force_writemask_all && inst->group == 0);
          assert(inst->dst.file == BAD_FILE);
          brw_set_default_exec_size(p, BRW_EXECUTE_1);
-         brw_MOV(p, retype(brw_flag_subreg(inst->flag_subreg),
-                           BRW_REGISTER_TYPE_UD),
-                 retype(brw_mask_reg(0), BRW_REGISTER_TYPE_UD));
+         brw_MOV(p, retype(brw_flag_subreg(inst->flag_subreg), BRW_TYPE_UD),
+                 retype(brw_mask_reg(0), BRW_TYPE_UD));
          break;
       }
       case SHADER_OPCODE_BROADCAST:
@@ -1374,7 +1258,7 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
 
       case SHADER_OPCODE_SEL_EXEC:
          assert(inst->force_writemask_all);
-         assert(devinfo->has_64bit_float || type_sz(dst.type) <= 4);
+         assert(devinfo->has_64bit_float || brw_type_size_bytes(dst.type) <= 4);
          brw_set_default_mask_control(p, BRW_MASK_DISABLE);
          brw_MOV(p, dst, src[1]);
          brw_set_default_mask_control(p, BRW_MASK_ENABLE);
@@ -1383,24 +1267,29 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
          break;
 
       case SHADER_OPCODE_QUAD_SWIZZLE:
-         assert(src[1].file == BRW_IMMEDIATE_VALUE);
-         assert(src[1].type == BRW_REGISTER_TYPE_UD);
+         assert(src[1].file == IMM);
+         assert(src[1].type == BRW_TYPE_UD);
          generate_quad_swizzle(inst, dst, src[0], src[1].ud);
          break;
 
       case SHADER_OPCODE_CLUSTER_BROADCAST: {
-         assert((devinfo->platform != INTEL_PLATFORM_CHV &&
-                 !intel_device_info_is_9lp(devinfo) &&
-                 devinfo->has_64bit_float) || type_sz(src[0].type) <= 4);
+         assert((!intel_device_info_is_9lp(devinfo) &&
+                 devinfo->has_64bit_float) || brw_type_size_bytes(src[0].type) <= 4);
          assert(!src[0].negate && !src[0].abs);
-         assert(src[1].file == BRW_IMMEDIATE_VALUE);
-         assert(src[1].type == BRW_REGISTER_TYPE_UD);
-         assert(src[2].file == BRW_IMMEDIATE_VALUE);
-         assert(src[2].type == BRW_REGISTER_TYPE_UD);
+         assert(src[1].file == IMM);
+         assert(src[1].type == BRW_TYPE_UD);
+         assert(src[2].file == IMM);
+         assert(src[2].type == BRW_TYPE_UD);
          const unsigned component = src[1].ud;
          const unsigned cluster_size = src[2].ud;
-         assert(inst->src[0].file != ARF && inst->src[0].file != FIXED_GRF);
-         const unsigned s = inst->src[0].stride;
+         assert(inst->src[0].file != ARF);
+
+         unsigned s;
+         if (inst->src[0].file == FIXED_GRF) {
+            s = inst->src[0].hstride ? 1 << (inst->src[0].hstride - 1) : 0;
+         } else {
+            s = inst->src[0].stride;
+         }
          unsigned vstride = cluster_size * s;
          unsigned width = cluster_size;
 
@@ -1433,7 +1322,7 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
 	 break;
 
       case SHADER_OPCODE_RND_MODE: {
-         assert(src[0].file == BRW_IMMEDIATE_VALUE);
+         assert(src[0].file == IMM);
          /*
           * Changes the floating point rounding mode updating the control
           * register field defined at cr0.0[5-6] bits.
@@ -1445,12 +1334,12 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
          break;
 
       case SHADER_OPCODE_FLOAT_CONTROL_MODE:
-         assert(src[0].file == BRW_IMMEDIATE_VALUE);
-         assert(src[1].file == BRW_IMMEDIATE_VALUE);
+         assert(src[0].file == IMM);
+         assert(src[1].file == IMM);
          brw_float_controls_mode(p, src[0].d, src[1].d);
          break;
 
-      case SHADER_OPCODE_READ_SR_REG:
+      case SHADER_OPCODE_READ_ARCH_REG:
          if (devinfo->ver >= 12) {
             /* There is a SWSB restriction that requires that any time sr0 is
              * accessed both the instruction doing the access and the next one
@@ -1458,13 +1347,12 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
              */
             if (brw_get_default_swsb(p).mode != TGL_SBID_NULL)
                brw_SYNC(p, TGL_SYNC_NOP);
-            assert(src[0].file == BRW_IMMEDIATE_VALUE);
             brw_set_default_swsb(p, tgl_swsb_regdist(1));
-            brw_MOV(p, dst, brw_sr0_reg(src[0].ud));
+            brw_MOV(p, dst, src[0]);
             brw_set_default_swsb(p, tgl_swsb_regdist(1));
             brw_AND(p, dst, dst, brw_imm_ud(0xffffffff));
          } else {
-            brw_MOV(p, dst, brw_sr0_reg(src[0].ud));
+            brw_MOV(p, dst, src[0]);
          }
          break;
 
@@ -1474,6 +1362,7 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
       case SHADER_OPCODE_LOAD_PAYLOAD:
          unreachable("Should be lowered by lower_load_payload()");
       }
+      prev_opcode = inst->opcode;
 
       if (multiple_instructions_emitted)
          continue;
@@ -1550,15 +1439,18 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
               "%d:%d spills:fills, %u sends, "
               "scheduled with mode %s. "
               "Promoted %u constants. "
+              "Non-SSA regs (after NIR): %u. "
               "Compacted %d to %d bytes (%.0f%%)\n",
               shader_name, params->source_hash, sha1buf,
-              dispatch_width, before_size / 16,
+              dispatch_width,
+              before_size / 16 - nop_count - sync_nop_count,
               loop_count, perf.latency,
               shader_stats.spill_count,
               shader_stats.fill_count,
               send_count,
               shader_stats.scheduler_mode,
               shader_stats.promoted_constants,
+              shader_stats.non_ssa_registers_after_nir,
               before_size, after_size,
               100.0f * (before_size - after_size) / before_size);
 
@@ -1606,6 +1498,7 @@ fs_generator::generate_code(const cfg_t *cfg, int dispatch_width,
       stats->spills = shader_stats.spill_count;
       stats->fills = shader_stats.fill_count;
       stats->max_live_registers = shader_stats.max_register_pressure;
+      stats->non_ssa_registers_after_nir = shader_stats.non_ssa_registers_after_nir;
    }
 
    return start_offset;

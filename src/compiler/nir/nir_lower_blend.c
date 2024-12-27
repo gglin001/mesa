@@ -133,7 +133,7 @@ nir_blend_factor_value(
 }
 
 static nir_def *
-nir_fsat_signed(nir_builder *b, nir_def *x)
+nir_build_fsat_signed(nir_builder *b, nir_def *x)
 {
    return nir_fclamp(b, x, nir_imm_floatN_t(b, -1.0, x->bit_size),
                      nir_imm_floatN_t(b, +1.0, x->bit_size));
@@ -145,7 +145,7 @@ nir_fsat_to_format(nir_builder *b, nir_def *x, enum pipe_format format)
    if (util_format_is_unorm(format))
       return nir_fsat(b, x);
    else if (util_format_is_snorm(format))
-      return nir_fsat_signed(b, x);
+      return nir_build_fsat_signed(b, x);
    else
       return x;
 }
@@ -319,9 +319,12 @@ nir_blend_logicop(
    if (util_format_is_float(format) || util_format_is_srgb(format))
       return src;
 
+   nir_alu_type type =
+      util_format_is_pure_integer(format) ? nir_type_uint : nir_type_float;
+
    if (bit_size != 32) {
-      src = nir_f2f32(b, src);
-      dst = nir_f2f32(b, dst);
+      src = nir_convert_to_bit_size(b, src, type, 32);
+      dst = nir_convert_to_bit_size(b, dst, type, 32);
    }
 
    assert(src->num_components <= 4);
@@ -358,8 +361,8 @@ nir_blend_logicop(
       assert(util_format_is_pure_integer(format));
    }
 
-   if (bit_size == 16)
-      out = nir_f2f16(b, out);
+   if (bit_size != 32)
+      out = nir_convert_to_bit_size(b, out, type, bit_size);
 
    return out;
 }
@@ -642,13 +645,11 @@ nir_lower_blend(nir_shader *shader, const nir_lower_blend_options *options)
 
    struct ctx ctx = { .options = options };
    bool progress = nir_shader_intrinsics_pass(shader, consume_dual_stores,
-                                              nir_metadata_block_index |
-                                                 nir_metadata_dominance,
+                                              nir_metadata_control_flow,
                                               ctx.src1);
 
    progress |= nir_shader_intrinsics_pass(shader, nir_lower_blend_instr,
-                                          nir_metadata_block_index |
-                                             nir_metadata_dominance,
+                                          nir_metadata_control_flow,
                                           &ctx);
    return progress;
 }

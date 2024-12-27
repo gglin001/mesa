@@ -233,9 +233,7 @@ opt_intrinsics_alu(nir_builder *b, nir_alu_instr *alu,
    }
 
    if (replacement) {
-      nir_def_rewrite_uses(&alu->def,
-                           replacement);
-      nir_instr_remove(&alu->instr);
+      nir_def_replace(&alu->def, replacement);
       return true;
    } else {
       return false;
@@ -258,8 +256,21 @@ try_opt_exclusive_scan_to_inclusive(nir_intrinsic_instr *intrin)
          return false;
 
       /* Don't reassociate exact float operations. */
-      if (nir_alu_type_get_base_type(nir_op_infos[alu->op].output_type) == nir_type_float &&
-          alu->op != nir_op_fmax && alu->op != nir_op_fmin && alu->exact)
+      if (nir_alu_type_get_base_type(nir_op_infos[alu->op].output_type) == nir_type_float && alu->exact)
+         return false;
+
+      /* SPIR-V rules for fmax/fmin scans are *very* stupid.
+       * The required identity is Inf instead of NaN but if one input
+       * is NaN, the other value has to be returned.
+       *
+       * This means for invocation 0:
+       * min(subgroupExclusiveMin(NaN), NaN) -> Inf
+       * subgroupInclusiveMin(NaN) -> undefined (NaN for any sane backend)
+       *
+       * SPIR-V [NF]Min/Max don't allow undefined result, even with standard
+       * float controls.
+       */
+      if (alu->op == nir_op_fmax || alu->op == nir_op_fmin)
          return false;
 
       if (alu->def.num_components != 1)
@@ -284,8 +295,7 @@ try_opt_exclusive_scan_to_inclusive(nir_intrinsic_instr *intrin)
    nir_foreach_use_including_if_safe(src, &intrin->def) {
       /* Remove alu. */
       nir_alu_instr *alu = nir_instr_as_alu(nir_src_parent_instr(src));
-      nir_def_rewrite_uses(&alu->def, &intrin->def);
-      nir_instr_remove(&alu->instr);
+      nir_def_replace(&alu->def, &intrin->def);
    }
 
    return true;
@@ -309,26 +319,37 @@ opt_intrinsics_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
          if (nir_src_parent_instr(use_src)->type == nir_instr_type_alu) {
             nir_alu_instr *alu = nir_instr_as_alu(nir_src_parent_instr(use_src));
 
-            if (alu->op == nir_op_ieq ||
-                alu->op == nir_op_ine) {
-               /* Check for 0 in either operand. */
-               nir_const_value *const_val =
-                  nir_src_as_const_value(alu->src[0].src);
-               if (!const_val)
-                  const_val = nir_src_as_const_value(alu->src[1].src);
-               if (!const_val || const_val->i32 != 0)
-                  continue;
+            if ((alu->op != nir_op_ieq && alu->op != nir_op_ine) || alu->def.num_components != 1)
+               continue;
 
-               nir_def *new_expr = nir_load_helper_invocation(b, 1);
+            nir_alu_src *alu_src = list_entry(use_src, nir_alu_src, src);
+            unsigned src_index = alu_src - alu->src;
+            nir_scalar other = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), !src_index);
 
-               if (alu->op == nir_op_ine)
-                  new_expr = nir_inot(b, new_expr);
+            if (!nir_scalar_is_const(other) || nir_scalar_as_uint(other))
+               continue;
 
-               nir_def_rewrite_uses(&alu->def,
-                                    new_expr);
-               nir_instr_remove(&alu->instr);
-               progress = true;
-            }
+            nir_cf_node *cf_node = &intrin->instr.block->cf_node;
+            while (cf_node->parent)
+               cf_node = cf_node->parent;
+
+            nir_function_impl *func_impl = nir_cf_node_as_function(cf_node);
+
+            /* We need to insert load_helper before any demote,
+             * which is only possible in the entry point function
+             */
+            if (func_impl != nir_shader_get_entrypoint(b->shader))
+               break;
+
+            b->cursor = nir_before_impl(func_impl);
+
+            nir_def *new_expr = nir_load_helper_invocation(b, 1);
+
+            if (alu->op == nir_op_ine)
+               new_expr = nir_inot(b, new_expr);
+
+            nir_def_replace(&alu->def, new_expr);
+            progress = true;
          }
       }
       return progress;
@@ -362,9 +383,7 @@ opt_intrinsics_impl(nir_function_impl *impl,
 
          case nir_instr_type_intrinsic: {
             nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
-            if (intrin->intrinsic == nir_intrinsic_discard ||
-                intrin->intrinsic == nir_intrinsic_discard_if ||
-                intrin->intrinsic == nir_intrinsic_demote ||
+            if (intrin->intrinsic == nir_intrinsic_demote ||
                 intrin->intrinsic == nir_intrinsic_demote_if ||
                 intrin->intrinsic == nir_intrinsic_terminate ||
                 intrin->intrinsic == nir_intrinsic_terminate_if)
@@ -392,8 +411,7 @@ nir_opt_intrinsics(nir_shader *shader)
    nir_foreach_function_impl(impl, shader) {
       if (opt_intrinsics_impl(impl, shader->options)) {
          progress = true;
-         nir_metadata_preserve(impl, nir_metadata_block_index |
-                                        nir_metadata_dominance);
+         nir_metadata_preserve(impl, nir_metadata_control_flow);
       } else {
          nir_metadata_preserve(impl, nir_metadata_all);
       }

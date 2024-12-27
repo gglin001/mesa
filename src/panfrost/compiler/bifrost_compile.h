@@ -62,6 +62,7 @@ void bifrost_compile_shader_nir(nir_shader *nir,
        */                                                                      \
       .vertex_id_zero_based = (arch <= 7),                                     \
                                                                                \
+      .lower_pack_64_4x16 = true,                                              \
       .lower_pack_half_2x16 = true,                                            \
       .lower_pack_unorm_2x16 = true,                                           \
       .lower_pack_snorm_2x16 = true,                                           \
@@ -88,16 +89,18 @@ void bifrost_compile_shader_nir(nir_shader *nir,
       .fuse_ffma16 = true,                                                     \
       .fuse_ffma32 = true,                                                     \
       .fuse_ffma64 = true,                                                     \
-      .use_interpolated_input_intrinsics = true,                               \
                                                                                \
       .lower_uniforms_to_ubo = true,                                           \
                                                                                \
       .has_cs_global_id = true,                                                \
       .lower_cs_local_index_to_id = true,                                      \
+      .lower_device_index_to_zero = true,                                      \
       .max_unroll_iterations = 32,                                             \
       .force_indirect_unrolling =                                              \
          (nir_var_shader_in | nir_var_shader_out | nir_var_function_temp),     \
       .force_indirect_unrolling_sampler = true,                                \
+      .scalarize_ddx = true,                                                   \
+      .support_indirect_inputs = (uint8_t)BITFIELD_MASK(PIPE_SHADER_TYPES),    \
    };
 
 DEFINE_OPTIONS(6);

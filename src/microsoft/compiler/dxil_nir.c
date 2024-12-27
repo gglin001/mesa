@@ -115,8 +115,7 @@ lower_32b_offset_load(nir_builder *b, nir_intrinsic_instr *intr, nir_variable *v
    }
 
    nir_def *result = nir_vec(b, comps, num_components);
-   nir_def_rewrite_uses(&intr->def, result);
-   nir_instr_remove(&intr->instr);
+   nir_def_replace(&intr->def, result);
 
    return true;
 }
@@ -417,9 +416,8 @@ dxil_nir_flatten_var_arrays(nir_shader *shader, nir_variable_mode modes)
       return false;
 
    nir_shader_intrinsics_pass(shader, flatten_var_arrays,
-                                nir_metadata_block_index |
-                                   nir_metadata_dominance |
-                                   nir_metadata_loop_analysis,
+                                nir_metadata_control_flow |
+                                nir_metadata_loop_analysis,
                                 NULL);
    nir_remove_dead_derefs(shader);
    return true;
@@ -600,9 +598,8 @@ dxil_nir_lower_var_bit_size(nir_shader *shader, nir_variable_mode modes,
       return false;
 
    nir_shader_intrinsics_pass(shader, lower_deref_bit_size,
-                                nir_metadata_block_index |
-                                   nir_metadata_dominance |
-                                   nir_metadata_loop_analysis,
+                                nir_metadata_control_flow |
+                                nir_metadata_loop_analysis,
                                 NULL);
    nir_remove_dead_derefs(shader);
    return true;
@@ -651,9 +648,8 @@ bool
 dxil_nir_remove_oob_array_accesses(nir_shader *shader)
 {
    return nir_shader_intrinsics_pass(shader, remove_oob_array_access,
-                                     nir_metadata_block_index |
-                                        nir_metadata_dominance |
-                                        nir_metadata_loop_analysis,
+                                     nir_metadata_control_flow |
+                                     nir_metadata_loop_analysis,
                                      NULL);
 }
 
@@ -675,8 +671,7 @@ lower_shared_atomic(nir_builder *b, nir_intrinsic_instr *intr, nir_variable *var
       result = nir_deref_atomic(b, 32, &deref->def, intr->src[1].ssa,
                                 .atomic_op = nir_intrinsic_atomic_op(intr));
 
-   nir_def_rewrite_uses(&intr->def, result);
-   nir_instr_remove(&intr->instr);
+   nir_def_replace(&intr->def, result);
    return true;
 }
 
@@ -760,9 +755,7 @@ lower_deref_ssbo(nir_builder *b, nir_deref_instr *deref)
       nir_deref_instr *deref_cast =
          nir_build_deref_cast(b, ptr, nir_var_mem_ssbo, deref->type,
                               glsl_get_explicit_stride(var->type));
-      nir_def_rewrite_uses(&deref->def,
-                               &deref_cast->def);
-      nir_instr_remove(&deref->instr);
+      nir_def_replace(&deref->def, &deref_cast->def);
 
       deref = deref_cast;
       return true;
@@ -887,8 +880,7 @@ cast_phi(nir_builder *b, nir_phi_instr *phi, unsigned new_bit_size)
    b->cursor = nir_after_phis(nir_cursor_current_block(b->cursor));
    nir_def *result = nir_u2uN(b, &lowered->def, old_bit_size);
 
-   nir_def_rewrite_uses(&phi->def, result);
-   nir_instr_remove(&phi->instr);
+   nir_def_replace(&phi->def, result);
 }
 
 static bool
@@ -909,8 +901,7 @@ upcast_phi_impl(nir_function_impl *impl, unsigned min_bit_size)
    }
 
    if (progress) {
-      nir_metadata_preserve(impl, nir_metadata_block_index |
-                                  nir_metadata_dominance);
+      nir_metadata_preserve(impl, nir_metadata_control_flow);
    } else {
       nir_metadata_preserve(impl, nir_metadata_all);
    }
@@ -942,6 +933,13 @@ struct dxil_nir_split_clip_cull_distance_params {
  *
  * To help emitting a valid input signature for this case, split the variables so that they
  * match what we need to put in the signature (e.g. { float clip[4]; float clip1; float cull[3]; })
+ * 
+ * This pass can deal with splitting across two axes:
+ * 1. Given { float clip[5]; float cull[3]; }, split clip into clip[4] and clip1[1]. This is
+ *    what's produced by nir_lower_clip_cull_distance_arrays.
+ * 2. Given { float clip[4]; float clipcull[4]; }, split clipcull into clip1[1] and cull[3].
+ *    This is what's produced by the sequence of nir_lower_clip_cull_distance_arrays, then
+ *    I/O lowering, vectorization, optimization, and I/O un-lowering.
  */
 static bool
 dxil_nir_split_clip_cull_distance_instr(nir_builder *b,
@@ -980,6 +978,9 @@ dxil_nir_split_clip_cull_distance_instr(nir_builder *b,
    assert(deref->deref_type == nir_deref_type_var ||
           deref->deref_type == nir_deref_type_array);
 
+   bool clip_size_accurate = var->data.mode == nir_var_shader_out || b->shader->info.stage == MESA_SHADER_FRAGMENT;
+   bool is_clip_cull_split = false;
+
    b->cursor = nir_before_instr(instr);
    unsigned arrayed_io_length = 0;
    const struct glsl_type *old_type = var->type;
@@ -987,16 +988,32 @@ dxil_nir_split_clip_cull_distance_instr(nir_builder *b,
       arrayed_io_length = glsl_array_size(old_type);
       old_type = glsl_get_array_element(old_type);
    }
+   int old_length = glsl_array_size(old_type);
    if (!new_var) {
       /* Update lengths for new and old vars */
-      int old_length = glsl_array_size(old_type);
       int new_length = (old_length + var->data.location_frac) - 4;
-      old_length -= new_length;
 
       /* The existing variable fits in the float4 */
-      if (new_length <= 0)
-         return false;
+      if (new_length <= 0) {
+         /* If we don't have an accurate clip size in the shader info, then we're in case 1 (only
+          * lowered clip_cull, not lowered+unlowered I/O), since I/O optimization moves these varyings
+          * out of sysval locations and into generic locations. */
+         if (!clip_size_accurate)
+            return false;
 
+         assert(old_length <= 4);
+         unsigned start = (var->data.location - VARYING_SLOT_CLIP_DIST0) * 4;
+         unsigned end = start + old_length;
+         /* If it doesn't straddle the clip array size, then it's either just clip or cull, not both. */
+         if (start >= b->shader->info.clip_distance_array_size ||
+               end <= b->shader->info.clip_distance_array_size)
+            return false;
+
+         new_length = end - b->shader->info.clip_distance_array_size;
+         is_clip_cull_split = true;
+      }
+
+      old_length -= new_length;
       new_var = nir_variable_clone(var, params->shader);
       nir_shader_add_variable(params->shader, new_var);
       assert(glsl_get_base_type(glsl_get_array_element(old_type)) == GLSL_TYPE_FLOAT);
@@ -1006,8 +1023,13 @@ dxil_nir_split_clip_cull_distance_instr(nir_builder *b,
          var->type = glsl_array_type(var->type, arrayed_io_length, 0);
          new_var->type = glsl_array_type(new_var->type, arrayed_io_length, 0);
       }
-      new_var->data.location++;
-      new_var->data.location_frac = 0;
+
+      if (is_clip_cull_split) {
+         new_var->data.location_frac = old_length;
+      } else {
+         new_var->data.location++;
+         new_var->data.location_frac = 0;
+      }
       params->new_var[new_var_idx] = new_var;
    }
 
@@ -1028,13 +1050,10 @@ dxil_nir_split_clip_cull_distance_instr(nir_builder *b,
    nir_const_value *index = nir_src_as_const_value(deref->arr.index);
    assert(index);
 
-   /* Treat this array as a vector starting at the component index in location_frac,
-    * so if location_frac is 1 and index is 0, then it's accessing the 'y' component
-    * of the vector. If index + location_frac is >= 4, there's no component there,
-    * so we need to add a new variable and adjust the index.
+   /* If we're indexing out-of-bounds of the old variable, then adjust to point
+    * to the new variable with a smaller index.
     */
-   unsigned total_index = index->u32 + var->data.location_frac;
-   if (total_index < 4)
+   if (index->u32 < old_length)
       return false;
 
    nir_deref_instr *new_var_deref = nir_build_deref_var(b, new_var);
@@ -1044,7 +1063,7 @@ dxil_nir_split_clip_cull_distance_instr(nir_builder *b,
       assert(parent->deref_type == nir_deref_type_array);
       new_intermediate_deref = nir_build_deref_array(b, new_intermediate_deref, parent->arr.index.ssa);
    }
-   nir_deref_instr *new_array_deref = nir_build_deref_array(b, new_intermediate_deref, nir_imm_int(b, total_index % 4));
+   nir_deref_instr *new_array_deref = nir_build_deref_array(b, new_intermediate_deref, nir_imm_int(b, index->u32 - old_length));
    nir_def_rewrite_uses(&deref->def, &new_array_deref->def);
    return true;
 }
@@ -1058,8 +1077,7 @@ dxil_nir_split_clip_cull_distance(nir_shader *shader)
    };
    nir_shader_instructions_pass(shader,
                                 dxil_nir_split_clip_cull_distance_instr,
-                                nir_metadata_block_index |
-                                nir_metadata_dominance |
+                                nir_metadata_control_flow |
                                 nir_metadata_loop_analysis,
                                 &params);
    return params.new_var[0] != NULL || params.new_var[1] != NULL;
@@ -1156,8 +1174,7 @@ dxil_nir_lower_double_math(nir_shader *shader)
 {
    return nir_shader_instructions_pass(shader,
                                        dxil_nir_lower_double_math_instr,
-                                       nir_metadata_block_index |
-                                       nir_metadata_dominance |
+                                       nir_metadata_control_flow |
                                        nir_metadata_loop_analysis,
                                        NULL);
 }
@@ -1231,8 +1248,7 @@ lower_load_local_group_size(nir_builder *b, nir_intrinsic_instr *intr)
       nir_const_value_for_int(b->shader->info.workgroup_size[2], 32)
    };
    nir_def *size = nir_build_imm(b, 3, 32, v);
-   nir_def_rewrite_uses(&intr->def, size);
-   nir_instr_remove(&intr->instr);
+   nir_def_replace(&intr->def, size);
 }
 
 static bool
@@ -1252,7 +1268,7 @@ bool
 dxil_nir_lower_system_values(nir_shader *shader)
 {
    return nir_shader_intrinsics_pass(shader, lower_system_values_impl,
-                                     nir_metadata_block_index | nir_metadata_dominance | nir_metadata_loop_analysis,
+                                     nir_metadata_control_flow | nir_metadata_loop_analysis,
                                      NULL);
 }
 
@@ -1452,12 +1468,12 @@ dxil_nir_split_typed_samplers(nir_shader *nir)
    struct hash_table_u64 *hash_table = _mesa_hash_table_u64_create(NULL);
 
    bool progress = nir_shader_instructions_pass(nir, redirect_sampler_derefs,
-      nir_metadata_block_index | nir_metadata_dominance | nir_metadata_loop_analysis, hash_table);
+      nir_metadata_control_flow | nir_metadata_loop_analysis, hash_table);
 
    _mesa_hash_table_u64_clear(hash_table);
 
    progress |= nir_shader_instructions_pass(nir, redirect_texture_derefs,
-      nir_metadata_block_index | nir_metadata_dominance | nir_metadata_loop_analysis, hash_table);
+      nir_metadata_control_flow | nir_metadata_loop_analysis, hash_table);
 
    _mesa_hash_table_u64_destroy(hash_table);
    return progress;
@@ -1470,9 +1486,6 @@ lower_sysval_to_load_input_impl(nir_builder *b, nir_intrinsic_instr *intr,
 {
    gl_system_value sysval = SYSTEM_VALUE_MAX;
    switch (intr->intrinsic) {
-   case nir_intrinsic_load_front_face:
-      sysval = SYSTEM_VALUE_FRONT_FACE;
-      break;
    case nir_intrinsic_load_instance_id:
       sysval = SYSTEM_VALUE_INSTANCE_ID;
       break;
@@ -1487,21 +1500,12 @@ lower_sysval_to_load_input_impl(nir_builder *b, nir_intrinsic_instr *intr,
    nir_variable *var = sysval_vars[sysval];
    assert(var);
 
-   const nir_alu_type dest_type = (sysval == SYSTEM_VALUE_FRONT_FACE)
-      ? nir_type_uint32 : nir_get_nir_type_for_glsl_type(var->type);
-   const unsigned bit_size = (sysval == SYSTEM_VALUE_FRONT_FACE)
-      ? 32 : intr->def.bit_size;
+   const nir_alu_type dest_type = nir_get_nir_type_for_glsl_type(var->type);
+   const unsigned bit_size = intr->def.bit_size;
 
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *result = nir_load_input(b, intr->def.num_components, bit_size, nir_imm_int(b, 0),
       .base = var->data.driver_location, .dest_type = dest_type);
-
-   /* The nir_type_uint32 is really a nir_type_bool32, but that type is very
-    * inconvenient at this point during compilation.  Convert to
-    * nir_type_bool1 by comparing with zero.
-    */
-   if (sysval == SYSTEM_VALUE_FRONT_FACE)
-      result = nir_ine_imm(b, result, 0);
 
    nir_def_rewrite_uses(&intr->def, result);
    return true;
@@ -1511,7 +1515,7 @@ bool
 dxil_nir_lower_sysval_to_load_input(nir_shader *s, nir_variable **sysval_vars)
 {
    return nir_shader_intrinsics_pass(s, lower_sysval_to_load_input_impl,
-                                     nir_metadata_block_index | nir_metadata_dominance,
+                                     nir_metadata_control_flow,
                                      sysval_vars);
 }
 
@@ -1545,16 +1549,10 @@ variable_location_cmp(const nir_variable* a, const nir_variable* b)
 }
 
 /* Order varyings according to driver location */
-uint64_t
+void
 dxil_sort_by_driver_location(nir_shader* s, nir_variable_mode modes)
 {
    nir_sort_variables_with_modes(s, variable_location_cmp, modes);
-
-   uint64_t result = 0;
-   nir_foreach_variable_with_modes(var, s, modes) {
-      result |= 1ull << var->data.location;
-   }
-   return result;
 }
 
 /* Sort PS outputs so that color outputs come first */
@@ -1595,12 +1593,14 @@ dxil_sort_ps_outputs(nir_shader* s)
 enum dxil_sysvalue_type {
    DXIL_NO_SYSVALUE = 0,
    DXIL_USED_SYSVALUE,
+   DXIL_UNUSED_NO_SYSVALUE,
    DXIL_SYSVALUE,
-   DXIL_GENERATED_SYSVALUE
+   DXIL_GENERATED_SYSVALUE,
 };
 
 static enum dxil_sysvalue_type
-nir_var_to_dxil_sysvalue_type(nir_variable *var, uint64_t other_stage_mask)
+nir_var_to_dxil_sysvalue_type(nir_variable *var, uint64_t other_stage_mask,
+                              const BITSET_WORD *other_stage_frac_mask)
 {
    switch (var->data.location) {
    case VARYING_SLOT_FACE:
@@ -1619,6 +1619,13 @@ nir_var_to_dxil_sysvalue_type(nir_variable *var, uint64_t other_stage_mask)
          return DXIL_SYSVALUE;
       return DXIL_USED_SYSVALUE;
    default:
+      if (var->data.location < VARYING_SLOT_PATCH0 &&
+          !((1ull << var->data.location) & other_stage_mask))
+         return DXIL_UNUSED_NO_SYSVALUE;
+      if (var->data.location_frac && other_stage_frac_mask &&
+          var->data.location >= VARYING_SLOT_VAR0 &&
+          !BITSET_TEST(other_stage_frac_mask, ((var->data.location - VARYING_SLOT_VAR0) * 4 + var->data.location_frac)))
+         return DXIL_UNUSED_NO_SYSVALUE;
       return DXIL_NO_SYSVALUE;
    }
 }
@@ -1626,29 +1633,30 @@ nir_var_to_dxil_sysvalue_type(nir_variable *var, uint64_t other_stage_mask)
 /* Order between stage values so that normal varyings come first,
  * then sysvalues and then system generated values.
  */
-uint64_t
+void
 dxil_reassign_driver_locations(nir_shader* s, nir_variable_mode modes,
-   uint64_t other_stage_mask)
+   uint64_t other_stage_mask, const BITSET_WORD *other_stage_frac_mask)
 {
    nir_foreach_variable_with_modes_safe(var, s, modes) {
       /* We use the driver_location here to avoid introducing a new
        * struct or member variable here. The true, updated driver location
        * will be written below, after sorting */
-      var->data.driver_location = nir_var_to_dxil_sysvalue_type(var, other_stage_mask);
+      var->data.driver_location = nir_var_to_dxil_sysvalue_type(var, other_stage_mask, other_stage_frac_mask);
    }
 
    nir_sort_variables_with_modes(s, variable_location_cmp, modes);
 
-   uint64_t result = 0;
    unsigned driver_loc = 0, driver_patch_loc = 0;
    nir_foreach_variable_with_modes(var, s, modes) {
-      if (var->data.location < 64)
-         result |= 1ull << var->data.location;
       /* Overlap patches with non-patch */
-      var->data.driver_location = var->data.patch ?
-         driver_patch_loc++ : driver_loc++;
+      unsigned *loc = var->data.patch ? &driver_patch_loc : &driver_loc;
+      var->data.driver_location = *loc;
+
+      const struct glsl_type *type = var->type;
+      if (nir_is_arrayed_io(var, s->info.stage) && glsl_type_is_array(type))
+         type = glsl_get_array_element(type);
+      *loc += glsl_count_vec4_slots(type, false, false);
    }
-   return result;
 }
 
 static bool
@@ -1839,17 +1847,14 @@ static bool
 lower_kill(struct nir_builder *builder, nir_intrinsic_instr *intr,
            void *_cb_data)
 {
-   if (intr->intrinsic != nir_intrinsic_discard &&
-       intr->intrinsic != nir_intrinsic_terminate &&
-       intr->intrinsic != nir_intrinsic_discard_if &&
+   if (intr->intrinsic != nir_intrinsic_terminate &&
        intr->intrinsic != nir_intrinsic_terminate_if)
       return false;
 
    builder->cursor = nir_instr_remove(&intr->instr);
    nir_def *condition;
 
-   if (intr->intrinsic == nir_intrinsic_discard ||
-       intr->intrinsic == nir_intrinsic_terminate) {
+   if (intr->intrinsic == nir_intrinsic_terminate) {
       nir_demote(builder);
       condition = nir_imm_true(builder);
    } else {
@@ -1921,7 +1926,7 @@ dxil_nir_ensure_position_writes(nir_shader *s)
       return false;
 
    return nir_shader_intrinsics_pass(s, update_writes,
-                                       nir_metadata_block_index | nir_metadata_dominance,
+                                       nir_metadata_control_flow,
                                        NULL);
 }
 
@@ -2024,8 +2029,7 @@ bool
 dxil_nir_lower_num_subgroups(nir_shader *s)
 {
    return nir_shader_intrinsics_pass(s, lower_num_subgroups,
-                                       nir_metadata_block_index |
-                                       nir_metadata_dominance |
+                                       nir_metadata_control_flow |
                                        nir_metadata_loop_analysis, NULL);
 }
 
@@ -2068,8 +2072,7 @@ split_unaligned_load(nir_builder *b, nir_intrinsic_instr *intrin, unsigned align
    }
 
    nir_def *new_dest = nir_extract_bits(b, srcs, num_loads, 0, num_comps, intrin->def.bit_size);
-   nir_def_rewrite_uses(&intrin->def, new_dest);
-   nir_instr_remove(&intrin->instr);
+   nir_def_replace(&intrin->def, new_dest);
 }
 
 static void
@@ -2264,36 +2267,17 @@ dxil_nir_lower_unsupported_subgroup_scan(nir_shader *s)
    return ret;
 }
 
-static bool
-lower_load_face(nir_builder *b, nir_intrinsic_instr *intr, void *data)
-{
-   if (intr->intrinsic != nir_intrinsic_load_front_face)
-      return false;
-
-   b->cursor = nir_before_instr(&intr->instr);
-
-   nir_variable *var = data;
-   nir_def *load = nir_ine_imm(b, nir_load_var(b, var), 0);
-
-   nir_def_rewrite_uses(&intr->def, load);
-   nir_instr_remove(&intr->instr);
-   return true;
-}
-
 bool
 dxil_nir_forward_front_face(nir_shader *nir)
 {
    assert(nir->info.stage == MESA_SHADER_FRAGMENT);
 
-   nir_variable *var = nir_variable_create(nir, nir_var_shader_in,
-                                           glsl_uint_type(),
-                                           "gl_FrontFacing");
-   var->data.location = VARYING_SLOT_VAR12;
-   var->data.interpolation = INTERP_MODE_FLAT;
-
-   return nir_shader_intrinsics_pass(nir, lower_load_face,
-                                       nir_metadata_block_index | nir_metadata_dominance,
-                                       var);
+   nir_variable *var = nir_find_variable_with_location(nir, nir_var_shader_in, VARYING_SLOT_FACE);
+   if (var) {
+      var->data.location = VARYING_SLOT_VAR12;
+      return true;
+   }
+   return false;
 }
 
 static bool
@@ -2331,7 +2315,7 @@ bool
 dxil_nir_move_consts(nir_shader *s)
 {
    return nir_shader_instructions_pass(s, move_consts,
-                                       nir_metadata_block_index | nir_metadata_dominance,
+                                       nir_metadata_control_flow,
                                        NULL);
 }
 
@@ -2373,7 +2357,7 @@ set_input_bits(struct dxil_module *mod, nir_intrinsic_instr *intr, BITSET_WORD *
    nir_src *row_src = intr->intrinsic == nir_intrinsic_load_per_vertex_input ? &intr->src[1] : &intr->src[0];
    bool is_patch_constant = mod->shader_kind == DXIL_DOMAIN_SHADER && intr->intrinsic == nir_intrinsic_load_input;
    const struct dxil_signature_record *sig_rec = is_patch_constant ?
-      &mod->patch_consts[nir_intrinsic_base(intr)] :
+      &mod->patch_consts[mod->patch_mappings[nir_intrinsic_base(intr)]] :
       &mod->inputs[mod->input_mappings[nir_intrinsic_base(intr)]];
    if (is_patch_constant) {
       /* Redirect to the second I/O table */
@@ -2405,8 +2389,8 @@ set_output_bits(struct dxil_module *mod, nir_intrinsic_instr *intr, BITSET_WORD 
    nir_src *row_src = intr->intrinsic == nir_intrinsic_store_per_vertex_output ? &intr->src[2] : &intr->src[1];
    bool is_patch_constant = mod->shader_kind == DXIL_HULL_SHADER && intr->intrinsic == nir_intrinsic_store_output;
    const struct dxil_signature_record *sig_rec = is_patch_constant ?
-      &mod->patch_consts[nir_intrinsic_base(intr)] :
-      &mod->outputs[nir_intrinsic_base(intr)];
+      &mod->patch_consts[mod->patch_mappings[nir_intrinsic_base(intr)]] :
+      &mod->outputs[mod->output_mappings[nir_intrinsic_base(intr)]];
    for (uint32_t component = 0; component < intr->num_components; ++component) {
       uint32_t base_element = 0;
       uint32_t num_elements = sig_rec->num_elements;
@@ -2835,6 +2819,188 @@ bool
 dxil_nir_lower_coherent_loads_and_stores(nir_shader *s)
 {
    return nir_shader_intrinsics_pass(s, lower_coherent_load_store,
-                                     nir_metadata_block_index | nir_metadata_dominance | nir_metadata_loop_analysis,
+                                     nir_metadata_control_flow | nir_metadata_loop_analysis,
                                      NULL);
+}
+
+struct undefined_varying_masks {
+   uint64_t io_mask;
+   uint32_t patch_io_mask;
+   const BITSET_WORD *frac_io_mask;
+};
+
+static bool
+is_dead_in_variable(nir_variable *var, void *data)
+{
+   switch (var->data.location) {
+   /* Only these values can be system generated values in addition to varyings */
+   case VARYING_SLOT_PRIMITIVE_ID:
+   case VARYING_SLOT_FACE:
+   case VARYING_SLOT_VIEW_INDEX:
+      return false;
+   /* Tessellation input vars must remain untouched */
+   case VARYING_SLOT_TESS_LEVEL_INNER:
+   case VARYING_SLOT_TESS_LEVEL_OUTER:
+      return false;
+   default:
+      return true;
+   }
+}
+
+static bool
+kill_undefined_varyings(struct nir_builder *b,
+                        nir_instr *instr,
+                        void *data)
+{
+   const struct undefined_varying_masks *masks = data;
+
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+
+   if (intr->intrinsic != nir_intrinsic_load_deref)
+      return false;
+
+   nir_variable *var = nir_intrinsic_get_var(intr, 0);
+   if (!var || var->data.mode != nir_var_shader_in)
+      return false;
+
+   if (!is_dead_in_variable(var, NULL))
+      return false;
+
+   uint32_t loc = var->data.patch && var->data.location >= VARYING_SLOT_PATCH0 ?
+      var->data.location - VARYING_SLOT_PATCH0 :
+      var->data.location;
+   uint64_t written = var->data.patch && var->data.location >= VARYING_SLOT_PATCH0 ?
+      masks->patch_io_mask : masks->io_mask;
+   if (BITFIELD64_RANGE(loc, glsl_varying_count(var->type)) & written) {
+      if (!masks->frac_io_mask || !var->data.location_frac ||
+          var->data.location < VARYING_SLOT_VAR0 ||
+          BITSET_TEST(masks->frac_io_mask, (var->data.location - VARYING_SLOT_VAR0) * 4 + var->data.location_frac))
+      return false;
+   }
+
+   b->cursor = nir_after_instr(instr);
+   /* Note: zero is used instead of undef, because optimization is not run here, but is
+    * run later on. If we load an undef here, and that undef ends up being used to store
+    * to position later on, that can cause some or all of the components in that position
+    * write to be removed, which is problematic especially in the case of all components,
+    * since that would remove the store instruction, and would make it tricky to satisfy
+    * the DXIL requirements of writing all position components.
+    */
+   nir_def *zero = nir_imm_zero(b, intr->def.num_components,
+                                       intr->def.bit_size);
+   nir_def_replace(&intr->def, zero);
+   return true;
+}
+
+bool
+dxil_nir_kill_undefined_varyings(nir_shader *shader, uint64_t prev_stage_written_mask, uint32_t prev_stage_patch_written_mask,
+                                 const BITSET_WORD *prev_stage_frac_output_mask)
+{
+   struct undefined_varying_masks masks = {
+      .io_mask = prev_stage_written_mask,
+      .patch_io_mask = prev_stage_patch_written_mask,
+      .frac_io_mask = prev_stage_frac_output_mask
+   };
+   bool progress = nir_shader_instructions_pass(shader,
+                                                kill_undefined_varyings,
+                                                nir_metadata_control_flow |
+                                                nir_metadata_loop_analysis,
+                                                (void *)&masks);
+   if (progress) {
+      nir_opt_dce(shader);
+      nir_remove_dead_derefs(shader);
+   }
+
+   const struct nir_remove_dead_variables_options options = {
+      .can_remove_var = is_dead_in_variable,
+      .can_remove_var_data = &masks,
+   };
+   progress |= nir_remove_dead_variables(shader, nir_var_shader_in, &options);
+   return progress;
+}
+
+static bool
+is_dead_out_variable(nir_variable *var, void *data)
+{
+   return !nir_slot_is_sysval_output(var->data.location, MESA_SHADER_NONE);
+}
+
+static bool
+kill_unused_outputs(struct nir_builder *b,
+                    nir_instr *instr,
+                    void *data)
+{
+   const struct undefined_varying_masks *masks = data;
+
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+
+   if (intr->intrinsic != nir_intrinsic_store_deref &&
+       intr->intrinsic != nir_intrinsic_load_deref)
+      return false;
+
+   nir_variable *var = nir_intrinsic_get_var(intr, 0);
+   if (!var || var->data.mode != nir_var_shader_out ||
+       /* always_active_io can mean two things: xfb or GL separable shaders. We can't delete
+        * varyings that are used for xfb (we'll just sort them last), but we must delete varyings
+        * that are mismatching between TCS and TES. Fortunately TCS can't do xfb, so we can ignore
+        the always_active_io bit for TCS outputs. */
+       (b->shader->info.stage != MESA_SHADER_TESS_CTRL && var->data.always_active_io))
+      return false;
+
+   if (!is_dead_out_variable(var, NULL))
+      return false;
+
+   unsigned loc = var->data.patch && var->data.location >= VARYING_SLOT_PATCH0 ?
+      var->data.location - VARYING_SLOT_PATCH0 :
+      var->data.location;
+   uint64_t read = var->data.patch && var->data.location >= VARYING_SLOT_PATCH0 ?
+      masks->patch_io_mask : masks->io_mask;
+   if (BITFIELD64_RANGE(loc, glsl_varying_count(var->type)) & read) {
+      if (!masks->frac_io_mask || !var->data.location_frac ||
+          var->data.location < VARYING_SLOT_VAR0 ||
+          BITSET_TEST(masks->frac_io_mask, (var->data.location - VARYING_SLOT_VAR0) * 4 + var->data.location_frac))
+      return false;
+   }
+
+   if (intr->intrinsic == nir_intrinsic_load_deref) {
+      b->cursor = nir_after_instr(&intr->instr);
+      nir_def *zero = nir_imm_zero(b, intr->def.num_components, intr->def.bit_size);
+      nir_def_rewrite_uses(&intr->def, zero);
+   }
+   nir_instr_remove(instr);
+   return true;
+}
+
+bool
+dxil_nir_kill_unused_outputs(nir_shader *shader, uint64_t next_stage_read_mask, uint32_t next_stage_patch_read_mask,
+                             const BITSET_WORD *next_stage_frac_input_mask)
+{
+   struct undefined_varying_masks masks = {
+      .io_mask = next_stage_read_mask,
+      .patch_io_mask = next_stage_patch_read_mask,
+      .frac_io_mask = next_stage_frac_input_mask
+   };
+
+   bool progress = nir_shader_instructions_pass(shader,
+                                                kill_unused_outputs,
+                                                nir_metadata_control_flow |
+                                                nir_metadata_loop_analysis,
+                                                (void *)&masks);
+
+   if (progress) {
+      nir_opt_dce(shader);
+      nir_remove_dead_derefs(shader);
+   }
+   const struct nir_remove_dead_variables_options options = {
+      .can_remove_var = is_dead_out_variable,
+      .can_remove_var_data = &masks,
+   };
+   progress |= nir_remove_dead_variables(shader, nir_var_shader_out, &options);
+   return progress;
 }

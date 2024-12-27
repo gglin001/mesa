@@ -1,7 +1,9 @@
 use std::{
+    alloc::Layout,
+    collections::{btree_map::Entry, BTreeMap},
     hash::{Hash, Hasher},
     mem,
-    ops::Deref,
+    ops::{Add, Deref},
     ptr::{self, NonNull},
 };
 
@@ -107,7 +109,7 @@ macro_rules! offset_of {
 // See https://github.com/rust-lang/rust/issues/96284
 #[must_use]
 #[inline]
-pub const fn is_aligned<T>(ptr: *const T) -> bool
+pub fn is_aligned<T>(ptr: *const T) -> bool
 where
     T: Sized,
 {
@@ -119,7 +121,7 @@ where
 // See https://github.com/rust-lang/rust/issues/95228
 #[must_use]
 #[inline(always)]
-pub const fn addr<T>(ptr: *const T) -> usize {
+pub fn addr<T>(ptr: *const T) -> usize {
     // The libcore implementations of `addr` and `expose_addr` suggest that, while both transmuting
     // and casting to usize will give you the address of a ptr in the end, they are not identical
     // in their side-effects.
@@ -127,9 +129,74 @@ pub const fn addr<T>(ptr: *const T) -> usize {
     // aggressively around it.
     // Let's trust the libcore devs over clippy on whether a transmute also exposes a ptr.
     #[allow(clippy::transmutes_expressible_as_ptr_casts)]
-    // SAFETY: Pointer-to-integer transmutes are valid (if you are okay with losing the
-    // provenance).
+    // SAFETY: Pointer-to-integer transmutes are valid outside of const contexts (if you are okay
+    // with losing the provenance).
     unsafe {
         mem::transmute(ptr.cast::<()>())
+    }
+}
+
+pub trait AllocSize<P> {
+    fn size(&self) -> P;
+}
+
+impl AllocSize<usize> for Layout {
+    fn size(&self) -> usize {
+        Self::size(self)
+    }
+}
+
+pub struct TrackedPointers<P, T: AllocSize<P>> {
+    ptrs: BTreeMap<P, T>,
+}
+
+impl<P, T: AllocSize<P>> TrackedPointers<P, T> {
+    pub fn new() -> Self {
+        Self {
+            ptrs: BTreeMap::new(),
+        }
+    }
+}
+
+impl<P, T: AllocSize<P>> TrackedPointers<P, T>
+where
+    P: Ord + Add<Output = P> + Copy,
+{
+    pub fn contains_key(&self, ptr: P) -> bool {
+        self.ptrs.contains_key(&ptr)
+    }
+
+    pub fn entry(&mut self, ptr: P) -> Entry<P, T> {
+        self.ptrs.entry(ptr)
+    }
+
+    pub fn find_alloc(&self, ptr: P) -> Option<(P, &T)> {
+        if let Some((&base, val)) = self.ptrs.range(..=ptr).next_back() {
+            let size = val.size();
+            // we check if ptr is within [base..base+size)
+            // means we can check if ptr - (base + size) < 0
+            if ptr < (base + size) {
+                return Some((base, val));
+            }
+        }
+        None
+    }
+
+    pub fn find_alloc_precise(&self, ptr: P) -> Option<&T> {
+        self.ptrs.get(&ptr)
+    }
+
+    pub fn insert(&mut self, ptr: P, val: T) -> Option<T> {
+        self.ptrs.insert(ptr, val)
+    }
+
+    pub fn remove(&mut self, ptr: P) -> Option<T> {
+        self.ptrs.remove(&ptr)
+    }
+}
+
+impl<P, T: AllocSize<P>> Default for TrackedPointers<P, T> {
+    fn default() -> Self {
+        Self::new()
     }
 }

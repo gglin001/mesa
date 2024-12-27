@@ -34,8 +34,6 @@
 
 using namespace elk;
 
-#define REG_CLASS_COUNT 20
-
 static void
 assign_reg(const struct intel_device_info *devinfo,
            unsigned *reg_hw_locations, elk_fs_reg *reg)
@@ -344,6 +342,9 @@ public:
       spill_node_count = 0;
    }
 
+   elk_fs_reg_alloc(const elk_fs_reg_alloc &) = delete;
+   elk_fs_reg_alloc & operator=(const elk_fs_reg_alloc &) = delete;
+
    ~elk_fs_reg_alloc()
    {
       ralloc_free(mem_ctx);
@@ -364,9 +365,9 @@ private:
    elk_fs_reg build_single_offset(const fs_builder &bld,
                               uint32_t spill_offset, int ip);
 
-   void emit_unspill(const fs_builder &bld, struct shader_stats *stats,
+   void emit_unspill(const fs_builder &bld, struct elk_shader_stats *stats,
                      elk_fs_reg dst, uint32_t spill_offset, unsigned count, int ip);
-   void emit_spill(const fs_builder &bld, struct shader_stats *stats,
+   void emit_spill(const fs_builder &bld, struct elk_shader_stats *stats,
                    elk_fs_reg src, uint32_t spill_offset, unsigned count, int ip);
 
    void set_spill_costs();
@@ -774,7 +775,7 @@ elk_fs_reg_alloc::build_lane_offsets(const fs_builder &bld, uint32_t spill_offse
 
 void
 elk_fs_reg_alloc::emit_unspill(const fs_builder &bld,
-                           struct shader_stats *stats,
+                           struct elk_shader_stats *stats,
                            elk_fs_reg dst,
                            uint32_t spill_offset, unsigned count, int ip)
 {
@@ -812,7 +813,7 @@ elk_fs_reg_alloc::emit_unspill(const fs_builder &bld,
 
 void
 elk_fs_reg_alloc::emit_spill(const fs_builder &bld,
-                         struct shader_stats *stats,
+                         struct elk_shader_stats *stats,
                          elk_fs_reg src,
                          uint32_t spill_offset, unsigned count, int ip)
 {

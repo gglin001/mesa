@@ -43,21 +43,14 @@
  * compressed formats, so we offer a helper to test if a format is supported */
 
 bool
-panfrost_supports_compressed_format(struct panfrost_device *dev, unsigned fmt)
+panfrost_supports_compressed_format(struct panfrost_device *dev,
+                                    unsigned texfeat_bit)
 {
-   if (MALI_EXTRACT_TYPE(fmt) != MALI_FORMAT_COMPRESSED)
-      return true;
-
-   unsigned idx = fmt & ~MALI_FORMAT_COMPRESSED;
-   assert(idx < 32);
-
-   return panfrost_query_compressed_formats(&dev->kmod.props) & (1 << idx);
+   assert(texfeat_bit < 32);
+   return dev->compressed_formats & BITFIELD_BIT(texfeat_bit);
 }
 
-/* Always reserve the lower 32MB. */
-#define PANFROST_VA_RESERVE_BOTTOM 0x2000000ull
-
-void
+int
 panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
 {
    dev->memctx = memctx;
@@ -65,7 +58,7 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
    dev->kmod.dev = pan_kmod_dev_create(fd, PAN_KMOD_DEV_FLAG_OWNS_FD, NULL);
    if (!dev->kmod.dev) {
       close(fd);
-      return;
+      return -1;
    }
 
    pan_kmod_dev_query_props(dev->kmod.dev, &dev->kmod.props);
@@ -78,13 +71,13 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
    if (!dev->model)
       goto err_free_kmod_dev;
 
-   /* 32bit address space, with the lower 32MB reserved. We clamp
+   /* 48bit address space max, with the lower 32MB reserved. We clamp
     * things so it matches kmod VA range limitations.
     */
-   uint64_t user_va_start = panfrost_clamp_to_usable_va_range(
-      dev->kmod.dev, PANFROST_VA_RESERVE_BOTTOM);
+   uint64_t user_va_start =
+      panfrost_clamp_to_usable_va_range(dev->kmod.dev, PAN_VA_USER_START);
    uint64_t user_va_end =
-      panfrost_clamp_to_usable_va_range(dev->kmod.dev, 1ull << 32);
+      panfrost_clamp_to_usable_va_range(dev->kmod.dev, PAN_VA_USER_END);
 
    dev->kmod.vm = pan_kmod_vm_create(
       dev->kmod.dev, PAN_KMOD_VM_FLAG_AUTO_VA | PAN_KMOD_VM_FLAG_TRACK_ACTIVITY,
@@ -100,6 +93,7 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
       panfrost_query_compressed_formats(&dev->kmod.props);
    dev->tiler_features = panfrost_query_tiler_features(&dev->kmod.props);
    dev->has_afbc = panfrost_query_afbc(&dev->kmod.props);
+   dev->has_afrc = panfrost_query_afrc(&dev->kmod.props);
    dev->formats = panfrost_format_table(dev->arch);
    dev->blendable_formats = panfrost_blendable_format_table(dev->arch);
 
@@ -126,6 +120,8 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
    if (dev->arch < 10) {
       dev->tiler_heap = panfrost_bo_create(
          dev, 128 * 1024 * 1024, PAN_BO_INVISIBLE | PAN_BO_GROWABLE, "Tiler heap");
+      if (!dev->tiler_heap)
+         goto err_free_kmod_dev;
    }
 
    pthread_mutex_init(&dev->submit_lock, NULL);
@@ -133,12 +129,25 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
    /* Done once on init */
    dev->sample_positions = panfrost_bo_create(
       dev, panfrost_sample_positions_buffer_size(), 0, "Sample positions");
+   if (!dev->sample_positions)
+      goto err_free_kmod_dev;
+
    panfrost_upload_sample_positions(dev->sample_positions->ptr.cpu);
-   return;
+   return 0;
 
 err_free_kmod_dev:
+   if (dev->decode_ctx)
+      pandecode_destroy_context(dev->decode_ctx);
+
+   panfrost_bo_unreference(dev->tiler_heap);
+   panfrost_bo_unreference(dev->sample_positions);
+
+   if (dev->kmod.vm)
+      pan_kmod_vm_destroy(dev->kmod.vm);
+
    pan_kmod_dev_destroy(dev->kmod.dev);
    dev->kmod.dev = NULL;
+   return -1;
 }
 
 void

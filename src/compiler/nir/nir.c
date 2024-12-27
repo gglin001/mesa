@@ -502,6 +502,14 @@ nir_function_create(nir_shader *shader, const char *name)
    func->is_preamble = false;
    func->dont_inline = false;
    func->should_inline = false;
+   func->is_subroutine = false;
+   func->is_tmp_globals_wrapper = false;
+   func->subroutine_index = 0;
+   func->num_subroutine_types = 0;
+   func->subroutine_types = NULL;
+   func->workgroup_size[0] = 0;
+   func->workgroup_size[1] = 0;
+   func->workgroup_size[2] = 0;
 
    /* Only meaningful for shader libraries, so don't export by default. */
    func->is_exported = false;
@@ -640,7 +648,8 @@ nir_loop_create(nir_shader *shader)
 
    cf_init(&loop->cf_node, nir_cf_node_loop);
    /* Assume that loops are divergent until proven otherwise */
-   loop->divergent = true;
+   loop->divergent_break = true;
+   loop->divergent_continue = true;
 
    nir_block *body = nir_block_create(shader);
    exec_list_make_empty(&loop->body);
@@ -872,6 +881,26 @@ nir_parallel_copy_instr_create(nir_shader *shader)
    instr_init(&instr->instr, nir_instr_type_parallel_copy);
 
    exec_list_make_empty(&instr->entries);
+
+   return instr;
+}
+
+nir_debug_info_instr *
+nir_debug_info_instr_create(nir_shader *shader, nir_debug_info_type type,
+                            uint32_t string_length)
+{
+   uint32_t additional_size = 0;
+   if (type == nir_debug_info_string)
+      additional_size = string_length + 1;
+
+   nir_debug_info_instr *instr = gc_zalloc_size(
+      shader->gctx, sizeof(nir_debug_info_instr) + additional_size, 1);
+   instr_init(&instr->instr, nir_instr_type_debug_info);
+
+   instr->type = type;
+
+   if (type == nir_debug_info_string)
+      instr->string_length = string_length;
 
    return instr;
 }
@@ -1122,10 +1151,24 @@ nir_instr_move(nir_cursor cursor, nir_instr *instr)
    /* If the cursor happens to refer to this instruction (either before or
     * after), don't do anything.
     */
-   if ((cursor.option == nir_cursor_before_instr ||
-        cursor.option == nir_cursor_after_instr) &&
-       cursor.instr == instr)
-      return false;
+   switch (cursor.option) {
+   case nir_cursor_before_instr:
+      if (cursor.instr == instr || nir_instr_prev(cursor.instr) == instr)
+         return false;
+      break;
+   case nir_cursor_after_instr:
+      if (cursor.instr == instr || nir_instr_next(cursor.instr) == instr)
+         return false;
+      break;
+   case nir_cursor_before_block:
+      if (cursor.block == instr->block && nir_instr_is_first(instr))
+         return false;
+      break;
+   case nir_cursor_after_block:
+      if (cursor.block == instr->block && nir_instr_is_last(instr))
+         return false;
+      break;
+   }
 
    nir_instr_remove(instr);
    nir_instr_insert(cursor, instr);
@@ -1325,6 +1368,9 @@ nir_instr_def(nir_instr *instr)
    case nir_instr_type_undef:
       return &nir_instr_as_undef(instr)->def;
 
+   case nir_instr_type_debug_info:
+      return &nir_instr_as_debug_info(instr)->def;
+
    case nir_instr_type_call:
    case nir_instr_type_jump:
       return NULL;
@@ -1397,6 +1443,16 @@ nir_src_as_const_value(nir_src src)
    return load->value;
 }
 
+const char *
+nir_src_as_string(nir_src src)
+{
+   nir_debug_info_instr *di = nir_src_as_debug_info(src);
+   if (di && di->type == nir_debug_info_string)
+      return di->string;
+
+   return NULL;
+}
+
 /**
  * Returns true if the source is known to be always uniform. Otherwise it
  * returns false which means it may or may not be uniform but it can't be
@@ -1443,6 +1499,17 @@ nir_src_is_always_uniform(nir_src src)
     * called with uniform arguments.
     */
    return false;
+}
+
+nir_block *
+nir_src_get_block(nir_src *src)
+{
+   if (nir_src_is_if(src))
+      return nir_cf_node_cf_tree_prev(&nir_src_parent_if(src)->cf_node);
+   else if (nir_src_parent_instr(src)->type == nir_instr_type_phi)
+      return list_entry(src, nir_phi_src, src)->pred;
+   else
+      return nir_src_parent_instr(src)->block;
 }
 
 static void
@@ -1507,6 +1574,7 @@ nir_def_init(nir_instr *instr, nir_def *def,
    def->num_components = num_components;
    def->bit_size = bit_size;
    def->divergent = true; /* This is the safer default */
+   def->loop_invariant = false;
 
    if (instr->block) {
       nir_function_impl *impl =
@@ -1654,6 +1722,33 @@ nir_def_all_uses_are_fsat(const nir_def *def)
          return false;
    }
 
+   return true;
+}
+
+bool
+nir_def_all_uses_ignore_sign_bit(const nir_def *def)
+{
+   nir_foreach_use(use, def) {
+      if (nir_src_is_if(use))
+         return false;
+      nir_instr *instr = nir_src_parent_instr(use);
+
+      if (instr->type != nir_instr_type_alu)
+         return false;
+
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      if (alu->op == nir_op_fabs) {
+         continue;
+      } else if (alu->op == nir_op_fmul || alu->op == nir_op_ffma) {
+         nir_alu_src *alu_src = list_entry(use, nir_alu_src, src);
+         unsigned src_index = alu_src - alu->src;
+         /* a * a doesn't care about sign of a. */
+         if (src_index < 2 && nir_alu_srcs_equal(alu, alu, 0, 1))
+            continue;
+      }
+
+      return false;
+   }
    return true;
 }
 
@@ -2054,8 +2149,7 @@ nir_function_impl_lower_instructions(nir_function_impl *impl,
 {
    nir_builder b = nir_builder_create(impl);
 
-   nir_metadata preserved = nir_metadata_block_index |
-                            nir_metadata_dominance;
+   nir_metadata preserved = nir_metadata_control_flow;
 
    bool progress = false;
    nir_cursor iter = nir_before_impl(impl);
@@ -2153,8 +2247,8 @@ bool
 nir_shader_supports_implicit_lod(nir_shader *shader)
 {
    return (shader->info.stage == MESA_SHADER_FRAGMENT ||
-           (shader->info.stage == MESA_SHADER_COMPUTE &&
-            shader->info.cs.derivative_group != DERIVATIVE_GROUP_NONE));
+           (gl_shader_stage_uses_workgroup(shader->info.stage) &&
+            shader->info.derivative_group != DERIVATIVE_GROUP_NONE));
 }
 
 nir_intrinsic_op
@@ -2181,6 +2275,8 @@ nir_intrinsic_from_system_value(gl_system_value val)
       return nir_intrinsic_load_invocation_id;
    case SYSTEM_VALUE_FRAG_COORD:
       return nir_intrinsic_load_frag_coord;
+   case SYSTEM_VALUE_PIXEL_COORD:
+      return nir_intrinsic_load_pixel_coord;
    case SYSTEM_VALUE_POINT_COORD:
       return nir_intrinsic_load_point_coord;
    case SYSTEM_VALUE_LINE_COORD:
@@ -2203,6 +2299,8 @@ nir_intrinsic_from_system_value(gl_system_value val)
       return nir_intrinsic_load_local_invocation_index;
    case SYSTEM_VALUE_WORKGROUP_ID:
       return nir_intrinsic_load_workgroup_id;
+   case SYSTEM_VALUE_BASE_WORKGROUP_ID:
+      return nir_intrinsic_load_base_workgroup_id;
    case SYSTEM_VALUE_WORKGROUP_INDEX:
       return nir_intrinsic_load_workgroup_index;
    case SYSTEM_VALUE_NUM_WORKGROUPS:
@@ -2255,6 +2353,8 @@ nir_intrinsic_from_system_value(gl_system_value val)
       return nir_intrinsic_load_base_global_invocation_id;
    case SYSTEM_VALUE_GLOBAL_INVOCATION_INDEX:
       return nir_intrinsic_load_global_invocation_index;
+   case SYSTEM_VALUE_GLOBAL_GROUP_SIZE:
+      return nir_intrinsic_load_global_size;
    case SYSTEM_VALUE_WORK_DIM:
       return nir_intrinsic_load_work_dim;
    case SYSTEM_VALUE_USER_DATA_AMD:
@@ -2314,7 +2414,7 @@ nir_intrinsic_from_system_value(gl_system_value val)
    case SYSTEM_VALUE_SM_ID_NV:
       return nir_intrinsic_load_sm_id_nv;
    default:
-      unreachable("system value does not directly correspond to intrinsic");
+      return nir_num_intrinsics;
    }
 }
 
@@ -2342,6 +2442,8 @@ nir_system_value_from_intrinsic(nir_intrinsic_op intrin)
       return SYSTEM_VALUE_INVOCATION_ID;
    case nir_intrinsic_load_frag_coord:
       return SYSTEM_VALUE_FRAG_COORD;
+   case nir_intrinsic_load_pixel_coord:
+      return SYSTEM_VALUE_PIXEL_COORD;
    case nir_intrinsic_load_point_coord:
       return SYSTEM_VALUE_POINT_COORD;
    case nir_intrinsic_load_line_coord:
@@ -2366,6 +2468,8 @@ nir_system_value_from_intrinsic(nir_intrinsic_op intrin)
       return SYSTEM_VALUE_NUM_WORKGROUPS;
    case nir_intrinsic_load_workgroup_id:
       return SYSTEM_VALUE_WORKGROUP_ID;
+   case nir_intrinsic_load_base_workgroup_id:
+      return SYSTEM_VALUE_BASE_WORKGROUP_ID;
    case nir_intrinsic_load_workgroup_index:
       return SYSTEM_VALUE_WORKGROUP_INDEX;
    case nir_intrinsic_load_primitive_id:
@@ -2417,6 +2521,8 @@ nir_system_value_from_intrinsic(nir_intrinsic_op intrin)
       return SYSTEM_VALUE_BASE_GLOBAL_INVOCATION_ID;
    case nir_intrinsic_load_global_invocation_index:
       return SYSTEM_VALUE_GLOBAL_INVOCATION_INDEX;
+   case nir_intrinsic_load_global_size:
+      return SYSTEM_VALUE_GLOBAL_GROUP_SIZE;
    case nir_intrinsic_load_work_dim:
       return SYSTEM_VALUE_WORK_DIM;
    case nir_intrinsic_load_user_data_amd:
@@ -2566,6 +2672,7 @@ nir_rewrite_image_intrinsic(nir_intrinsic_instr *intrin, nir_def *src,
       CASE(load_raw_intel)
       CASE(store_raw_intel)
       CASE(fragment_mask_load_amd)
+      CASE(store_block_agx)
 #undef CASE
    default:
       unreachable("Unhanded image intrinsic");
@@ -2598,6 +2705,42 @@ nir_image_intrinsic_coord_components(const nir_intrinsic_instr *instr)
       return coords;
    else
       return coords + nir_intrinsic_image_array(instr);
+}
+
+bool
+nir_intrinsic_can_reorder(nir_intrinsic_instr *instr)
+{
+   if (nir_intrinsic_has_access(instr)) {
+      enum gl_access_qualifier access = nir_intrinsic_access(instr);
+      if (access & ACCESS_VOLATILE)
+         return false;
+      if (access & ACCESS_CAN_REORDER)
+         return true;
+   }
+
+   const nir_intrinsic_info *info;
+   if (instr->intrinsic == nir_intrinsic_load_deref) {
+      nir_deref_instr *deref = nir_src_as_deref(instr->src[0]);
+      if (nir_deref_mode_is_in_set(deref, nir_var_system_value)) {
+         nir_variable *var = nir_deref_instr_get_variable(deref);
+         if (!var)
+            return false;
+
+         nir_intrinsic_op sysval_op =
+            nir_intrinsic_from_system_value((gl_system_value)var->data.location);
+         if (sysval_op == nir_num_intrinsics)
+            return true;
+
+         info = &nir_intrinsic_infos[sysval_op];
+      } else {
+         return nir_deref_mode_is_in_set(deref, nir_var_read_only_modes);
+      }
+   } else {
+      info = &nir_intrinsic_infos[instr->intrinsic];
+   }
+
+   return (info->flags & NIR_INTRINSIC_CAN_ELIMINATE) &&
+          (info->flags & NIR_INTRINSIC_CAN_REORDER);
 }
 
 nir_src *
@@ -2898,8 +3041,14 @@ nir_alu_instr_is_comparison(const nir_alu_instr *instr)
    switch (instr->op) {
       CASE_ALL_SIZES(nir_op_flt)
       CASE_ALL_SIZES(nir_op_fge)
+      CASE_ALL_SIZES(nir_op_fltu)
+      CASE_ALL_SIZES(nir_op_fgeu)
       CASE_ALL_SIZES(nir_op_feq)
       CASE_ALL_SIZES(nir_op_fneu)
+      CASE_ALL_SIZES(nir_op_fequ)
+      CASE_ALL_SIZES(nir_op_fneo)
+      CASE_ALL_SIZES(nir_op_funord)
+      CASE_ALL_SIZES(nir_op_ford)
       CASE_ALL_SIZES(nir_op_ilt)
       CASE_ALL_SIZES(nir_op_ult)
       CASE_ALL_SIZES(nir_op_ige)
@@ -2995,6 +3144,7 @@ nir_intrinsic_instr_dest_type(const nir_intrinsic_instr *intrin)
    }
 
    case nir_intrinsic_load_input:
+   case nir_intrinsic_load_per_primitive_input:
    case nir_intrinsic_load_uniform:
       return nir_intrinsic_dest_type(intrin);
 
@@ -3066,6 +3216,7 @@ nir_tex_instr_result_size(const nir_tex_instr *instr)
       case GLSL_SAMPLER_DIM_RECT:
       case GLSL_SAMPLER_DIM_EXTERNAL:
       case GLSL_SAMPLER_DIM_SUBPASS:
+      case GLSL_SAMPLER_DIM_SUBPASS_MS:
          ret = 2;
          break;
       case GLSL_SAMPLER_DIM_3D:
@@ -3087,6 +3238,7 @@ nir_tex_instr_result_size(const nir_tex_instr *instr)
    case nir_texop_samples_identical:
    case nir_texop_fragment_mask_fetch_amd:
    case nir_texop_lod_bias_agx:
+   case nir_texop_has_custom_border_color_agx:
       return 1;
 
    case nir_texop_descriptor_amd:
@@ -3097,6 +3249,9 @@ nir_tex_instr_result_size(const nir_tex_instr *instr)
 
    case nir_texop_hdr_dim_nv:
    case nir_texop_tex_type_nv:
+      return 4;
+
+   case nir_texop_custom_border_color_agx:
       return 4;
 
    default:
@@ -3118,6 +3273,10 @@ nir_tex_instr_is_query(const nir_tex_instr *instr)
    case nir_texop_descriptor_amd:
    case nir_texop_sampler_descriptor_amd:
    case nir_texop_lod_bias_agx:
+   case nir_texop_custom_border_color_agx:
+   case nir_texop_has_custom_border_color_agx:
+   case nir_texop_hdr_dim_nv:
+   case nir_texop_tex_type_nv:
       return true;
    case nir_texop_tex:
    case nir_texop_txb:
@@ -3199,6 +3358,8 @@ nir_tex_instr_src_type(const nir_tex_instr *instr, unsigned src)
    case nir_tex_src_plane:
       return nir_type_int;
 
+   case nir_tex_src_sampler_deref_intrinsic:
+   case nir_tex_src_texture_deref_intrinsic:
    case nir_tex_src_ms_mcs_intel:
    case nir_tex_src_texture_deref:
    case nir_tex_src_sampler_deref:
@@ -3421,9 +3582,80 @@ nir_remove_non_exported(nir_shader *nir)
    }
 }
 
+/*
+ * After precompiling entrypoints from a kernel library, we want to garbage
+ * collect the NIR entrypoints but leave the exported library functions. This
+ * helper does that.
+ */
+void
+nir_remove_entrypoints(nir_shader *nir)
+{
+   nir_foreach_entrypoint_safe(func, nir) {
+      exec_node_remove(&func->node);
+   }
+}
+
 unsigned
 nir_static_workgroup_size(const nir_shader *s)
 {
    return s->info.workgroup_size[0] * s->info.workgroup_size[1] *
           s->info.workgroup_size[2];
 }
+
+bool
+nir_block_contains_work(nir_block *block)
+{
+   if (!nir_cf_node_is_last(&block->cf_node))
+      return true;
+
+   nir_foreach_instr(instr, block) {
+      if (instr->type == nir_instr_type_phi)
+         continue;
+      if (instr->type != nir_instr_type_alu ||
+          !nir_op_is_vec_or_mov(nir_instr_as_alu(instr)->op))
+         return true;
+   }
+
+   return false;
+}
+
+nir_op
+nir_atomic_op_to_alu(nir_atomic_op op)
+{
+   switch (op) {
+   case nir_atomic_op_iadd:
+      return nir_op_iadd;
+   case nir_atomic_op_imin:
+      return nir_op_imin;
+   case nir_atomic_op_umin:
+      return nir_op_umin;
+   case nir_atomic_op_imax:
+      return nir_op_imax;
+   case nir_atomic_op_umax:
+      return nir_op_umax;
+   case nir_atomic_op_iand:
+      return nir_op_iand;
+   case nir_atomic_op_ior:
+      return nir_op_ior;
+   case nir_atomic_op_ixor:
+      return nir_op_ixor;
+   case nir_atomic_op_fadd:
+      return nir_op_fadd;
+   case nir_atomic_op_fmin:
+      return nir_op_fmin;
+   case nir_atomic_op_fmax:
+      return nir_op_fmax;
+
+   /* We don't handle exchanges or wraps */
+   case nir_atomic_op_xchg:
+   case nir_atomic_op_cmpxchg:
+   case nir_atomic_op_fcmpxchg:
+   case nir_atomic_op_inc_wrap:
+   case nir_atomic_op_dec_wrap:
+   case nir_atomic_op_ordered_add_gfx12_amd:
+      return nir_num_opcodes;
+   }
+
+   unreachable("Invalid nir_atomic_op");
+}
+

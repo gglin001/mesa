@@ -315,7 +315,7 @@ with the IR:
 
 .. code-block:: sh
 
-   ~/shader-db$ AGX_MESA_DEBUG=shaders,shaderdb ASAHI_MESA_DEBUG=precompile LIBGL_DRIVERS_PATH=~/lib/dri/ LD_PRELOAD=~/mesa/build/src/asahi/drm-shim/libasahi_noop_drm_shim.so ./run shaders/glmark/1-12.shader_test
+   ~/shader-db$ AGX_MESA_DEBUG=shaders,shaderdb ASAHI_MESA_DEBUG=precompile LD_PRELOAD=~/mesa/build/src/asahi/drm-shim/libasahi_noop_drm_shim.so ./run shaders/glmark/1-12.shader_test
 
 The drm-shim implementation for Asahi is located in ``src/asahi/drm-shim``. The
 drm-shim implementation there should be updated as new UABI is added.
@@ -342,7 +342,7 @@ concepts used in PowerVR GPUs appear in AGX.
 
    USC
    Unified Shader Cores
-      A unified shader core is a small cpu that runs shader code. The core is
+      A unified shader core is a small CPU that runs shader code. The core is
       unified because a single ISA is used for vertex, pixel and compute
       shaders. This differs from older GPUs where the vertex, fragment and
       compute have separate ISAs for shader stages.
@@ -359,5 +359,9 @@ concepts used in PowerVR GPUs appear in AGX.
 
    PBE
    Pixel BackEnd
-      Hardware unit which writes to color attachements and images. Also the
+      Hardware unit which writes to color attachments and images. Also the
       name for a descriptor passed to :term:`PBE` instructions.
+
+   UVS
+   Unified Vertex Store
+      Hardware unit which buffers the outputs of the vertex shader (varyings).

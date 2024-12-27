@@ -6,6 +6,8 @@
 #include "elk_nir_options.h"
 
 #define COMMON_OPTIONS                                                        \
+   .compact_arrays = true,                                                    \
+   .discard_is_demote = true,                                                 \
    .has_uclz = true,                                                          \
    .lower_fdiv = true,                                                        \
    .lower_scmp = true,                                                        \
@@ -23,13 +25,15 @@
    .lower_device_index_to_zero = true,                                        \
    .vectorize_io = true,                                                      \
    .vectorize_tess_levels = true,                                             \
-   .use_interpolated_input_intrinsics = true,                                 \
+   .scalarize_ddx = true,                                                     \
    .lower_insert_byte = true,                                                 \
    .lower_insert_word = true,                                                 \
    .vertex_id_zero_based = true,                                              \
    .lower_base_vertex = true,                                                 \
    .support_16bit_alu = true,                                                 \
-   .lower_uniforms_to_ubo = true
+   .lower_uniforms_to_ubo = true,                                             \
+   .support_indirect_inputs = (uint8_t)BITFIELD_MASK(PIPE_SHADER_TYPES),      \
+   .support_indirect_outputs = (uint8_t)BITFIELD_MASK(PIPE_SHADER_TYPES)
 
 #define COMMON_SCALAR_OPTIONS                                                 \
    .lower_to_scalar = true,                                                   \

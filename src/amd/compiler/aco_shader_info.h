@@ -5,24 +5,7 @@
  * based in part on anv driver which is:
  * Copyright © 2015 Intel Corporation
  *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 #ifndef ACO_SHADER_INFO_H
 #define ACO_SHADER_INFO_H
@@ -58,12 +41,14 @@ struct aco_vs_prolog_info {
 
    unsigned num_attributes;
    uint32_t misaligned_mask;
+   uint32_t unaligned_mask;
    bool is_ngg;
    gl_shader_stage next_stage;
 };
 
 struct aco_ps_epilog_info {
    struct ac_arg colors[MAX_DRAW_BUFFERS];
+   uint8_t color_map[MAX_DRAW_BUFFERS];
 
    uint32_t spi_shader_col_format;
 
@@ -74,35 +59,25 @@ struct aco_ps_epilog_info {
    bool mrt0_is_dual_src;
 
    bool alpha_to_coverage_via_mrtz;
+   bool alpha_to_one;
 
    /* OpenGL only */
    uint16_t color_types;
    bool clamp_color;
-   bool alpha_to_one;
    bool skip_null_export;
    unsigned broadcast_last_cbuf;
    enum compare_func alpha_func;
+   /* Depth/stencil/samplemask are always passed via VGPRs, and the epilog key can choose
+    * not to export them using these flags, which can be dynamic states.
+    */
+   bool kill_depth;
+   bool kill_stencil;
+   bool kill_samplemask;
+
    struct ac_arg alpha_reference;
    struct ac_arg depth;
    struct ac_arg stencil;
    struct ac_arg samplemask;
-};
-
-struct aco_tcs_epilog_info {
-   bool pass_tessfactors_by_reg;
-   bool tcs_out_patch_fits_subgroup;
-   enum tess_primitive_mode primitive_mode;
-   unsigned tess_offchip_ring_size;
-   bool tes_reads_tessfactors;
-
-   struct ac_arg invocation_id;
-   struct ac_arg rel_patch_id;
-   struct ac_arg tcs_out_current_patch_data_offset;
-   struct ac_arg patch_base;
-   struct ac_arg tess_lvl_in[2];
-   struct ac_arg tess_lvl_out[4];
-   struct ac_arg tcs_out_lds_layout;
-   struct ac_arg tcs_offchip_layout;
 };
 
 struct aco_ps_prolog_info {
@@ -134,13 +109,12 @@ struct aco_shader_info {
    bool has_ngg_early_prim_export;
    bool image_2d_view_of_3d;
    unsigned workgroup_size;
-   bool has_epilog;                        /* Only for TCS or PS. */
    bool merged_shader_compiled_separately; /* GFX9+ */
    struct ac_arg next_stage_pc;
    struct ac_arg epilog_pc; /* Vulkan only */
    struct {
       bool tcs_in_out_eq;
-      uint64_t tcs_temp_only_input_mask;
+      bool any_tcs_inputs_via_lds;
       bool has_prolog;
    } vs;
    struct {
@@ -148,20 +122,13 @@ struct aco_shader_info {
 
       /* Vulkan only */
       uint32_t num_lds_blocks;
-      uint32_t num_linked_outputs;
-      uint32_t num_linked_patch_outputs;
-      uint32_t tcs_vertices_out;
-
-      /* OpenGL only */
-      bool pass_tessfactors_by_reg;
-      unsigned patch_stride;
-      struct ac_arg tes_offchip_addr;
-      struct ac_arg vs_state_bits;
    } tcs;
    struct {
-      uint32_t num_interp;
+      uint32_t num_inputs;
       unsigned spi_ps_input_ena;
       unsigned spi_ps_input_addr;
+      bool has_prolog;
+      bool has_epilog;
 
       /* OpenGL only */
       struct ac_arg alpha_reference;
@@ -171,18 +138,16 @@ struct aco_shader_info {
    } cs;
 
    uint32_t gfx9_gs_ring_lds_size;
-
-   bool is_trap_handler_shader;
 };
 
 enum aco_compiler_debug_level {
-   ACO_COMPILER_DEBUG_LEVEL_PERFWARN,
    ACO_COMPILER_DEBUG_LEVEL_ERROR,
 };
 
 struct aco_compiler_options {
-   bool dump_shader;
+   bool dump_ir;
    bool dump_preoptir;
+   bool record_asm;
    bool record_ir;
    bool record_stats;
    bool has_ls_vgpr_init_bug;
@@ -231,6 +196,35 @@ enum aco_symbol_id {
 struct aco_symbol {
    enum aco_symbol_id id;
    unsigned offset;
+};
+
+#define MAX_SGPRS 108
+#define MAX_VGPRS       256
+#define MAX_LDS_SIZE    65536 /* 64 KiB */
+#define NUM_SAVED_VGPRS 2
+
+struct aco_trap_handler_layout {
+   uint32_t saved_vgprs[NUM_SAVED_VGPRS * 64];
+
+   uint32_t ttmp0;
+   uint32_t ttmp1;
+
+   struct {
+      uint32_t status;
+      uint32_t mode;
+      uint32_t trap_sts;
+      uint32_t hw_id1;
+      uint32_t gpr_alloc;
+      uint32_t lds_alloc;
+      uint32_t ib_sts;
+   } sq_wave_regs;
+
+   uint32_t m0;
+   uint32_t exec_lo;
+   uint32_t exec_hi;
+   uint32_t sgprs[MAX_SGPRS];
+   uint32_t vgprs[MAX_VGPRS * 64];
+   uint32_t lds[MAX_LDS_SIZE / 4];
 };
 
 #ifdef __cplusplus

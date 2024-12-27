@@ -40,9 +40,8 @@ typedef struct nir_builder {
    /* Whether new ALU instructions will be marked "exact" */
    bool exact;
 
-   /* Whether to run divergence analysis on inserted instructions (loop merge
-    * and header phis are not updated). */
-   bool update_divergence;
+   /* Float_controls2 bits. See nir_alu_instr for details. */
+   uint32_t fp_fast_math;
 
    nir_shader *shader;
    nir_function_impl *impl;
@@ -78,6 +77,8 @@ nir_builder MUST_CHECK PRINTFLIKE(3, 4)
 typedef bool (*nir_instr_pass_cb)(struct nir_builder *, nir_instr *, void *);
 typedef bool (*nir_intrinsic_pass_cb)(struct nir_builder *,
                                       nir_intrinsic_instr *, void *);
+typedef bool (*nir_alu_pass_cb)(struct nir_builder *,
+                                nir_alu_instr *, void *);
 
 /**
  * Iterates over all the instructions in a NIR function and calls the given pass
@@ -165,6 +166,39 @@ nir_shader_intrinsics_pass(nir_shader *shader,
          nir_foreach_instr_safe(instr, block) {
             if (instr->type == nir_instr_type_intrinsic) {
                nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               func_progress |= pass(&b, intr, cb_data);
+            }
+         }
+      }
+
+      if (func_progress) {
+         nir_metadata_preserve(impl, preserved);
+         progress = true;
+      } else {
+         nir_metadata_preserve(impl, nir_metadata_all);
+      }
+   }
+
+   return progress;
+}
+
+/* As above, but for ALU */
+static inline bool
+nir_shader_alu_pass(nir_shader *shader,
+                    nir_alu_pass_cb pass,
+                    nir_metadata preserved,
+                    void *cb_data)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, shader) {
+      bool func_progress = false;
+      nir_builder b = nir_builder_create(impl);
+
+      nir_foreach_block_safe(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type == nir_instr_type_alu) {
+               nir_alu_instr *intr = nir_instr_as_alu(instr);
                func_progress |= pass(&b, intr, cb_data);
             }
          }
@@ -413,28 +447,66 @@ nir_imm_ivec2(nir_builder *build, int x, int y)
 }
 
 static inline nir_def *
-nir_imm_ivec3(nir_builder *build, int x, int y, int z)
+nir_imm_ivec3_intN(nir_builder *build, int x, int y, int z, unsigned bit_size)
 {
    nir_const_value v[3] = {
-      nir_const_value_for_int(x, 32),
-      nir_const_value_for_int(y, 32),
-      nir_const_value_for_int(z, 32),
+      nir_const_value_for_int(x, bit_size),
+      nir_const_value_for_int(y, bit_size),
+      nir_const_value_for_int(z, bit_size),
    };
 
-   return nir_build_imm(build, 3, 32, v);
+   return nir_build_imm(build, 3, bit_size, v);
+}
+
+static inline nir_def *
+nir_imm_uvec2_intN(nir_builder *build, unsigned x, unsigned y,
+                   unsigned bit_size)
+{
+   nir_const_value v[2] = {
+      nir_const_value_for_uint(x, bit_size),
+      nir_const_value_for_uint(y, bit_size),
+   };
+
+   return nir_build_imm(build, 2, bit_size, v);
+}
+
+static inline nir_def *
+nir_imm_uvec3_intN(nir_builder *build, unsigned x, unsigned y, unsigned z,
+                   unsigned bit_size)
+{
+   nir_const_value v[3] = {
+      nir_const_value_for_uint(x, bit_size),
+      nir_const_value_for_uint(y, bit_size),
+      nir_const_value_for_uint(z, bit_size),
+   };
+
+   return nir_build_imm(build, 3, bit_size, v);
+}
+
+static inline nir_def *
+nir_imm_ivec3(nir_builder *build, int x, int y, int z)
+{
+   return nir_imm_ivec3_intN(build, x, y, z, 32);
+}
+
+static inline nir_def *
+nir_imm_ivec4_intN(nir_builder *build, int x, int y, int z, int w,
+                   unsigned bit_size)
+{
+   nir_const_value v[4] = {
+      nir_const_value_for_int(x, bit_size),
+      nir_const_value_for_int(y, bit_size),
+      nir_const_value_for_int(z, bit_size),
+      nir_const_value_for_int(w, bit_size),
+   };
+
+   return nir_build_imm(build, 4, bit_size, v);
 }
 
 static inline nir_def *
 nir_imm_ivec4(nir_builder *build, int x, int y, int z, int w)
 {
-   nir_const_value v[4] = {
-      nir_const_value_for_int(x, 32),
-      nir_const_value_for_int(y, 32),
-      nir_const_value_for_int(z, 32),
-      nir_const_value_for_int(w, 32),
-   };
-
-   return nir_build_imm(build, 4, 32, v);
+   return nir_imm_ivec4_intN(build, x, y, z, w, 32);
 }
 
 nir_def *
@@ -573,6 +645,7 @@ nir_mov_alu(nir_builder *build, nir_alu_src src, unsigned num_components)
    nir_def_init(&mov->instr, &mov->def, num_components,
                 nir_src_bit_size(src.src));
    mov->exact = build->exact;
+   mov->fp_fast_math = build->fp_fast_math;
    mov->src[0] = src;
    nir_builder_instr_insert(build, &mov->instr);
 
@@ -692,6 +765,15 @@ static inline nir_def *
 nir_channel(nir_builder *b, nir_def *def, unsigned c)
 {
    return nir_swizzle(b, def, &c, 1);
+}
+
+static inline nir_def *
+nir_channel_or_undef(nir_builder *b, nir_def *def, signed int channel)
+{
+   if (channel >= 0 && channel < def->num_components)
+      return nir_channel(b, def, channel);
+   else
+      return nir_undef(b, 1, def->bit_size);
 }
 
 static inline nir_def *
@@ -866,6 +948,30 @@ nir_isub_imm(nir_builder *build, uint64_t y, nir_def *x)
 }
 
 static inline nir_def *
+nir_imax_imm(nir_builder *build, nir_def *x, int64_t y)
+{
+   return nir_imax(build, x, nir_imm_intN_t(build, y, x->bit_size));
+}
+
+static inline nir_def *
+nir_imin_imm(nir_builder *build, nir_def *x, int64_t y)
+{
+   return nir_imin(build, x, nir_imm_intN_t(build, y, x->bit_size));
+}
+
+static inline nir_def *
+nir_umax_imm(nir_builder *build, nir_def *x, uint64_t y)
+{
+   return nir_umax(build, x, nir_imm_intN_t(build, y, x->bit_size));
+}
+
+static inline nir_def *
+nir_umin_imm(nir_builder *build, nir_def *x, uint64_t y)
+{
+   return nir_umin(build, x, nir_imm_intN_t(build, y, x->bit_size));
+}
+
+static inline nir_def *
 _nir_mul_imm(nir_builder *build, nir_def *x, uint64_t y, bool amul)
 {
    assert(x->bit_size <= 64);
@@ -877,6 +983,8 @@ _nir_mul_imm(nir_builder *build, nir_def *x, uint64_t y, bool amul)
       return x;
    } else if ((!build->shader->options ||
                !build->shader->options->lower_bitops) &&
+              !(amul && (!build->shader->options ||
+                         build->shader->options->has_amul)) &&
               util_is_power_of_two_or_zero64(y)) {
       return nir_ishl(build, x, nir_imm_int(build, ffsll(y) - 1));
    } else if (amul) {
@@ -920,6 +1028,12 @@ static inline nir_def *
 nir_fdiv_imm(nir_builder *build, nir_def *x, double y)
 {
    return nir_fdiv(build, x, nir_imm_floatN_t(build, y, x->bit_size));
+}
+
+static inline nir_def *
+nir_fpow_imm(nir_builder *build, nir_def *x, double y)
+{
+   return nir_fpow(build, x, nir_imm_floatN_t(build, y, x->bit_size));
 }
 
 static inline nir_def *
@@ -1115,6 +1229,11 @@ nir_pack_bits(nir_builder *b, nir_def *src, unsigned dest_bit_size)
          return nir_pack_64_2x32(b, src);
       case 16:
          return nir_pack_64_4x16(b, src);
+      case 8: {
+         nir_def *lo = nir_pack_32_4x8(b, nir_channels(b, src, 0x0f));
+         nir_def *hi = nir_pack_32_4x8(b, nir_channels(b, src, 0xf0));
+         return nir_pack_64_2x32(b, nir_vec2(b, lo, hi));
+      }
       default:
          break;
       }
@@ -1159,6 +1278,15 @@ nir_unpack_bits(nir_builder *b, nir_def *src, unsigned dest_bit_size)
          return nir_unpack_64_2x32(b, src);
       case 16:
          return nir_unpack_64_4x16(b, src);
+      case 8: {
+         nir_def *split = nir_unpack_64_2x32(b, src);
+         nir_def *lo = nir_unpack_32_4x8(b, nir_channel(b, split, 0));
+         nir_def *hi = nir_unpack_32_4x8(b, nir_channel(b, split, 1));
+         return nir_vec8(b, nir_channel(b, lo, 0), nir_channel(b, lo, 1),
+                         nir_channel(b, lo, 2), nir_channel(b, lo, 3),
+                         nir_channel(b, hi, 0), nir_channel(b, hi, 1),
+                         nir_channel(b, hi, 2), nir_channel(b, hi, 3));
+      }
       default:
          break;
       }
@@ -1883,6 +2011,46 @@ nir_tex_src_for_ssa(nir_tex_src_type src_type, nir_def *def)
    return src;
 }
 
+#undef nir_ddx
+#undef nir_ddx_fine
+#undef nir_ddx_coarse
+#undef nir_ddy
+#undef nir_ddy_fine
+#undef nir_ddy_coarse
+
+static inline nir_def *
+nir_build_deriv(nir_builder *b, nir_def *x, nir_intrinsic_op intrin)
+{
+   if (b->shader->options->scalarize_ddx && x->num_components > 1) {
+      nir_def *res[NIR_MAX_VEC_COMPONENTS] = { NULL };
+
+      for (unsigned i = 0; i < x->num_components; ++i) {
+         res[i] = _nir_build_ddx(b, x->bit_size, nir_channel(b, x, i));
+         nir_instr_as_intrinsic(res[i]->parent_instr)->intrinsic = intrin;
+      }
+
+      return nir_vec(b, res, x->num_components);
+   } else {
+      nir_def *res = _nir_build_ddx(b, x->bit_size, x);
+      nir_instr_as_intrinsic(res->parent_instr)->intrinsic = intrin;
+      return res;
+   }
+}
+
+#define DEF_DERIV(op)                                                        \
+   static inline nir_def *                                                   \
+      nir_##op(nir_builder *build, nir_def *src0)                            \
+   {                                                                         \
+      return nir_build_deriv(build, src0, nir_intrinsic_##op);               \
+   }
+
+DEF_DERIV(ddx)
+DEF_DERIV(ddx_fine)
+DEF_DERIV(ddx_coarse)
+DEF_DERIV(ddy)
+DEF_DERIV(ddy_fine)
+DEF_DERIV(ddy_coarse)
+
 /*
  * Find a texture source, remove it, and return its nir_def. If the texture
  * source does not exist, return NULL. This is useful for texture lowering pass
@@ -2052,6 +2220,16 @@ nir_goto_if(nir_builder *build, struct nir_block *target, nir_def *cond,
 }
 
 static inline void
+nir_break_if(nir_builder *build, nir_def *cond)
+{
+   nir_if *nif = nir_push_if(build, cond);
+   {
+      nir_jump(build, nir_jump_break);
+   }
+   nir_pop_if(build, nif);
+}
+
+static inline void
 nir_build_call(nir_builder *build, nir_function *func, size_t count,
                nir_def **args)
 {
@@ -2064,6 +2242,27 @@ nir_build_call(nir_builder *build, nir_function *func, size_t count,
 
    nir_builder_instr_insert(build, &call->instr);
 }
+
+static inline void
+nir_discard(nir_builder *build)
+{
+   if (build->shader->options->discard_is_demote)
+      nir_demote(build);
+   else
+      nir_terminate(build);
+}
+
+static inline void
+nir_discard_if(nir_builder *build, nir_def *src)
+{
+   if (build->shader->options->discard_is_demote)
+      nir_demote_if(build, src);
+   else
+      nir_terminate_if(build, src);
+}
+
+nir_def *
+nir_build_string(nir_builder *build, const char *value);
 
 /*
  * Call a given nir_function * with a variadic number of nir_def * arguments.
@@ -2092,6 +2291,14 @@ nir_scoped_memory_barrier(nir_builder *b,
 
 nir_def *
 nir_gen_rect_vertices(nir_builder *b, nir_def *z, nir_def *w);
+
+/* Emits a printf in the same way nir_lower_printf(). Each of the variadic
+ * argument is a pointer to a nir_def value.
+ */
+void nir_printf_fmt(nir_builder *b,
+                    bool use_printf_base_identifier,
+                    unsigned ptr_bit_size,
+                    const char *fmt, ...);
 
 #ifdef __cplusplus
 } /* extern "C" */

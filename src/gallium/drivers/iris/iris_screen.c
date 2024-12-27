@@ -49,10 +49,12 @@
 #include "iris_context.h"
 #include "iris_defines.h"
 #include "iris_fence.h"
+#include "iris_perf.h"
 #include "iris_pipe.h"
 #include "iris_resource.h"
 #include "iris_screen.h"
 #include "compiler/glsl_types.h"
+#include "intel/common/intel_debug_identifier.h"
 #include "intel/common/intel_gem.h"
 #include "intel/common/intel_l3_config.h"
 #include "intel/common/intel_uuid.h"
@@ -60,6 +62,9 @@
 
 #define genX_call(devinfo, func, ...)             \
    switch ((devinfo)->verx10) {                   \
+   case 300:                                      \
+      gfx30_##func(__VA_ARGS__);                  \
+      break;                                      \
    case 200:                                      \
       gfx20_##func(__VA_ARGS__);                  \
       break;                                      \
@@ -111,20 +116,11 @@ iris_get_driver_uuid(struct pipe_screen *pscreen, char *uuid)
    intel_uuid_compute_driver_id((uint8_t *)uuid, devinfo, PIPE_UUID_SIZE);
 }
 
-static bool
-iris_enable_clover()
-{
-   static int enable = -1;
-   if (enable < 0)
-      enable = debug_get_bool_option("IRIS_ENABLE_CLOVER", false);
-   return enable;
-}
-
 static void
 iris_warn_cl()
 {
    static bool warned = false;
-   if (warned)
+   if (warned || INTEL_DEBUG(DEBUG_CL_QUIET))
       return;
 
    warned = true;
@@ -278,7 +274,6 @@ iris_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
    case PIPE_CAP_SHADER_ARRAY_COMPONENTS:
    case PIPE_CAP_GLSL_TESS_LEVELS_AS_INPUTS:
    case PIPE_CAP_LOAD_CONSTBUF:
-   case PIPE_CAP_NIR_COMPACT_ARRAYS:
    case PIPE_CAP_DRAW_PARAMETERS:
    case PIPE_CAP_FS_POSITION_IS_SYSVAL:
    case PIPE_CAP_FS_FACE_IS_INTEGER_SYSVAL:
@@ -516,8 +511,6 @@ iris_get_shader_param(struct pipe_screen *pscreen,
       return 256; /* GL_MAX_PROGRAM_TEMPORARIES_ARB */
    case PIPE_SHADER_CAP_CONT_SUPPORTED:
       return 0;
-   case PIPE_SHADER_CAP_INDIRECT_INPUT_ADDR:
-   case PIPE_SHADER_CAP_INDIRECT_OUTPUT_ADDR:
    case PIPE_SHADER_CAP_INDIRECT_TEMP_ADDR:
    case PIPE_SHADER_CAP_INDIRECT_CONST_ADDR:
       /* Lie about these to avoid st/mesa's GLSL IR lowering of indirects,
@@ -547,12 +540,8 @@ iris_get_shader_param(struct pipe_screen *pscreen,
    case PIPE_SHADER_CAP_MAX_HW_ATOMIC_COUNTERS:
    case PIPE_SHADER_CAP_MAX_HW_ATOMIC_COUNTER_BUFFERS:
       return 0;
-   case PIPE_SHADER_CAP_SUPPORTED_IRS: {
-      int irs = 1 << PIPE_SHADER_IR_NIR;
-      if (iris_enable_clover())
-         irs |= 1 << PIPE_SHADER_IR_NIR_SERIALIZED;
-      return irs;
-   }
+   case PIPE_SHADER_CAP_SUPPORTED_IRS:
+      return 1 << PIPE_SHADER_IR_NIR;
    case PIPE_SHADER_CAP_TGSI_ANY_INOUT_DECL_RANGE:
    case PIPE_SHADER_CAP_TGSI_SQRT_SUPPORTED:
       return 0;
@@ -663,6 +652,7 @@ iris_get_timestamp(struct pipe_screen *pscreen)
 void
 iris_screen_destroy(struct iris_screen *screen)
 {
+   intel_perf_free(screen->perf_cfg);
    iris_destroy_screen_measure(screen);
    util_queue_destroy(&screen->shader_compiler_queue);
    glsl_type_singleton_decref();
@@ -848,6 +838,10 @@ iris_screen_create(int fd, const struct pipe_screen_config *config)
    screen->precompile = debug_get_bool_option("shader_precompile", true);
 
    isl_device_init(&screen->isl_dev, screen->devinfo);
+   screen->isl_dev.dummy_aux_address = iris_bufmgr_get_dummy_aux_address(screen->bufmgr);
+
+   screen->isl_dev.sampler_route_to_lsc =
+      driQueryOptionb(config->options, "intel_sampler_route_to_lsc");
 
    iris_compiler_init(screen);
 

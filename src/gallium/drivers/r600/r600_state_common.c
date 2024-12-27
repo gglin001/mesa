@@ -1,29 +1,11 @@
 /*
  * Copyright 2010 Red Hat Inc.
  *           2010 Jerome Glisse
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * on the rights to use, copy, modify, merge, publish, distribute, sub
- * license, and/or sell copies of the Software, and to permit persons to whom
- * the Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHOR(S) AND/OR THEIR SUPPLIERS BE LIABLE FOR ANY CLAIM,
- * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
- * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
- * USE OR OTHER DEALINGS IN THE SOFTWARE.
- *
  * Authors: Dave Airlie <airlied@redhat.com>
  *          Jerome Glisse <jglisse@redhat.com>
+ * SPDX-License-Identifier: MIT
  */
+
 #include "r600_formats.h"
 #include "r600_shader.h"
 #include "r600d.h"
@@ -3264,6 +3246,7 @@ uint32_t r600_colorformat_endian_swap(uint32_t colorformat, bool do_endian_swap)
 		case V_0280A0_COLOR_5_6_5:
 		case V_0280A0_COLOR_1_5_5_5:
 		case V_0280A0_COLOR_4_4_4_4:
+		case V_0280A0_COLOR_16_FLOAT:
 		case V_0280A0_COLOR_16:
 			return (do_endian_swap ? ENDIAN_8IN16 : ENDIAN_NONE);
 
@@ -3276,10 +3259,12 @@ uint32_t r600_colorformat_endian_swap(uint32_t colorformat, bool do_endian_swap)
 			 */
 			return ENDIAN_NONE;
 
+		case V_0280A0_COLOR_10_11_11_FLOAT:
 		case V_0280A0_COLOR_2_10_10_10:
 		case V_0280A0_COLOR_8_24:
 		case V_0280A0_COLOR_24_8:
 		case V_0280A0_COLOR_32_FLOAT:
+		case V_0280A0_COLOR_32:
 			return (do_endian_swap ? ENDIAN_8IN32 : ENDIAN_NONE);
 
 		case V_0280A0_COLOR_16_16_FLOAT:

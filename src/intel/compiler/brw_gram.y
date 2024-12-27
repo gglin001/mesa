@@ -26,7 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include "brw_asm.h"
+#include "brw_asm_internal.h"
 
 #undef yyerror
 #ifdef YYBYACC
@@ -93,17 +93,17 @@ isPowerofTwo(unsigned int x)
 static struct brw_reg
 set_direct_src_operand(struct brw_reg *reg, int type)
 {
-	return brw_reg(reg->file,
-		       reg->nr,
-		       reg->subnr,
-		       0,		// negate
-		       0,		// abs
-		       type,
-		       0,		// vstride
-		       0,		// width
-		       0,		// hstride
-		       BRW_SWIZZLE_NOOP,
-		       WRITEMASK_XYZW);
+	return brw_make_reg(reg->file,
+                            reg->nr,
+                            reg->subnr,
+                            0,		// negate
+                            0,		// abs
+                            type,
+                            0,		// vstride
+                            0,		// width
+                            0,		// hstride
+                            BRW_SWIZZLE_NOOP,
+                            WRITEMASK_XYZW);
 }
 
 static void
@@ -195,12 +195,6 @@ i965_asm_binary_instruction(int opcode,
 		break;
 	case BRW_OPCODE_ROR:
 		brw_ROR(p, dest, src0, src1);
-		break;
-	case BRW_OPCODE_SAD2:
-		fprintf(stderr, "Opcode BRW_OPCODE_SAD2 unhandled\n");
-		break;
-	case BRW_OPCODE_SADA2:
-		fprintf(stderr, "Opcode BRW_OPCODE_SADA2 unhandled\n");
 		break;
 	case BRW_OPCODE_SUBB:
 		brw_SUBB(p, dest, src0, src1);
@@ -297,13 +291,25 @@ i965_asm_set_instruction_options(struct brw_codegen *p,
 		brw_inst_set_no_dd_clear(p->devinfo, brw_last_inst,
 					 options.no_dd_clear);
 	} else {
+		enum opcode opcode = brw_inst_opcode(p->isa, brw_last_inst);
 		brw_inst_set_swsb(p->devinfo, brw_last_inst,
-		                  tgl_swsb_encode(p->devinfo, options.depinfo));
+		                  tgl_swsb_encode(p->devinfo, options.depinfo,
+						  opcode));
 	}
 	brw_inst_set_debug_control(p->devinfo, brw_last_inst,
 			           options.debug_control);
-	brw_inst_set_acc_wr_control(p->devinfo, brw_last_inst,
-				    options.acc_wr_control);
+	if (brw_has_branch_ctrl(p->devinfo, brw_inst_opcode(p->isa, brw_last_inst))) {
+		if (options.acc_wr_control)
+			error(NULL, "Instruction does not support AccWrEnable\n");
+
+		brw_inst_set_branch_control(p->devinfo, brw_last_inst,
+		                            options.branch_control);
+	} else if (options.branch_control) {
+		error(NULL, "Instruction does not support BranchCtrl\n");
+	} else if (p->devinfo->ver < 20) {
+		brw_inst_set_acc_wr_control(p->devinfo, brw_last_inst,
+					    options.acc_wr_control);
+	}
 	brw_inst_set_cmpt_control(p->devinfo, brw_last_inst,
 				  options.compaction);
 }
@@ -366,7 +372,7 @@ add_label(struct brw_codegen *p, const char* label_name, enum instr_label_type t
 %token <integer> TYPE_Q TYPE_UQ
 %token <integer> TYPE_V TYPE_UV
 %token <integer> TYPE_F TYPE_HF
-%token <integer> TYPE_DF TYPE_NF
+%token <integer> TYPE_DF
 %token <integer> TYPE_VF
 
 /* label */
@@ -389,7 +395,7 @@ add_label(struct brw_codegen *p, const char* label_name, enum instr_label_type t
 %token <integer> OR
 %token <integer> PLN POP PUSH
 %token <integer> RET RNDD RNDE RNDU RNDZ ROL ROR
-%token <integer> SAD2 SADA2 SEL SENDS SENDSC SHL SHR SMOV SUBB SYNC
+%token <integer> SEL SENDS SENDSC SHL SHR SMOV SUBB SYNC
 %token <integer> SEND_GFX4 SENDC_GFX4 SEND_GFX12 SENDC_GFX12
 %token <integer> WAIT WHILE
 %token <integer> XOR
@@ -452,6 +458,9 @@ add_label(struct brw_codegen *p, const char* label_name, enum instr_label_type t
 /* thread control */
 %token ATOMIC SWITCH
 
+/* branch control */
+%token BRANCH_CTRL
+
 /* quater control */
 %token QTR_2Q QTR_3Q QTR_4Q QTR_2H QTR_2N QTR_3N QTR_4N QTR_5N
 %token QTR_6N QTR_7N QTR_8N
@@ -468,7 +477,7 @@ add_label(struct brw_codegen *p, const char* label_name, enum instr_label_type t
 /* register type */
 %token <integer> GENREG ADDRREG ACCREG FLAGREG NOTIFYREG STATEREG
 %token <integer> CONTROLREG IPREG PERFORMANCEREG THREADREG CHANNELENABLEREG
-%token <integer> MASKREG
+%token <integer> MASKREG SCALARREG
 
 %token <integer> INTEGER
 %token <llint> LONG
@@ -516,7 +525,7 @@ add_label(struct brw_codegen *p, const char* label_name, enum instr_label_type t
 %type <integer> swizzle
 
 /* registers */
-%type <reg> accreg addrreg channelenablereg controlreg flagreg ipreg
+%type <reg> accreg addrreg channelenablereg controlreg flagreg ipreg scalarreg
 %type <reg> notifyreg nullreg performancereg threadcontrolreg statereg maskreg
 %type <integer> subregnum
 
@@ -542,6 +551,8 @@ add_label(struct brw_codegen *p, const char* label_name, enum instr_label_type t
 %token <integer> REG_DIST_INT
 %token <integer> REG_DIST_LONG
 %token <integer> REG_DIST_ALL
+%token <integer> REG_DIST_MATH
+%token <integer> REG_DIST_SCALAR
 %token <integer> SBID_ALLOC
 %token <integer> SBID_WAIT_SRC
 %token <integer> SBID_WAIT_DST
@@ -563,6 +574,10 @@ add_instruction_option(struct options *options, struct instoption opt)
 		}
 		return;
 	}
+	if (opt.type == INSTOPTION_CHAN_OFFSET) {
+		options->chan_offset = opt.uint_value;
+		return;
+	}
 	switch (opt.uint_value) {
 	case ALIGN1:
 		options->access_mode = BRW_ALIGN_1;
@@ -575,6 +590,9 @@ add_instruction_option(struct options *options, struct instoption opt)
 		break;
 	case ATOMIC:
 		options->thread_control |= BRW_THREAD_ATOMIC;
+		break;
+	case BRANCH_CTRL:
+		options->branch_control = true;
 		break;
 	case NODDCHK:
 		options->no_dd_check = true;
@@ -599,46 +617,6 @@ add_instruction_option(struct options *options, struct instoption opt)
 		break;
 	case EOT:
 		options->end_of_thread = true;
-		break;
-	/* TODO : Figure out how to set instruction group and get rid of
-	 * code below
-	 */
-	case QTR_2Q:
-		options->qtr_ctrl = BRW_COMPRESSION_2NDHALF;
-		break;
-	case QTR_3Q:
-		options->qtr_ctrl = BRW_COMPRESSION_COMPRESSED;
-		break;
-	case QTR_4Q:
-		options->qtr_ctrl = 3;
-		break;
-	case QTR_2H:
-		options->qtr_ctrl = BRW_COMPRESSION_COMPRESSED;
-		break;
-	case QTR_2N:
-		options->qtr_ctrl = BRW_COMPRESSION_NONE;
-		options->nib_ctrl = true;
-		break;
-	case QTR_3N:
-		options->qtr_ctrl = BRW_COMPRESSION_2NDHALF;
-		break;
-	case QTR_4N:
-		options->qtr_ctrl = BRW_COMPRESSION_2NDHALF;
-		options->nib_ctrl = true;
-		break;
-	case QTR_5N:
-		options->qtr_ctrl = BRW_COMPRESSION_COMPRESSED;
-		break;
-	case QTR_6N:
-		options->qtr_ctrl = BRW_COMPRESSION_COMPRESSED;
-		options->nib_ctrl = true;
-		break;
-	case QTR_7N:
-		options->qtr_ctrl = 3;
-		break;
-	case QTR_8N:
-		options->qtr_ctrl = 3;
-		options->nib_ctrl = true;
 		break;
 	}
 }
@@ -708,18 +686,13 @@ unaryinstruction:
 						    $4.flag_subreg_nr);
 		}
 
-		if ($7.file != BRW_IMMEDIATE_VALUE) {
+		if ($7.file != IMM) {
 			brw_inst_set_src0_vstride(p->devinfo, brw_last_inst,
 						  $7.vstride);
 		}
 		brw_inst_set_saturate(p->devinfo, brw_last_inst, $3);
 		brw_inst_set_exec_size(p->devinfo, brw_last_inst, $5);
-		// TODO: set instruction group instead of qtr and nib ctrl
-		brw_inst_set_qtr_control(p->devinfo, brw_last_inst,
-				         $8.qtr_ctrl);
-
-		brw_inst_set_nib_control(p->devinfo, brw_last_inst,
-				         $8.nib_ctrl);
+		brw_inst_set_group(p->devinfo, brw_last_inst, $8.chan_offset);
 	}
 	;
 
@@ -758,12 +731,7 @@ binaryinstruction:
 
 		brw_inst_set_saturate(p->devinfo, brw_last_inst, $3);
 		brw_inst_set_exec_size(p->devinfo, brw_last_inst, $5);
-		// TODO: set instruction group instead of qtr and nib ctrl
-		brw_inst_set_qtr_control(p->devinfo, brw_last_inst,
-				         $9.qtr_ctrl);
-
-		brw_inst_set_nib_control(p->devinfo, brw_last_inst,
-				         $9.nib_ctrl);
+		brw_inst_set_group(p->devinfo, brw_last_inst, $9.chan_offset);
 
 		brw_pop_insn_state(p);
 	}
@@ -783,8 +751,6 @@ binaryopcodes:
 	| PLN
 	| ROL
 	| ROR
-	| SAD2
-	| SADA2
 	| SUBB
 	;
 
@@ -810,12 +776,7 @@ binaryaccinstruction:
 
 		brw_inst_set_saturate(p->devinfo, brw_last_inst, $3);
 		brw_inst_set_exec_size(p->devinfo, brw_last_inst, $5);
-		// TODO: set instruction group instead of qtr and nib ctrl
-		brw_inst_set_qtr_control(p->devinfo, brw_last_inst,
-				         $9.qtr_ctrl);
-
-		brw_inst_set_nib_control(p->devinfo, brw_last_inst,
-				         $9.nib_ctrl);
+		brw_inst_set_group(p->devinfo, brw_last_inst, $9.chan_offset);
 	}
 	;
 
@@ -842,13 +803,7 @@ mathinstruction:
 		i965_asm_set_instruction_options(p, $9);
 		brw_inst_set_exec_size(p->devinfo, brw_last_inst, $5);
 		brw_inst_set_saturate(p->devinfo, brw_last_inst, $3);
-		// TODO: set instruction group instead
-		brw_inst_set_qtr_control(p->devinfo, brw_last_inst,
-				         $9.qtr_ctrl);
-
-		brw_inst_set_nib_control(p->devinfo, brw_last_inst,
-				         $9.nib_ctrl);
-
+		brw_inst_set_group(p->devinfo, brw_last_inst, $9.chan_offset);
 		brw_pop_insn_state(p);
 	}
 	;
@@ -899,12 +854,7 @@ ternaryinstruction:
 
 		brw_inst_set_saturate(p->devinfo, brw_last_inst, $3);
 		brw_inst_set_exec_size(p->devinfo, brw_last_inst, $5);
-		// TODO: set instruction group instead of qtr and nib ctrl
-		brw_inst_set_qtr_control(p->devinfo, brw_last_inst,
-				         $10.qtr_ctrl);
-
-		brw_inst_set_nib_control(p->devinfo, brw_last_inst,
-				         $10.nib_ctrl);
+		brw_inst_set_group(p->devinfo, brw_last_inst, $10.chan_offset);
 	}
 	;
 
@@ -947,16 +897,11 @@ sendinstruction:
 		brw_set_src0(p, brw_last_inst, $5);
 		brw_inst_set_bits(brw_last_inst, 127, 96, $6);
 		brw_inst_set_src1_file_type(p->devinfo, brw_last_inst,
-				            BRW_IMMEDIATE_VALUE,
-					    BRW_REGISTER_TYPE_UD);
+				            IMM,
+					    BRW_TYPE_UD);
 		brw_inst_set_sfid(p->devinfo, brw_last_inst, $7);
 		brw_inst_set_eot(p->devinfo, brw_last_inst, $9.end_of_thread);
-		// TODO: set instruction group instead of qtr and nib ctrl
-		brw_inst_set_qtr_control(p->devinfo, brw_last_inst,
-				         $9.qtr_ctrl);
-
-		brw_inst_set_nib_control(p->devinfo, brw_last_inst,
-				         $9.nib_ctrl);
+		brw_inst_set_group(p->devinfo, brw_last_inst, $9.chan_offset);
 
 		brw_pop_insn_state(p);
 	}
@@ -971,12 +916,7 @@ sendinstruction:
 		brw_inst_set_bits(brw_last_inst, 127, 96, $7);
 		brw_inst_set_sfid(p->devinfo, brw_last_inst, $8);
 		brw_inst_set_eot(p->devinfo, brw_last_inst, $10.end_of_thread);
-		// TODO: set instruction group instead of qtr and nib ctrl
-		brw_inst_set_qtr_control(p->devinfo, brw_last_inst,
-				         $10.qtr_ctrl);
-
-		brw_inst_set_nib_control(p->devinfo, brw_last_inst,
-				         $10.nib_ctrl);
+		brw_inst_set_group(p->devinfo, brw_last_inst, $10.chan_offset);
 
 		brw_pop_insn_state(p);
 	}
@@ -988,16 +928,16 @@ sendinstruction:
 		brw_set_src0(p, brw_last_inst, $5);
 		brw_set_src1(p, brw_last_inst, $6);
 
-		if ($7.file == BRW_IMMEDIATE_VALUE) {
+		if ($7.file == IMM) {
 			brw_inst_set_send_sel_reg32_desc(p->devinfo, brw_last_inst, 0);
 			brw_inst_set_send_desc(p->devinfo, brw_last_inst, $7.ud);
 		} else {
 			brw_inst_set_send_sel_reg32_desc(p->devinfo, brw_last_inst, 1);
 		}
 
-		if ($8.file == BRW_IMMEDIATE_VALUE) {
+		if ($8.file == IMM) {
 			brw_inst_set_send_sel_reg32_ex_desc(p->devinfo, brw_last_inst, 0);
-			brw_inst_set_sends_ex_desc(p->devinfo, brw_last_inst, $8.ud);
+			brw_inst_set_sends_ex_desc(p->devinfo, brw_last_inst, $8.ud, false);
 		} else {
 			brw_inst_set_send_sel_reg32_ex_desc(p->devinfo, brw_last_inst, 1);
 			brw_inst_set_send_ex_desc_ia_subreg_nr(p->devinfo, brw_last_inst, $8.subnr >> 2);
@@ -1005,17 +945,48 @@ sendinstruction:
 
 		brw_inst_set_sfid(p->devinfo, brw_last_inst, $9);
 		brw_inst_set_eot(p->devinfo, brw_last_inst, $11.end_of_thread);
-		// TODO: set instruction group instead of qtr and nib ctrl
-		brw_inst_set_qtr_control(p->devinfo, brw_last_inst,
-				         $11.qtr_ctrl);
-
-		brw_inst_set_nib_control(p->devinfo, brw_last_inst,
-					 $11.nib_ctrl);
+		brw_inst_set_group(p->devinfo, brw_last_inst, $11.chan_offset);
 
 		if (p->devinfo->verx10 >= 125 && $10.ex_bso) {
 			brw_inst_set_send_ex_bso(p->devinfo, brw_last_inst, 1);
 			brw_inst_set_send_src1_len(p->devinfo, brw_last_inst,
 						   $10.src1_len);
+		}
+
+		brw_pop_insn_state(p);
+	}
+	| predicate sendsopcode execsize dst GENREGFILE LSQUARE scalarreg RSQUARE desc ex_desc sharedfunction msgdesc instoptions
+	{
+                assert(p->devinfo->ver >= 30);
+
+		i965_asm_set_instruction_options(p, $13);
+		brw_inst_set_exec_size(p->devinfo, brw_last_inst, $3);
+		brw_set_dest(p, brw_last_inst, $4);
+		brw_set_src0(p, brw_last_inst, $7);
+		brw_set_src1(p, brw_last_inst, brw_null_reg());
+
+		if ($9.file == IMM) {
+			brw_inst_set_send_sel_reg32_desc(p->devinfo, brw_last_inst, 0);
+			brw_inst_set_send_desc(p->devinfo, brw_last_inst, $9.ud);
+		} else {
+			brw_inst_set_send_sel_reg32_desc(p->devinfo, brw_last_inst, 1);
+		}
+
+		if ($10.file == IMM) {
+			brw_inst_set_send_sel_reg32_ex_desc(p->devinfo, brw_last_inst, 0);
+			brw_inst_set_sends_ex_desc(p->devinfo, brw_last_inst, $10.ud, true);
+		} else {
+			brw_inst_set_send_sel_reg32_ex_desc(p->devinfo, brw_last_inst, 1);
+			brw_inst_set_send_ex_desc_ia_subreg_nr(p->devinfo, brw_last_inst, $10.subnr >> 2);
+		}
+
+		brw_inst_set_sfid(p->devinfo, brw_last_inst, $11);
+		brw_inst_set_eot(p->devinfo, brw_last_inst, $13.end_of_thread);
+		brw_inst_set_group(p->devinfo, brw_last_inst, $13.chan_offset);
+
+		if ($12.ex_bso) {
+			brw_inst_set_send_ex_bso(p->devinfo, brw_last_inst, 1);
+                        /* Not settings src1 length, as its implied zero. */
 		}
 
 		brw_pop_insn_state(p);
@@ -1133,7 +1104,7 @@ branchinstruction:
 		brw_inst_set_exec_size(p->devinfo, brw_last_inst, $2);
 
 		brw_set_dest(p, brw_last_inst, retype(brw_null_reg(),
-			     BRW_REGISTER_TYPE_D));
+			     BRW_TYPE_D));
 		if (p->devinfo->ver < 12)
 			brw_set_src0(p, brw_last_inst, brw_imm_d(0));
 	}
@@ -1148,7 +1119,7 @@ branchinstruction:
 
 		brw_set_dest(p, brw_last_inst,
 			     vec1(retype(brw_null_reg(),
-			     BRW_REGISTER_TYPE_D)));
+			     BRW_TYPE_D)));
 		if (p->devinfo->ver < 12)
 			brw_set_src0(p, brw_last_inst, brw_imm_d(0x0));
 
@@ -1168,7 +1139,7 @@ breakinstruction:
 		brw_inst_set_exec_size(p->devinfo, brw_last_inst, $3);
 
 		brw_set_dest(p, brw_last_inst, retype(brw_null_reg(),
-			     BRW_REGISTER_TYPE_D));
+			     BRW_TYPE_D));
 		brw_set_src0(p, brw_last_inst, brw_imm_d(0x0));
 
 		brw_pop_insn_state(p);
@@ -1183,7 +1154,7 @@ breakinstruction:
 		brw_inst_set_exec_size(p->devinfo, brw_last_inst, $3);
 
 		brw_set_dest(p, brw_last_inst, retype(brw_null_reg(),
-			     BRW_REGISTER_TYPE_D));
+			     BRW_TYPE_D));
 
 		if (p->devinfo->ver < 12) {
 			brw_set_src0(p, brw_last_inst, brw_imm_d(0x0));
@@ -1219,7 +1190,7 @@ loopinstruction:
 
 		brw_set_dest(p, brw_last_inst,
 					retype(brw_null_reg(),
-					BRW_REGISTER_TYPE_D));
+					BRW_TYPE_D));
 		if (p->devinfo->ver < 12)
 			brw_set_src0(p, brw_last_inst, brw_imm_d(0x0));
 
@@ -1239,7 +1210,7 @@ syncinstruction:
 			error(&@2, "sync instruction is supported only on gfx12+\n");
 		}
 
-		if ($5.file == BRW_IMMEDIATE_VALUE &&
+		if ($5.file == IMM &&
 		    $3 != TGL_SYNC_ALLRD &&
 		    $3 != TGL_SYNC_ALLWR) {
 			error(&@2, "Only allrd and allwr support immediate argument\n");
@@ -1251,8 +1222,7 @@ syncinstruction:
 		brw_inst_set_exec_size(p->devinfo, brw_last_inst, $4);
 		brw_set_src0(p, brw_last_inst, $5);
 		brw_inst_set_eot(p->devinfo, brw_last_inst, $6.end_of_thread);
-		brw_inst_set_qtr_control(p->devinfo, brw_last_inst, $6.qtr_ctrl);
-		brw_inst_set_nib_control(p->devinfo, brw_last_inst, $6.nib_ctrl);
+		brw_inst_set_group(p->devinfo, brw_last_inst, $6.chan_offset);
 
 		brw_pop_insn_state(p);
 	}
@@ -1318,7 +1288,7 @@ dstoperand:
 		$$.type = $4;
 		$$.writemask = $3;
 		$$.swizzle = BRW_SWIZZLE_NOOP;
-		$$.subnr = $$.subnr * brw_reg_type_to_size($4);
+		$$.subnr = $$.subnr * brw_type_size_bytes($4);
 	}
 	;
 
@@ -1329,7 +1299,7 @@ dstoperandex:
 		$$.hstride = $2;
 		$$.type = $4;
 		$$.writemask = $3;
-		$$.subnr = $$.subnr * brw_reg_type_to_size($4);
+		$$.subnr = $$.subnr * brw_type_size_bytes($4);
 	}
 	/* BSpec says "When the conditional modifier is present, updates
 	 * to the selected flag register also occur. In this case, the
@@ -1348,7 +1318,7 @@ dstoperandex:
 	{
 		$$ = $1;
 		$$.hstride = 1;
-		$$.type = BRW_REGISTER_TYPE_UW;
+		$$.type = BRW_TYPE_UW;
 	}
 	;
 
@@ -1363,6 +1333,7 @@ dstoperandex_typed:
 	| notifyreg
 	| performancereg
 	| statereg
+	| scalarreg
 	;
 
 dstreg:
@@ -1388,44 +1359,44 @@ immreg:
 	immval imm_type
 	{
 		switch ($2) {
-		case BRW_REGISTER_TYPE_UD:
+		case BRW_TYPE_UD:
 			$$ = brw_imm_ud($1);
 			break;
-		case BRW_REGISTER_TYPE_D:
+		case BRW_TYPE_D:
 			$$ = brw_imm_d($1);
 			break;
-		case BRW_REGISTER_TYPE_UW:
+		case BRW_TYPE_UW:
 			$$ = brw_imm_uw($1 | ($1 << 16));
 			break;
-		case BRW_REGISTER_TYPE_W:
+		case BRW_TYPE_W:
 			$$ = brw_imm_w($1);
 			break;
-		case BRW_REGISTER_TYPE_F:
-			$$ = brw_imm_reg(BRW_REGISTER_TYPE_F);
+		case BRW_TYPE_F:
+			$$ = brw_imm_reg(BRW_TYPE_F);
 			/* Set u64 instead of ud since DIM uses a 64-bit F-typed imm */
 			$$.u64 = $1;
 			break;
-		case BRW_REGISTER_TYPE_V:
+		case BRW_TYPE_V:
 			$$ = brw_imm_v($1);
 			break;
-		case BRW_REGISTER_TYPE_UV:
+		case BRW_TYPE_UV:
 			$$ = brw_imm_uv($1);
 			break;
-		case BRW_REGISTER_TYPE_VF:
+		case BRW_TYPE_VF:
 			$$ = brw_imm_vf($1);
 			break;
-		case BRW_REGISTER_TYPE_Q:
+		case BRW_TYPE_Q:
 			$$ = brw_imm_q($1);
 			break;
-		case BRW_REGISTER_TYPE_UQ:
+		case BRW_TYPE_UQ:
 			$$ = brw_imm_uq($1);
 			break;
-		case BRW_REGISTER_TYPE_DF:
-			$$ = brw_imm_reg(BRW_REGISTER_TYPE_DF);
+		case BRW_TYPE_DF:
+			$$ = brw_imm_reg(BRW_TYPE_DF);
 			$$.d64 = $1;
 			break;
-		case BRW_REGISTER_TYPE_HF:
-			$$ = brw_imm_reg(BRW_REGISTER_TYPE_HF);
+		case BRW_TYPE_HF:
+			$$ = brw_imm_reg(BRW_TYPE_HF);
 			$$.ud = $1 | ($1 << 16);
 			break;
 		default:
@@ -1479,17 +1450,17 @@ directsrcaccoperand:
 srcarcoperandex:
 	srcarcoperandex_typed region reg_type
 	{
-		$$ = brw_reg($1.file,
-			     $1.nr,
-			     $1.subnr,
-			     0,
-			     0,
-			     $3,
-			     $2.vstride,
-			     $2.width,
-			     $2.hstride,
-			     BRW_SWIZZLE_NOOP,
-			     WRITEMASK_XYZW);
+		$$ = brw_make_reg($1.file,
+			          $1.nr,
+			          $1.subnr,
+			          0,
+			          0,
+			          $3,
+			          $2.vstride,
+			          $2.width,
+			          $2.hstride,
+			          BRW_SWIZZLE_NOOP,
+			          WRITEMASK_XYZW);
 	}
 	| nullreg region reg_type
 	{
@@ -1500,7 +1471,7 @@ srcarcoperandex:
 	}
 	| threadcontrolreg
 	{
-		$$ = set_direct_src_operand(&$1, BRW_REGISTER_TYPE_UW);
+		$$ = set_direct_src_operand(&$1, BRW_TYPE_UW);
 	}
 	;
 
@@ -1511,22 +1482,23 @@ srcarcoperandex_typed:
 	| ipreg
 	| maskreg
 	| statereg
+	| scalarreg
 	;
 
 indirectsrcoperand:
 	negate abs indirectgenreg indirectregion swizzle reg_type
 	{
-		$$ = brw_reg($3.file,
-			     0,
-			     $3.subnr,
-			     $1,  // negate
-			     $2,  // abs
-			     $6,
-			     $4.vstride,
-			     $4.width,
-			     $4.hstride,
-			     $5,
-			     WRITEMASK_X);
+		$$ = brw_make_reg($3.file,
+			          0,
+			          $3.subnr,
+			          $1,  // negate
+			          $2,  // abs
+			          $6,
+			          $4.vstride,
+			          $4.width,
+			          $4.hstride,
+			          $5,
+			          WRITEMASK_X);
 
 		$$.address_mode = BRW_ADDRESS_REGISTER_INDIRECT_REGISTER;
 		// brw_reg set indirect_offset to 0 so set it to valid value
@@ -1544,17 +1516,17 @@ directgenreg_list:
 directsrcoperand:
 	negate abs directgenreg_list region swizzle reg_type
 	{
-		$$ = brw_reg($3.file,
-			     $3.nr,
-			     $3.subnr,
-			     $1,
-			     $2,
-			     $6,
-			     $4.vstride,
-			     $4.width,
-			     $4.hstride,
-			     $5,
-			     WRITEMASK_X);
+		$$ = brw_make_reg($3.file,
+			          $3.nr,
+			          $3.subnr,
+			          $1,
+			          $2,
+			          $6,
+			          $4.vstride,
+			          $4.width,
+			          $4.hstride,
+			          $5,
+			          WRITEMASK_X);
 	}
 	| srcarcoperandex
 	;
@@ -1585,8 +1557,8 @@ directgenreg:
 	GENREG subregnum
 	{
 		memset(&$$, '\0', sizeof($$));
-		$$.file = BRW_GENERAL_REGISTER_FILE;
-		$$.nr = $1;
+		$$.file = FIXED_GRF;
+		$$.nr = $1 * reg_unit(p->devinfo);
 		$$.subnr = $2;
 	}
 	;
@@ -1595,7 +1567,7 @@ indirectgenreg:
 	GENREGFILE LSQUARE addrparam RSQUARE
 	{
 		memset(&$$, '\0', sizeof($$));
-		$$.file = BRW_GENERAL_REGISTER_FILE;
+		$$.file = FIXED_GRF;
 		$$.subnr = $3.subnr;
 		$$.indirect_offset = $3.indirect_offset;
 	}
@@ -1610,7 +1582,7 @@ addrreg:
 			error(&@2, "Address sub register number %d"
 				   "out of range\n", $2);
 
-		$$.file = BRW_ARCHITECTURE_REGISTER_FILE;
+		$$.file = ARF;
 		$$.nr = BRW_ARF_ADDRESS;
 		$$.subnr = $2;
 	}
@@ -1626,7 +1598,7 @@ accreg:
 				   " out of range\n", $1);
 
 		memset(&$$, '\0', sizeof($$));
-		$$.file = BRW_ARCHITECTURE_REGISTER_FILE;
+		$$.file = ARF;
 		$$.nr = BRW_ARF_ACCUMULATOR;
 		$$.subnr = $2;
 	}
@@ -1646,7 +1618,7 @@ flagreg:
 			error(&@2, "Flag subregister number %d"
 				   " out of range\n", $2);
 
-		$$.file = BRW_ARCHITECTURE_REGISTER_FILE;
+		$$.file = ARF;
 		$$.nr = BRW_ARF_FLAG | $1;
 		$$.subnr = $2;
 	}
@@ -1659,7 +1631,7 @@ maskreg:
 			error(&@1, "Mask register number %d"
 				   " out of range\n", $1);
 
-		$$.file = BRW_ARCHITECTURE_REGISTER_FILE;
+		$$.file = ARF;
 		$$.nr = BRW_ARF_MASK;
 		$$.subnr = $2;
 	}
@@ -1673,11 +1645,23 @@ notifyreg:
 			error(&@2, "Notification sub register number %d"
 				   " out of range\n", $2);
 
-		$$.file = BRW_ARCHITECTURE_REGISTER_FILE;
+		$$.file = ARF;
 		$$.nr = BRW_ARF_NOTIFICATION_COUNT;
 		$$.subnr = $2;
 	}
 	;
+
+scalarreg:
+	SCALARREG subregnum
+	{
+		if ($2 > 31)
+			error(&@2, "Scalar sub register number %d"
+			           " out of range\n", $2);
+
+		$$.file = ARF;
+		$$.nr = BRW_ARF_SCALAR;
+		$$.subnr = $2;
+	}
 
 statereg:
 	STATEREG subregnum
@@ -1690,7 +1674,7 @@ statereg:
 			error(&@2, "State sub register number %d"
 				   " out of range\n", $2);
 
-		$$.file = BRW_ARCHITECTURE_REGISTER_FILE;
+		$$.file = ARF;
 		$$.nr = BRW_ARF_STATE;
 		$$.subnr = $2;
 	}
@@ -1703,7 +1687,7 @@ controlreg:
 			error(&@2, "control sub register number %d"
 				   " out of range\n", $2);
 
-		$$.file = BRW_ARCHITECTURE_REGISTER_FILE;
+		$$.file = ARF;
 		$$.nr = BRW_ARF_CONTROL;
 		$$.subnr = $2;
 	}
@@ -1724,7 +1708,7 @@ threadcontrolreg:
 			error(&@2, "Thread control sub register number %d"
 				   " out of range\n", $2);
 
-		$$.file = BRW_ARCHITECTURE_REGISTER_FILE;
+		$$.file = ARF;
 		$$.nr = BRW_ARF_TDR;
 		$$.subnr = $2;
 	}
@@ -1743,7 +1727,7 @@ performancereg:
 			error(&@2, "Performance sub register number %d"
 				   " out of range\n", $2);
 
-		$$.file = BRW_ARCHITECTURE_REGISTER_FILE;
+		$$.file = ARF;
 		$$.nr = BRW_ARF_TIMESTAMP;
 		$$.subnr = $2;
 	}
@@ -1756,7 +1740,7 @@ channelenablereg:
 			error(&@1, "Channel enable register number %d"
 				   " out of range\n", $1);
 
-		$$.file = BRW_ARCHITECTURE_REGISTER_FILE;
+		$$.file = ARF;
 		$$.nr = BRW_ARF_MASK;
 		$$.subnr = $2;
 	}
@@ -1864,25 +1848,24 @@ region_wh:
 	;
 
 reg_type:
-	  TYPE_F 	{ $$ = BRW_REGISTER_TYPE_F;  }
-	| TYPE_UD 	{ $$ = BRW_REGISTER_TYPE_UD; }
-	| TYPE_D 	{ $$ = BRW_REGISTER_TYPE_D;  }
-	| TYPE_UW 	{ $$ = BRW_REGISTER_TYPE_UW; }
-	| TYPE_W 	{ $$ = BRW_REGISTER_TYPE_W;  }
-	| TYPE_UB 	{ $$ = BRW_REGISTER_TYPE_UB; }
-	| TYPE_B 	{ $$ = BRW_REGISTER_TYPE_B;  }
-	| TYPE_DF 	{ $$ = BRW_REGISTER_TYPE_DF; }
-	| TYPE_UQ 	{ $$ = BRW_REGISTER_TYPE_UQ; }
-	| TYPE_Q 	{ $$ = BRW_REGISTER_TYPE_Q;  }
-	| TYPE_HF 	{ $$ = BRW_REGISTER_TYPE_HF; }
-	| TYPE_NF 	{ $$ = BRW_REGISTER_TYPE_NF; }
+	  TYPE_F 	{ $$ = BRW_TYPE_F;  }
+	| TYPE_UD 	{ $$ = BRW_TYPE_UD; }
+	| TYPE_D 	{ $$ = BRW_TYPE_D;  }
+	| TYPE_UW 	{ $$ = BRW_TYPE_UW; }
+	| TYPE_W 	{ $$ = BRW_TYPE_W;  }
+	| TYPE_UB 	{ $$ = BRW_TYPE_UB; }
+	| TYPE_B 	{ $$ = BRW_TYPE_B;  }
+	| TYPE_DF 	{ $$ = BRW_TYPE_DF; }
+	| TYPE_UQ 	{ $$ = BRW_TYPE_UQ; }
+	| TYPE_Q 	{ $$ = BRW_TYPE_Q;  }
+	| TYPE_HF 	{ $$ = BRW_TYPE_HF; }
 	;
 
 imm_type:
 	reg_type 	{ $$ = $1; }
-	| TYPE_V 	{ $$ = BRW_REGISTER_TYPE_V;  }
-	| TYPE_VF 	{ $$ = BRW_REGISTER_TYPE_VF; }
-	| TYPE_UV 	{ $$ = BRW_REGISTER_TYPE_UV; }
+	| TYPE_V 	{ $$ = BRW_TYPE_V;  }
+	| TYPE_VF 	{ $$ = BRW_TYPE_VF; }
+	| TYPE_UV 	{ $$ = BRW_TYPE_UV; }
 	;
 
 writemask:
@@ -2131,6 +2114,18 @@ depinfo:
 		$$.regdist = $1;
 		$$.pipe = TGL_PIPE_ALL;
 	}
+	| REG_DIST_MATH
+	{
+		memset(&$$, 0, sizeof($$));
+		$$.regdist = $1;
+		$$.pipe = TGL_PIPE_MATH;
+	}
+	| REG_DIST_SCALAR
+	{
+		memset(&$$, 0, sizeof($$));
+		$$.regdist = $1;
+		$$.pipe = TGL_PIPE_SCALAR;
+	}
 	| SBID_ALLOC
 	{
 		memset(&$$, 0, sizeof($$));
@@ -2153,7 +2148,13 @@ depinfo:
 instoption:
 	ALIGN1 	        { $$.type = INSTOPTION_FLAG; $$.uint_value = ALIGN1;}
 	| ALIGN16 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = ALIGN16; }
-	| ACCWREN 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = ACCWREN; }
+	| ACCWREN
+	{
+		if (p->devinfo->ver >= 20)
+			error(&@1, "AccWrEnable not supported in Xe2+\n");
+		$$.type = INSTOPTION_FLAG;
+		$$.uint_value = ACCWREN;
+	}
 	| BREAKPOINT 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = BREAKPOINT; }
 	| NODDCLR 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = NODDCLR; }
 	| NODDCHK 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = NODDCHK; }
@@ -2161,19 +2162,41 @@ instoption:
 	| EOT 	        { $$.type = INSTOPTION_FLAG; $$.uint_value = EOT; }
 	| SWITCH 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = SWITCH; }
 	| ATOMIC 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = ATOMIC; }
+	| BRANCH_CTRL 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = BRANCH_CTRL; }
 	| CMPTCTRL 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = CMPTCTRL; }
 	| WECTRL 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = WECTRL; }
-	| QTR_2Q 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = QTR_2Q; }
-	| QTR_3Q 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = QTR_3Q; }
-	| QTR_4Q 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = QTR_4Q; }
-	| QTR_2H 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = QTR_2H; }
-	| QTR_2N 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = QTR_2N; }
-	| QTR_3N 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = QTR_3N; }
-	| QTR_4N 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = QTR_4N; }
-	| QTR_5N 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = QTR_5N; }
-	| QTR_6N 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = QTR_6N; }
-	| QTR_7N 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = QTR_7N; }
-	| QTR_8N 	{ $$.type = INSTOPTION_FLAG; $$.uint_value = QTR_8N; }
+	| QTR_2Q 	{ $$.type = INSTOPTION_CHAN_OFFSET; $$.uint_value = 8; }
+	| QTR_3Q 	{ $$.type = INSTOPTION_CHAN_OFFSET; $$.uint_value = 16; }
+	| QTR_4Q 	{ $$.type = INSTOPTION_CHAN_OFFSET; $$.uint_value = 24; }
+	| QTR_2H 	{ $$.type = INSTOPTION_CHAN_OFFSET; $$.uint_value = 16; }
+	| QTR_2N
+        {
+		if (p->devinfo->ver >= 20)
+			error(&@1, "Channel offset must be multiple of 8 in Xe2+\n");
+		$$.type = INSTOPTION_CHAN_OFFSET;
+		$$.uint_value = 4;
+	}
+	| QTR_3N 	{ $$.type = INSTOPTION_CHAN_OFFSET; $$.uint_value = 8; }
+	| QTR_4N
+	{
+		if (p->devinfo->ver >= 20)
+			error(&@1, "Channel offset must be multiple of 8 in Xe2+\n");
+		$$.type = INSTOPTION_CHAN_OFFSET; $$.uint_value = 12;
+	}
+	| QTR_5N 	{ $$.type = INSTOPTION_CHAN_OFFSET; $$.uint_value = 16; }
+	| QTR_6N
+	{
+		if (p->devinfo->ver >= 20)
+			error(&@1, "Channel offset must be multiple of 8 in Xe2+\n");
+		$$.type = INSTOPTION_CHAN_OFFSET; $$.uint_value = 20;
+	}
+	| QTR_7N 	{ $$.type = INSTOPTION_CHAN_OFFSET; $$.uint_value = 24; }
+	| QTR_8N
+	{
+		if (p->devinfo->ver >= 20)
+			error(&@1, "Channel offset must be multiple of 8 in Xe2+\n");
+		$$.type = INSTOPTION_CHAN_OFFSET; $$.uint_value = 28;
+	}
 	| depinfo	{ $$.type = INSTOPTION_DEP_INFO; $$.depinfo_value = $1; }
 	;
 

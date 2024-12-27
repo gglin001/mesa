@@ -2,19 +2,24 @@
 # shellcheck disable=SC1091 # The relative paths in this file only become valid at runtime.
 # shellcheck disable=SC2034 # Variables are used in scripts called from here
 # shellcheck disable=SC2086 # we want word splitting
+# shellcheck disable=SC2016 # non-expanded variables are intentional
 # When changing this file, you need to bump the following
 # .gitlab-ci/image-tags.yml tags:
 # KERNEL_ROOTFS_TAG
 
 set -e
+
+. .gitlab-ci/setup-test-env.sh
+
 set -o xtrace
 
 export DEBIAN_FRONTEND=noninteractive
 export LLVM_VERSION="${LLVM_VERSION:=15}"
+export FIRMWARE_FILES="${FIRMWARE_FILES}"
 
 check_minio()
 {
-    S3_PATH="${S3_HOST}/mesa-lava/$1/${DISTRIBUTION_TAG}/${DEBIAN_ARCH}"
+    S3_PATH="${S3_HOST}/${S3_KERNEL_BUCKET}/$1/${DISTRIBUTION_TAG}/${DEBIAN_ARCH}"
     if curl -L --retry 4 -f --retry-delay 60 -s -X HEAD \
       "https://${S3_PATH}/done"; then
         echo "Remote files are up-to-date, skip rebuilding them."
@@ -31,9 +36,10 @@ check_minio "${CI_PROJECT_PATH}"
 . .gitlab-ci/container/build-rust.sh
 
 if [[ "$DEBIAN_ARCH" = "arm64" ]]; then
+    BUILD_CL="ON"
+    BUILD_VK="ON"
     GCC_ARCH="aarch64-linux-gnu"
     KERNEL_ARCH="arm64"
-    SKQP_ARCH="arm64"
     DEFCONFIG="arch/arm64/configs/defconfig"
     DEVICE_TREES="rk3399-gru-kevin.dtb"
     DEVICE_TREES+=" meson-g12b-a311d-khadas-vim3.dtb"
@@ -52,9 +58,10 @@ if [[ "$DEBIAN_ARCH" = "arm64" ]]; then
     KERNEL_IMAGE_NAME="Image"
 
 elif [[ "$DEBIAN_ARCH" = "armhf" ]]; then
+    BUILD_CL="OFF"
+    BUILD_VK="OFF"
     GCC_ARCH="arm-linux-gnueabihf"
     KERNEL_ARCH="arm"
-    SKQP_ARCH="arm"
     DEFCONFIG="arch/arm/configs/multi_v7_defconfig"
     DEVICE_TREES="rk3288-veyron-jaq.dtb"
     DEVICE_TREES+=" sun8i-h3-libretech-all-h3-cc.dtb"
@@ -76,14 +83,15 @@ elif [[ "$DEBIAN_ARCH" = "armhf" ]]; then
       libxkbcommon-dev:armhf
     )
 else
+    BUILD_CL="ON"
+    BUILD_VK="ON"
     GCC_ARCH="x86_64-linux-gnu"
     KERNEL_ARCH="x86_64"
-    SKQP_ARCH="x64"
     DEFCONFIG="arch/x86/configs/x86_64_defconfig"
     DEVICE_TREES=""
     KERNEL_IMAGE_NAME="bzImage"
     CONTAINER_ARCH_PACKAGES=(
-      libasound2-dev libcap-dev libfdt-dev libva-dev wayland-protocols p7zip wine
+      libasound2-dev libcap-dev libfdt-dev libva-dev p7zip wine
     )
 fi
 
@@ -106,6 +114,7 @@ fi
 
 # no need to remove these at end, image isn't saved at the end
 CONTAINER_EPHEMERAL=(
+    arch-test
     automake
     bc
     "clang-${LLVM_VERSION}"
@@ -114,6 +123,7 @@ CONTAINER_EPHEMERAL=(
     mmdebstrap
     git
     glslang-tools
+    jq
     libdrm-dev
     libegl1-mesa-dev
     libxext-dev
@@ -144,8 +154,14 @@ CONTAINER_EPHEMERAL=(
     python3-serial
     python3-venv
     unzip
+    wayland-protocols
     zstd
 )
+
+[ "$BUILD_CL" == "ON" ] && CONTAINER_EPHEMERAL+=(
+	ocl-icd-opencl-dev
+)
+
 
 echo "deb [trusted=yes] https://gitlab.freedesktop.org/gfx-ci/ci-deb-repo/-/raw/${PKG_REPO_REV}/ ${FDO_DISTRIBUTION_VERSION%-*} main" | tee /etc/apt/sources.list.d/gfx-ci_.list
 
@@ -156,7 +172,7 @@ apt-get install -y --no-remove \
                    "${CONTAINER_ARCH_PACKAGES[@]}" \
                    ${EXTRA_LOCAL_PACKAGES}
 
-ROOTFS=/lava-files/rootfs-${DEBIAN_ARCH}
+export ROOTFS=/lava-files/rootfs-${DEBIAN_ARCH}
 mkdir -p "$ROOTFS"
 
 # rootfs packages
@@ -190,7 +206,6 @@ PKG_DEP=(
 # arch dependent rootfs packages
 [ "$DEBIAN_ARCH" = "arm64" ] && PKG_ARCH=(
   libgl1 libglu1-mesa
-  libvulkan-dev
   firmware-linux-nonfree firmware-qcom-media
   libfontconfig1
 )
@@ -203,7 +218,6 @@ PKG_DEP=(
   spirv-tools
   libelf1 libfdt1 "libllvm${LLVM_VERSION}"
   libva2 libva-drm2
-  libvulkan-dev
   socat
   sysvinit-core
   wine
@@ -212,10 +226,21 @@ PKG_DEP=(
   firmware-misc-nonfree
 )
 
+[ "$BUILD_CL" == "ON" ] && PKG_ARCH+=(
+	clinfo
+	"libclang-cpp${LLVM_VERSION}"
+	"libclang-common-${LLVM_VERSION}-dev"
+	ocl-icd-libopencl1
+)
+[ "$BUILD_VK" == "ON" ] && PKG_ARCH+=(
+	libvulkan-dev
+)
+
 mmdebstrap \
     --variant=apt \
     --arch="${DEBIAN_ARCH}" \
     --components main,contrib,non-free-firmware \
+    --customize-hook='.gitlab-ci/container/get-firmware-from-source.sh "$ROOTFS" "$FIRMWARE_FILES"' \
     --include "${PKG_BASE[*]} ${PKG_CI[*]} ${PKG_DEP[*]} ${PKG_MESA_DEP[*]} ${PKG_ARCH[*]}" \
     bookworm \
     "$ROOTFS/" \
@@ -225,24 +250,20 @@ mmdebstrap \
 ############### Install mold
 . .gitlab-ci/container/build-mold.sh
 
-############### Setuping
-if [ "$DEBIAN_ARCH" = "amd64" ]; then
-  . .gitlab-ci/container/setup-wine.sh "/dxvk-wine64"
-  . .gitlab-ci/container/install-wine-dxvk.sh
-  mv /dxvk-wine64 $ROOTFS
-fi
-
-############### Installing
-if [ "$DEBIAN_ARCH" = "amd64" ]; then
-  . .gitlab-ci/container/install-wine-apitrace.sh
-  mkdir -p "$ROOTFS/apitrace-msvc-win64"
-  mv /apitrace-msvc-win64/bin "$ROOTFS/apitrace-msvc-win64"
-  rm -rf /apitrace-msvc-win64
-fi
-
 ############### Building
 STRIP_CMD="${GCC_ARCH}-strip"
 mkdir -p $ROOTFS/usr/lib/$GCC_ARCH
+
+############### Build libclc
+
+if [ "$BUILD_CL" = "ON" ]; then
+  rm -rf /usr/lib/clc/*
+  . .gitlab-ci/container/build-libclc.sh
+  mkdir -p $ROOTFS/usr/{share,lib}/clc
+  mv /usr/share/clc/spirv*-mesa3d-.spv $ROOTFS/usr/share/clc/
+  ln -s /usr/share/clc/spirv64-mesa3d-.spv $ROOTFS/usr/lib/clc/
+  ln -s /usr/share/clc/spirv-mesa3d-.spv $ROOTFS/usr/lib/clc/
+fi
 
 ############### Build Vulkan validation layer (for zink)
 if [ "$DEBIAN_ARCH" = "amd64" ]; then
@@ -261,7 +282,7 @@ rm -rf /apitrace
 ############### Build ANGLE
 if [[ "$DEBIAN_ARCH" = "amd64" ]]; then
   . .gitlab-ci/container/build-angle.sh
-  mv /angle /lava-files/rootfs-${DEBIAN_ARCH}/.
+  mv /angle $ROOTFS/.
   rm -rf /angle
 fi
 
@@ -272,6 +293,11 @@ mv /usr/local/bin/*-runner $ROOTFS/usr/bin/.
 
 
 ############### Build dEQP
+
+DEQP_API=tools \
+DEQP_TARGET=default \
+. .gitlab-ci/container/build-deqp.sh
+
 DEQP_API=GL \
 DEQP_TARGET=surfaceless \
 . .gitlab-ci/container/build-deqp.sh
@@ -280,11 +306,19 @@ DEQP_API=GLES \
 DEQP_TARGET=surfaceless \
 . .gitlab-ci/container/build-deqp.sh
 
-DEQP_API=VK \
-DEQP_TARGET=default \
-. .gitlab-ci/container/build-deqp.sh
+if [ "$BUILD_VK" == "ON" ]; then
+  DEQP_API=VK \
+  DEQP_TARGET=default \
+  . .gitlab-ci/container/build-deqp.sh
 
-mv /deqp $ROOTFS/.
+  DEQP_API=VK-main \
+  DEQP_TARGET=default \
+  . .gitlab-ci/container/build-deqp.sh
+fi
+
+rm -rf /VK-GL-CTS
+
+mv /deqp-* $ROOTFS/.
 
 
 ############### Build SKQP
@@ -295,7 +329,21 @@ if [[ "$DEBIAN_ARCH" = "arm64" ]] \
 fi
 
 ############### Build piglit
-PIGLIT_OPTS="-DPIGLIT_BUILD_DMA_BUF_TESTS=ON -DPIGLIT_BUILD_GLX_TESTS=ON" . .gitlab-ci/container/build-piglit.sh
+PIGLIT_OPTS="-DPIGLIT_USE_WAFFLE=ON
+	     -DPIGLIT_USE_GBM=ON
+	     -DPIGLIT_USE_WAYLAND=ON
+	     -DPIGLIT_USE_X11=ON
+	     -DPIGLIT_BUILD_GLX_TESTS=ON
+	     -DPIGLIT_BUILD_EGL_TESTS=ON
+	     -DPIGLIT_BUILD_WGL_TESTS=OFF
+	     -DPIGLIT_BUILD_GL_TESTS=ON
+	     -DPIGLIT_BUILD_GLES1_TESTS=ON
+	     -DPIGLIT_BUILD_GLES2_TESTS=ON
+	     -DPIGLIT_BUILD_GLES3_TESTS=ON
+	     -DPIGLIT_BUILD_CL_TESTS=$BUILD_CL
+	     -DPIGLIT_BUILD_VK_TESTS=$BUILD_VK
+	     -DPIGLIT_BUILD_DMA_BUF_TESTS=ON" \
+  . .gitlab-ci/container/build-piglit.sh
 mv /piglit $ROOTFS/.
 
 ############### Build libva tests
@@ -314,10 +362,8 @@ if [[ ${DEBIAN_ARCH} = "amd64" ]]; then
 fi
 
 ############### Build ci-kdl
-section_start kdl "Prepare a venv for kdl"
 . .gitlab-ci/container/build-kdl.sh
-mv ci-kdl.venv $ROOTFS
-section_end kdl
+mv /ci-kdl $ROOTFS/
 
 ############### Build local stuff for use by igt and kernel testing, which
 ############### will reuse most of our container build process from a specific
@@ -327,8 +373,8 @@ if [[ -e ".gitlab-ci/local/build-rootfs.sh" ]]; then
 fi
 
 
-############### Build kernel
-. .gitlab-ci/container/build-kernel.sh
+############### Download prebuilt kernel
+. .gitlab-ci/container/download-prebuilt-kernel.sh
 
 ############### Delete rust, since the tests won't be compiling anything.
 rm -rf /root/.cargo
@@ -340,12 +386,14 @@ if [ "$DEBIAN_ARCH" = "amd64" ]; then
 fi
 
 ############### Fill rootfs
+cp .gitlab-ci/setup-test-env.sh $ROOTFS/.
 cp .gitlab-ci/container/setup-rootfs.sh $ROOTFS/.
 cp .gitlab-ci/container/strip-rootfs.sh $ROOTFS/.
 cp .gitlab-ci/container/debian/llvm-snapshot.gpg.key $ROOTFS/.
 cp .gitlab-ci/container/debian/winehq.gpg.key $ROOTFS/.
 chroot $ROOTFS bash /setup-rootfs.sh
 rm $ROOTFS/{llvm-snapshot,winehq}.gpg.key
+rm "$ROOTFS/setup-test-env.sh"
 rm "$ROOTFS/setup-rootfs.sh"
 rm "$ROOTFS/strip-rootfs.sh"
 cp /etc/wgetrc $ROOTFS/etc/.
@@ -365,8 +413,8 @@ popd
 
 . .gitlab-ci/container/container_post_build.sh
 
-ci-fairy s3cp --token-file "${CI_JOB_JWT_FILE}" /lava-files/"${ROOTFSTAR}" \
+ci-fairy s3cp --token-file "${S3_JWT_FILE}" /lava-files/"${ROOTFSTAR}" \
       https://${S3_PATH}/"${ROOTFSTAR}"
 
 touch /lava-files/done
-ci-fairy s3cp --token-file "${CI_JOB_JWT_FILE}" /lava-files/done https://${S3_PATH}/done
+ci-fairy s3cp --token-file "${S3_JWT_FILE}" /lava-files/done https://${S3_PATH}/done

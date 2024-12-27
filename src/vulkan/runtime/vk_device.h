@@ -37,6 +37,7 @@
 extern "C" {
 #endif
 
+struct vk_acceleration_structure_build_ops;
 struct vk_command_buffer_ops;
 struct vk_device_shader_ops;
 struct vk_sync;
@@ -134,6 +135,40 @@ struct vk_device {
    /** Shader vtable for VK_EXT_shader_object and common pipelines */
    const struct vk_device_shader_ops *shader_ops;
 
+   /** Acceleration structure build vtable for common BVH building. */
+   const struct vk_acceleration_structure_build_ops *as_build_ops;
+
+   /**
+    * Write data to a buffer from the command processor. This is simpler than
+    * setting up a staging buffer and faster for small writes, but is not
+    * meant for larger amounts of data. \p data is owned by the caller and the
+    * driver is expected to write it out directly to the command stream as
+    * part of an immediate write packet.
+    */
+   void (*write_buffer_cp)(VkCommandBuffer cmdbuf, VkDeviceAddress addr,
+                           void *data, uint32_t size);
+
+   /* Flush data written via write_buffer_cp. Users must use a normal pipeline
+    * barrier in order to read this data, with the appropriate destination
+    * access, but this replaces the source access mask.
+    */
+   void (*flush_buffer_write_cp)(VkCommandBuffer cmdbuf);
+
+   /* An unaligned dispatch function. This launches a number of threads that
+    * may not be a multiple of the workgroup size, which may result in partial
+    * workgroups.
+    */
+   void (*cmd_dispatch_unaligned)(VkCommandBuffer cmdbuf,
+                                  uint32_t invocations_x,
+                                  uint32_t invocations_y,
+                                  uint32_t invocations_z);
+
+   /* vkCmdFillBuffer but with a device address. */
+   void (*cmd_fill_buffer_addr)(VkCommandBuffer cmdbuf,
+                                VkDeviceAddress devAddr,
+                                VkDeviceSize size,
+                                uint32_t data);
+
    /** Driver provided callback for capturing traces
     * 
     * Triggers for this callback are:
@@ -194,6 +229,9 @@ struct vk_device {
 
    /* Set by vk_device_set_drm_fd() */
    int drm_fd;
+
+   /** Implicit pipeline cache, or NULL */
+   struct vk_pipeline_cache *mem_cache;
 
    /** An enum describing how timeline semaphores work */
    enum vk_device_timeline_mode {
@@ -264,6 +302,9 @@ struct vk_device {
    struct hash_table *swapchain_private;
    mtx_t swapchain_name_mtx;
    struct hash_table *swapchain_name;
+
+   /* For VK_KHR_pipeline_binary */
+   bool disable_internal_cache;
 };
 
 VK_DEFINE_HANDLE_CASTS(vk_device, base, VkDevice,
@@ -424,13 +465,6 @@ vk_time_max_deviation(uint64_t begin, uint64_t end, uint64_t max_clock_period)
 PFN_vkVoidFunction
 vk_device_get_proc_addr(const struct vk_device *device,
                         const char *name);
-
-bool vk_get_physical_device_core_1_1_property_ext(struct VkBaseOutStructure *ext,
-                                                     const VkPhysicalDeviceVulkan11Properties *core);
-bool vk_get_physical_device_core_1_2_property_ext(struct VkBaseOutStructure *ext,
-                                                     const VkPhysicalDeviceVulkan12Properties *core);
-bool vk_get_physical_device_core_1_3_property_ext(struct VkBaseOutStructure *ext,
-                                                     const VkPhysicalDeviceVulkan13Properties *core);
 
 #ifdef __cplusplus
 }

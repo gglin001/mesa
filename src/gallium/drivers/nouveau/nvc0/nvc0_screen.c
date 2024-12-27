@@ -340,10 +340,13 @@ nvc0_screen_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
       return 0;
 
    case PIPE_CAP_PCI_GROUP:
+      return dev->info.pci.domain;
    case PIPE_CAP_PCI_BUS:
+      return dev->info.pci.bus;
    case PIPE_CAP_PCI_DEVICE:
+      return dev->info.pci.dev;
    case PIPE_CAP_PCI_FUNCTION:
-      return 0;
+      return dev->info.pci.func;
 
    case PIPE_CAP_OPENCL_INTEGER_FUNCTIONS: /* could be done */
    case PIPE_CAP_INTEGER_MULTIPLY_32X16: /* could be done */
@@ -355,14 +358,8 @@ nvc0_screen_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
 
    case PIPE_CAP_VENDOR_ID:
       return 0x10de;
-   case PIPE_CAP_DEVICE_ID: {
-      uint64_t device_id;
-      if (nouveau_getparam(dev, NOUVEAU_GETPARAM_PCI_DEVICE, &device_id)) {
-         NOUVEAU_ERR("NOUVEAU_GETPARAM_PCI_DEVICE failed.\n");
-         return -1;
-      }
-      return device_id;
-   }
+   case PIPE_CAP_DEVICE_ID:
+      return dev->info.device_id;
    case PIPE_CAP_ACCELERATED:
       return 1;
    case PIPE_CAP_VIDEO_MEMORY:
@@ -396,12 +393,8 @@ nvc0_screen_get_shader_param(struct pipe_screen *pscreen,
    }
 
    switch (param) {
-   case PIPE_SHADER_CAP_SUPPORTED_IRS: {
-      uint32_t irs = 1 << PIPE_SHADER_IR_NIR;
-      if (screen->force_enable_cl)
-         irs |= 1 << PIPE_SHADER_IR_NIR_SERIALIZED;
-      return irs;
-   }
+   case PIPE_SHADER_CAP_SUPPORTED_IRS:
+      return 1 << PIPE_SHADER_IR_NIR;
    case PIPE_SHADER_CAP_MAX_INSTRUCTIONS:
    case PIPE_SHADER_CAP_MAX_ALU_INSTRUCTIONS:
    case PIPE_SHADER_CAP_MAX_TEX_INSTRUCTIONS:
@@ -417,17 +410,6 @@ nvc0_screen_get_shader_param(struct pipe_screen *pscreen,
       return NVC0_MAX_CONSTBUF_SIZE;
    case PIPE_SHADER_CAP_MAX_CONST_BUFFERS:
       return NVC0_MAX_PIPE_CONSTBUFS;
-   case PIPE_SHADER_CAP_INDIRECT_OUTPUT_ADDR:
-      return shader != PIPE_SHADER_FRAGMENT;
-   case PIPE_SHADER_CAP_INDIRECT_INPUT_ADDR:
-      /* HW doesn't support indirect addressing of fragment program inputs
-       * on Volta.  The binary driver generates a function to handle every
-       * possible indirection, and indirectly calls the function to handle
-       * this instead.
-       */
-      if (class_3d >= GV100_3D_CLASS)
-         return shader != PIPE_SHADER_FRAGMENT;
-      return 1;
    case PIPE_SHADER_CAP_INDIRECT_TEMP_ADDR:
    case PIPE_SHADER_CAP_INDIRECT_CONST_ADDR:
       return 1;
@@ -611,7 +593,7 @@ nvc0_screen_destroy(struct pipe_screen *pscreen)
 {
    struct nvc0_screen *screen = nvc0_screen(pscreen);
 
-   if (!nouveau_drm_screen_unref(&screen->base))
+   if (!screen->base.initialized)
       return;
 
    if (screen->blitter)
@@ -888,10 +870,11 @@ nvc0_screen_resize_text_area(struct nvc0_screen *screen, struct nouveau_pushbuf 
    nouveau_heap_free(&screen->lib_code);
    nouveau_heap_destroy(&screen->text_heap);
 
-   /* XXX: getting a page fault at the end of the code buffer every few
-    *  launches, don't use the last 256 bytes to work around them - prefetch ?
+   /*
+    * Shader storage needs a 2K (from NVIDIA) overallocations at the end
+    * to avoid prefetch bugs.
     */
-   nouveau_heap_init(&screen->text_heap, 0, size - 0x100);
+   nouveau_heap_init(&screen->text_heap, 0, size - 0x800);
 
    /* update the code segment setup */
    if (screen->eng3d->oclass < GV100_3D_CLASS) {
@@ -1486,6 +1469,11 @@ nvc0_screen_create(struct nouveau_device *dev)
    if (!nvc0_blitter_create(screen))
       goto fail;
 
+   nouveau_device_set_classes_for_debug(dev,
+                                        screen->eng3d->oclass,
+                                        screen->compute->oclass,
+                                        screen->m2mf->oclass,
+                                        screen->copy ? screen->copy->oclass : 0);
    return &screen->base;
 
 fail:

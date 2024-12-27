@@ -18,6 +18,8 @@
 # include "intel_gfx125_shaders_code.h"
 #elif GFX_VERx10 == 200
 # include "intel_gfx20_shaders_code.h"
+#elif GFX_VERx10 == 300
+# include "intel_gfx30_shaders_code.h"
 #else
 # error "Unsupported generation"
 #endif
@@ -41,7 +43,7 @@ load_fragment_index(nir_builder *b)
 static nir_def *
 load_compute_index(nir_builder *b)
 {
-   return nir_channel(b, nir_load_global_invocation_id_zero_base(b, 32), 0);
+   return nir_channel(b, nir_load_global_invocation_id(b, 32), 0);
 }
 
 nir_shader *
@@ -64,6 +66,7 @@ genX(call_internal_shader)(nir_builder *b, enum anv_internal_kernel_name shader_
       genX(libanv_write_draw)(
          b,
          load_param(b, 64, struct anv_gen_indirect_params, generated_cmds_addr),
+         load_param(b, 64, struct anv_gen_indirect_params, wa_insts_addr),
          load_param(b, 64, struct anv_gen_indirect_params, indirect_data_addr),
          load_param(b, 64, struct anv_gen_indirect_params, draw_id_addr),
          load_param(b, 32, struct anv_gen_indirect_params, indirect_data_stride),
@@ -72,6 +75,8 @@ genX(call_internal_shader)(nir_builder *b, enum anv_internal_kernel_name shader_
          load_param(b, 32, struct anv_gen_indirect_params, instance_multiplier),
          load_param(b, 32, struct anv_gen_indirect_params, max_draw_count),
          load_param(b, 32, struct anv_gen_indirect_params, flags),
+         load_param(b, 32, struct anv_gen_indirect_params, mocs),
+         load_param(b, 32, struct anv_gen_indirect_params, cmd_primitive_size),
          load_param(b, 32, struct anv_gen_indirect_params, ring_count),
          load_param(b, 64, struct anv_gen_indirect_params, gen_addr),
          load_param(b, 64, struct anv_gen_indirect_params, end_addr),

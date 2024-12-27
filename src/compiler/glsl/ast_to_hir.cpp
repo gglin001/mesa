@@ -1262,7 +1262,7 @@ check_builtin_array_max_size(const char *name, unsigned size,
                        state->Const.MaxTextureCoords);
    } else if (strcmp("gl_ClipDistance", name) == 0) {
       state->clip_dist_size = size;
-      if (size + state->cull_dist_size > state->Const.MaxClipPlanes) {
+      if (size > state->Const.MaxClipPlanes) {
          /* From section 7.1 (Vertex Shader Special Variables) of the
           * GLSL 1.30 spec:
           *
@@ -1278,7 +1278,7 @@ check_builtin_array_max_size(const char *name, unsigned size,
       }
    } else if (strcmp("gl_CullDistance", name) == 0) {
       state->cull_dist_size = size;
-      if (size + state->clip_dist_size > state->Const.MaxClipPlanes) {
+      if (size > state->Const.MaxClipPlanes) {
          /* From the ARB_cull_distance spec:
           *
           *   "The gl_CullDistance array is predeclared as unsized and
@@ -1292,6 +1292,21 @@ check_builtin_array_max_size(const char *name, unsigned size,
                           "be larger than gl_MaxCullDistances (%u)",
                           state->Const.MaxClipPlanes);
       }
+   }
+
+   /* From the ARB_cull_distance spec:
+    *
+    * It is a compile-time or link-time error for the set of shaders forming
+    * a program to have the sum of the sizes of the gl_ClipDistance and
+    * gl_CullDistance arrays to be larger than
+    * gl_MaxCombinedClipAndCullDistances.
+    */
+   if (state->clip_dist_size + state->cull_dist_size >
+       state->Const.MaxClipPlanes) {
+       _mesa_glsl_error(&loc, state, "The combined size of 'gl_ClipDistance' "
+                        "and 'gl_CullDistance' size cannot be larger than "
+                        "gl_MaxCombinedClipAndCullDistances (%u)",
+                        state->Const.MaxClipPlanes);
    }
 }
 
@@ -2707,6 +2722,8 @@ get_type_name_for_precision_qualifier(const glsl_type *type)
    default:
       unreachable("Unsupported type");
    } /* base type */
+
+   return NULL;
 }
 
 static unsigned
@@ -4483,8 +4500,8 @@ get_variable_being_redeclared(ir_variable **var_ptr, YYLTYPE loc,
        * We don't really need to do anything here, just allow the
        * redeclaration. Any error on the gl_FragCoord is handled on the ast
        * level at apply_layout_qualifier_to_variable using the
-       * ast_type_qualifier and _mesa_glsl_parse_state, or later at
-       * linker.cpp.
+       * ast_type_qualifier and _mesa_glsl_parse_state, or later in the
+       * linker.
        */
       /* According to section 4.3.7 of the GLSL 1.30 spec,
        * the following built-in varaibles can be redeclared with an
@@ -6077,7 +6094,7 @@ ast_parameter_declarator::hir(exec_list *instructions,
     */
    if ((var->data.mode == ir_var_function_inout || var->data.mode == ir_var_function_out)
        && glsl_type_is_array(type)
-       && !state->check_version(120, 100, &loc,
+       && !state->check_version(state->allow_glsl_120_subset_in_110 ? 110 : 120, 100, &loc,
                                 "arrays cannot be out or inout parameters")) {
       type = &glsl_type_builtin_error;
    }
@@ -6446,6 +6463,8 @@ ast_function::hir(exec_list *instructions,
                continue;
 
             tsig = fn->matching_signature(state, &sig->parameters,
+                                          state->has_implicit_conversions(),
+                                          state->has_implicit_int_to_uint_conversion(),
                                           false);
             if (!tsig) {
                _mesa_glsl_error(& loc, state, "subroutine type mismatch '%s' - signatures do not match\n", decl->identifier);
@@ -7150,7 +7169,9 @@ ast_case_label::hir(exec_list *instructions,
 
          /* Check if int->uint implicit conversion is supported. */
          bool integer_conversion_supported =
-            _mesa_glsl_can_implicitly_convert(&glsl_type_builtin_int, &glsl_type_builtin_uint, state);
+            _mesa_glsl_can_implicitly_convert(&glsl_type_builtin_int, &glsl_type_builtin_uint,
+                                              state->has_implicit_conversions(),
+                                              state->has_implicit_int_to_uint_conversion());
 
          if ((!glsl_type_is_integer_32(type_a) || !glsl_type_is_integer_32(type_b)) ||
               !integer_conversion_supported) {
@@ -7900,7 +7921,11 @@ ast_process_struct_or_iface_block_members(exec_list *instructions,
 
                   fields[i].image_format = qual->image_format;
                } else {
-                  if (!qual->flags.q.write_only) {
+                  if (state->has_image_load_formatted()) {
+                     if (state->EXT_shader_image_load_formatted_warn) {
+                        _mesa_glsl_warning(&loc, state, "GL_EXT_image_load_formatted used");
+                     }
+                  } else if (!qual->flags.q.write_only) {
                      _mesa_glsl_error(&loc, state, "image not qualified with "
                                       "`writeonly' must have a format layout "
                                       "qualifier");
@@ -9214,7 +9239,8 @@ remove_per_vertex_blocks(exec_list *instructions,
    foreach_in_list_safe(ir_instruction, node, instructions) {
       ir_variable *const var = node->as_variable();
       if (var != NULL && var->get_interface_type() == per_vertex &&
-          var->data.mode == mode) {
+          var->data.mode == mode &&
+          var->data.how_declared == ir_var_declared_implicitly) {
          state->symbols->disable_variable(var->name);
          var->remove();
       }
