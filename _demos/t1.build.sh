@@ -51,3 +51,24 @@ cl_demos/build/bin/cl_simple
 cl_demos/build/bin/cl_absf
 
 ################################################################################
+
+# log:
+
+# (pyenv) root@7a5c74b67293:.../mesa# cl_demos/build/bin/cl_enumopencl
+# Enumerated 1 platforms.
+
+# Platform[0]:
+#         Name:           Clover
+#         Vendor:         Mesa
+#         Driver Version: OpenCL 1.1 Mesa 24.3.2 (git-de0dc35519)
+# Device[0]:
+#         Type:           CPU
+#         Name:           llvmpipe (LLVM 19.1.0, 128 bits)
+#         Vendor:         Mesa
+#         Device Version: OpenCL 1.1 Mesa 24.3.2 (git-de0dc35519)
+#         Device Profile: FULL_PROFILE
+#         Driver Version: 24.3.2
+
+# Done.
+
+################################################################################
