@@ -21,12 +21,14 @@ PKG_CONFIG_PATH=/opt/spirv-tools/lib/pkgconfig:/opt/llvm-spirv/lib/pkgconfig:/op
   -Dglx=dri \
   -Degl=disabled \
   -Dllvm=enabled \
+  -Dshared-llvm=disabled \
   -Ddraw-use-llvm=true \
   -Dgallium-drivers="llvmpipe" \
   -Dgallium-opencl=icd \
   -Dgallium-rusticl=false \
   -Dopencl-spirv=true \
   -Dvulkan-drivers="swrast" \
+  -Dstatic-libclc=all \
   -Dperfetto=false \
   -Dbuild-tests=false \
   -Denable-glcpp-tests=false
@@ -46,5 +48,6 @@ export OCL_ICD_FILENAMES=$PWD/build/install/lib/aarch64-linux-gnu/libMesaOpenCL.
 
 cl_demos/build/bin/cl_enumopencl
 cl_demos/build/bin/cl_simple
+cl_demos/build/bin/cl_absf
 
 ################################################################################

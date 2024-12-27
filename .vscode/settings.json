@@ -2,9 +2,9 @@
   "terminal.integrated.env.linux": {
     // "EXT_PATH": "${workspaceFolder}/build/install/bin",
     "EXT_PATH": "${workspaceFolder}/build/install/bin:${workspaceFolder}/cl_demos/build/bin",
-    // "OCL_ICD_VENDORS": "/root/micromamba/envs/pyenv/etc/OpenCL/vendors",
-    // "OCL_ICD_FILENAMES": "${workspaceFolder}/build/install/lib/aarch64-linux-gnu/libOpenCL.so",
-    "OCL_ICD_FILENAMES": "${workspaceFolder}/build/install/lib/aarch64-linux-gnu/libMesaOpenCL.so",
+    "OCL_ICD_VENDORS": "${workspaceFolder}/build/install/etc/OpenCL/vendors",
+    // "OCL_ICD_FILENAMES": "${workspaceFolder}/build/install/lib/aarch64-linux-gnu/libMesaOpenCL.so",
+    "LP_CL": "1",
   },
   "mesonbuild.configureOnOpen": false,
   "mesonbuild.buildFolder": "build",
