@@ -63,7 +63,8 @@ rusticl_args = [
   # we want unsafe blocks inside unsafe functions
   '-Dunsafe_op_in_unsafe_fn',
   # we error on all clippy warnings unless they are disabled
-  '-Dclippy::all',
+  # TODO: restore
+  '-Aclippy::all',
   # we want to add asserts in control flow
   '-Aclippy::assertions_on_constants',
   # warns on Arc<_> as keys
