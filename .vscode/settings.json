@@ -12,4 +12,5 @@
   "mesonbuild.languageServer": "mesonlsp",
   // installing muon has too many deps
   "mesonbuild.linter.muon.enabled": false,
+  "mesonbuild.mesonlsp.linting.disableUnusedVariableCheck": true,
 }
