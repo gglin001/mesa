@@ -9,29 +9,36 @@ micromamba install xorg-libxshmfence xorg-libxxf86vm xorg-libxrandr
 
 ################################################################################
 
-PKG_CONFIG_PATH=/opt/spirv-tools/lib/pkgconfig:/opt/llvm-spirv/lib/pkgconfig:/opt/libclc/share/pkgconfig:$PKG_CONFIG_PATH \
-  CC=/usr/bin/clang CXX=/usr/bin/clang++ \
-  meson setup --reconfigure build \
-  --buildtype=debug \
-  -Dprefix=$PWD/build/install \
-  -Dplatforms=wayland,x11 \
-  -Dopengl=true \
-  -Dgles1=disabled \
-  -Dgles2=disabled \
-  -Dglx=dri \
-  -Degl=disabled \
-  -Dllvm=enabled \
-  -Dshared-llvm=disabled \
-  -Ddraw-use-llvm=true \
-  -Dgallium-drivers="llvmpipe" \
-  -Dgallium-opencl=icd \
-  -Dgallium-rusticl=false \
-  -Dopencl-spirv=true \
-  -Dvulkan-drivers="swrast" \
-  -Dstatic-libclc=all \
-  -Dperfetto=false \
-  -Dbuild-tests=false \
+args=(
+  --buildtype=debug
+  -Dprefix=$PWD/build/install
+  -Dplatforms=wayland,x11
+  -Dopengl=true
+  -Dgles1=disabled
+  -Dgles2=disabled
+  -Dglx=dri
+  -Degl=disabled
+  -Dllvm=enabled
+  -Dshared-llvm=disabled
+  -Ddraw-use-llvm=true
+  -Dgallium-drivers="llvmpipe"
+  -Dgallium-opencl=icd
+  -Dgallium-rusticl=false
+  # -Dgallium-rusticl=true
+  -Drust_std=2021
+  -Dopencl-spirv=true
+  -Dvulkan-drivers="swrast"
+  -Dstatic-libclc=all
+  -Dperfetto=false
+  -Dbuild-tests=false
   -Denable-glcpp-tests=false
+)
+PKG_CONFIG_PATH=/opt/spirv-tools/lib/pkgconfig:$PKG_CONFIG_PATH \
+  PKG_CONFIG_PATH=/opt/llvm-spirv/lib/pkgconfig:$PKG_CONFIG_PATH \
+  PKG_CONFIG_PATH=/opt/libclc/share/pkgconfig:$PKG_CONFIG_PATH \
+  CC=/usr/bin/clang CXX=/usr/bin/clang++ \
+  RUSTC=clippy-driver \
+  meson setup --reconfigure build "${args[@]}"
 
 meson compile -C build
 meson install -C build
